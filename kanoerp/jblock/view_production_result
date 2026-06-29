@@ -1,0 +1,449 @@
+// =====================================================
+// jblock — PRODUCTION RESULT (runs on the ui_list_engine engine)
+//
+// Thin domain config: SQL, card layout, NEW + EDIT form, one-section DETAIL,
+// secondary filters, sort, and four bulk actions (Delete, Match production,
+// Import, Bulk add). Detail/edit are kept INLINE here (single consumer; extract
+// only on a genuine second use). Match / Import / Bulk-add hand off to shared
+// source_code rows: ui_match_production, ui_result_import, ui_result_bulk_add.
+//
+// production_result columns used:
+//   shipment_date · fk_production_id (null until matched) · fk_sku_option_id
+//   · quantity (signed; negative = permakan sent OUT to konveksi) · checking_pic
+//   (single-select field) · is_permakan · remarks · import_product_code (scratch).
+// =====================================================
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Select, InputNumber, Switch, Input, Modal, message } = antd;
+const ce = React.createElement;
+
+// cross-record nav channel → RecordNav host at the view root (production_ref → production detail)
+const navRef = { open: null };
+
+// ── shared code loader ──
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const uid = 'code_' + name;
+  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+  const src = (rows && rows[0] && rows[0].code) || '';
+  if (!src) throw new Error(name + ' not installed');
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// ── helpers ──
+function runSql(uid, sql) {
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []);
+}
+const num = v => Number(v == null ? 0 : v);
+function uniq(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fmtDateNumeric(d) { if (!d) return ''; const p = dayjs(d); return p.isValid() ? p.format('DD/MM/YYYY') : ''; }
+function toInputDate(d) { if (!d) return ''; const p = dayjs(d); return p.isValid() ? p.format('YYYY-MM-DD') : ''; }
+const todayStr = () => dayjs().format('YYYY-MM-DD');
+function pill(text, bg, color) { return ce('span', { style: { display: 'inline-block', padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: bg, color: color } }, text); }
+const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
+
+// signed-quantity presentation: negative = permakan OUT to konveksi
+function qtyColor(q) { q = num(q); return q < 0 ? '#ef4444' : q > 0 ? '#16a34a' : '#9ca3af'; }
+function qtyText(q) { q = num(q); return q > 0 ? '+' + q : String(q); }
+
+// resolve the product code to show / use for image (matched product, else scratch code)
+function rowCode(r) { return r.product_code || r.import_product_code || ''; }
+
+// =====================================================
+// DATA LAYER
+// =====================================================
+function fetchList() {
+  return runSql('prr_list_v1',
+    "SELECT pr.id AS id, pr.shipment_date AS shipment_date, pr.quantity AS quantity, " +
+    "  pr.is_permakan AS is_permakan, pr.checking_pic AS checking_pic, pr.remarks AS remarks, " +
+    "  pr.import_product_code AS import_product_code, pr.fk_production_id AS production_id, " +
+    "  pr.fk_sku_option_id AS sku_option_id, sku_option.display AS sku_display, " +
+    "  production.production_ref AS production_ref, production.status AS production_status, " +
+    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
+    "FROM production_result pr " +
+    "LEFT JOIN sku_option ON pr.fk_sku_option_id = sku_option.id " +
+    "LEFT JOIN production ON pr.fk_production_id = production.id " +
+    "LEFT JOIN product   ON production.fk_product_code  = product.code " +
+    "LEFT JOIN konveksi  ON production.fk_konveksi_code = konveksi.code " +
+    "ORDER BY pr.id DESC");
+}
+
+// product images, keyed by product.code (covers both matched code and scratch code)
+function fetchImages() {
+  return runSql('prr_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'")
+    .then(function(rows) {
+      if (!rows.length) return {};
+      let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return {}; }
+      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
+      if (!through || !fk || !ok) return {};
+      return runSql('prr_imgjoin',
+        "SELECT product.code AS code, attachments.url AS url, attachments.filename AS filename FROM product " +
+        "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
+        "JOIN attachments ON attachments.id = " + through + "." + ok + " ORDER BY attachments.id ASC")
+        .then(function(irows) { const map = {}; irows.forEach(r => { if (!map[r.code]) map[r.code] = r.url || (r.filename ? '/storage/uploads/' + r.filename : ''); }); return map; });
+    }).catch(() => ({}));
+}
+
+// single-select / enum options straight from the collection field metadata.
+// Same helper works for `status` in the other views — pass the collection + field.
+function getEnumOptions(collectionName, fieldName) {
+  try {
+    const ds = ctx.dataSourceManager.getDataSource('main');
+    const col = ds && ds.getCollection(collectionName);
+    const field = col && col.getField(fieldName);
+    const opts = (field && field.enum) || [];
+    return opts.map(function(o) {
+      return (typeof o === 'object' && o !== null)
+        ? { value: o.value, label: o.label != null ? o.label : o.value, color: o.color }
+        : { value: o, label: o };
+    }).filter(o => o.value != null);
+  } catch (e) { return []; }
+}
+
+// checking_pic value→label map (display the label, store/filter on the value)
+const _picLabels = {};
+function refreshPicLabels() { getEnumOptions('production_result', 'checking_pic').forEach(function(o) { _picLabels[String(o.value)] = o.label; }); }
+function picLabel(v) { if (v == null || v === '') return ''; const k = String(v); return _picLabels[k] != null ? _picLabels[k] : v; }
+refreshPicLabels();
+
+// New/Edit form + filter option sources
+function fetchExtra() {
+  refreshPicLabels();
+  return runSql('prr_opt_prod', "SELECT production.id AS id, production.production_ref AS ref, product.code AS pcode, product.name AS pname, konveksi.name AS kname FROM production JOIN product ON production.fk_product_code = product.code JOIN konveksi ON production.fk_konveksi_code = konveksi.code ORDER BY production.created_at DESC")
+    .then(function(prods) {
+      return { productions: prods, checkingPics: getEnumOptions('production_result', 'checking_pic') };
+    });
+}
+
+// variants actually being produced for a production (from production_quantity_details)
+function fetchVariants(productionId) {
+  if (!productionId) return Promise.resolve([]);
+  return runSql('prr_variants_' + productionId,
+    "SELECT DISTINCT sku_option.id AS id, sku_option.display AS display, sku_option.sort AS sort " +
+    "FROM production_quantity_details pqd JOIN sku_option ON pqd.fk_sku_option_id = sku_option.id " +
+    "WHERE pqd.fk_production_id = '" + productionId + "' ORDER BY sku_option.sort ASC");
+}
+
+// =====================================================
+// ACTIONS
+// =====================================================
+function deleteResult(id) { return ctx.api.resource('production_result').destroy({ filterByTk: id }); }
+function valuesFromForm(f) {
+  return {
+    shipment_date: f.shipment_date || null,
+    fk_production_id: f.production || null,
+    fk_sku_option_id: f.sku_option || null,
+    quantity: (f.quantity === '' || f.quantity == null) ? null : f.quantity,
+    checking_pic: f.checking_pic || null,
+    is_permakan: !!f.is_permakan,
+    remarks: f.remarks || null,
+  };
+}
+function createResult(f) { return ctx.api.resource('production_result').create({ values: valuesFromForm(f) }); }
+function updateResult(id, f) { return ctx.api.resource('production_result').update({ filterByTk: id, values: valuesFromForm(f) }); }
+
+// =====================================================
+// SHARED FORM BODY (new + edit) — production → variant dependency
+// =====================================================
+function ResultFormBody(props) {
+  const form = props.form, setF = props.setF, extra = props.extra || {};
+  const sV = useState([]); const variants = sV[0]; const setVariants = sV[1];
+  const sVL = useState(false); const vLoading = sVL[0]; const setVLoading = sVL[1];
+
+  useEffect(function() {
+    let alive = true;
+    if (!form.production) { setVariants([]); return; }
+    setVLoading(true);
+    fetchVariants(form.production).then(function(v) {
+      if (!alive) return;
+      setVariants(v); setVLoading(false);
+      // drop a stale variant that isn't part of the newly chosen production
+      if (form.sku_option && !v.some(x => String(x.id) === String(form.sku_option))) setF('sku_option', null);
+    }).catch(function() { if (alive) { setVariants([]); setVLoading(false); } });
+    return function() { alive = false; };
+  }, [form.production]);
+
+  const prodOptions = (extra.productions || []).map(p => ({ value: p.id, label: (p.ref || ('#' + p.id)) + ' · ' + (p.pcode || '') + ' — ' + (p.pname || '') + ' · ' + (p.kname || '') }));
+  const variantOptions = variants.map(v => ({ value: v.id, label: v.display || ('#' + v.id) }));
+  const picOptions = extra.checkingPics || [];
+  const q = num(form.quantity);
+
+  return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+    ce('div', null, fieldLabel('Shipment date'),
+      ce('input', { type: 'date', value: form.shipment_date || '', onChange: e => setF('shipment_date', e.target.value),
+        onClick: e => { try { e.currentTarget.showPicker(); } catch (err) {} },
+        style: { width: '100%', height: 36, padding: '0 10px', fontSize: 13, border: '1px solid #d9d9d9', borderRadius: 6, outline: 'none', boxSizing: 'border-box', background: '#fff', cursor: 'pointer' } })),
+
+    ce('div', null, fieldLabel('Production'),
+      ce(Select, { showSearch: true, allowClear: true, value: form.production || undefined, onChange: v => setF('production', v || null),
+        style: { width: '100%' }, placeholder: 'Search ref, product code, name, konveksi…',
+        filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: prodOptions })),
+
+    ce('div', null, fieldLabel('SKU option'),
+      ce(Select, { showSearch: true, allowClear: true, value: form.sku_option || undefined, onChange: v => setF('sku_option', v || null),
+        style: { width: '100%' }, disabled: !form.production, loading: vLoading,
+        placeholder: !form.production ? 'Select a production first' : (vLoading ? 'Loading variants…' : (variantOptions.length ? 'Select the produced variant' : 'No variants on this production')),
+        filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: variantOptions })),
+
+    ce('div', null, fieldLabel('Quantity'),
+      ce(InputNumber, { value: (form.quantity === '' || form.quantity == null) ? null : form.quantity, onChange: v => setF('quantity', v),
+        style: { width: '100%' }, placeholder: 'Enter quantity', controls: true }),
+      q < 0 ? ce('div', { style: { fontSize: 11, color: '#ef4444', marginTop: 4 } }, 'Negative quantity = sending permakan OUT to the konveksi.') : null),
+
+    ce('div', null, fieldLabel('Checking PIC'),
+      ce(Select, { showSearch: true, allowClear: true, value: form.checking_pic || undefined, onChange: v => setF('checking_pic', v || null),
+        style: { width: '100%' }, placeholder: picOptions.length ? 'Select checking PIC' : 'No PIC options found',
+        filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: picOptions })),
+
+    ce('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+      fieldLabel('Is permakan'),
+      ce(Switch, { checked: !!form.is_permakan, onChange: v => setF('is_permakan', v) })),
+
+    ce('div', null, fieldLabel('Remarks'),
+      ce(Input.TextArea, { value: form.remarks || '', onChange: e => setF('remarks', e.target.value), rows: 3, placeholder: 'Optional notes' })));
+}
+
+// =====================================================
+// DETAIL — two-column field layout + remarks row
+//   col1: product code · product name · konveksi · production ref
+//   col2: shipment date · sku option · quantity · checking PIC
+// =====================================================
+function ResultDetail(props) {
+  const row = props.row, imgMap = props.imgMap || {};
+  const img = imgMap[rowCode(row)] || '';
+  const matched = !!row.production_id;
+  function item(label, value, valStyle) {
+    return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+      ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, label),
+      ce('div', { style: Object.assign({ fontSize: 13, color: '#111827', fontWeight: 500 }, valStyle || {}) }, (value === '' || value == null) ? '—' : value));
+  }
+  const matchedRef = row.production_ref || (matched ? ('#' + row.production_id) : '— not matched');
+  const prodRefItem = (matched && props.onOpenProduction)
+    ? ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+        ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, 'Production ref'),
+        ce('span', { onClick: function() { props.onOpenProduction(row.production_id); },
+          style: { fontSize: 13, fontWeight: 600, color: '#4338ca', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 2 } },
+          matchedRef, ce('span', { style: { fontSize: 15, lineHeight: 1 } }, '›')))
+    : item('Production ref', matchedRef);
+  const col1 = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+    item('Product code', rowCode(row)),
+    item('Product name', row.product_name),
+    item('Konveksi', row.konveksi_name),
+    prodRefItem);
+  const col2 = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+    item('Shipment date', fmtDateNumeric(row.shipment_date)),
+    item('SKU option', row.sku_display || (row.sku_option_id ? ('#' + row.sku_option_id) : '')),
+    item('Quantity', qtyText(row.quantity), { color: qtyColor(row.quantity), fontWeight: 700 }),
+    item('Checking PIC', picLabel(row.checking_pic)));
+  return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 18, paddingTop: 4 } },
+    ce('div', { className: 'prr-detail-head' },
+      ce('div', { className: 'prr-detail-img' },
+        img ? ce('img', { src: img, style: { maxWidth: '100%', maxHeight: 240, borderRadius: 12, display: 'block' } }) : ce('span', { style: { fontSize: 42, color: '#cbd5e1' } }, '👕')),
+      ce('div', { className: 'prr-detail-meta' },
+        row.is_permakan ? pill('Permakan', '#fef2f2', '#ef4444') : null,
+        ce('div', { className: 'prr-detail-grid' }, col1, col2))),
+    ce('div', null,
+      ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500, marginBottom: 4 } }, 'Remarks'),
+      ce('div', { style: { fontSize: 13, color: row.remarks ? '#374151' : '#d1d5db', fontStyle: row.remarks ? 'normal' : 'italic' } }, row.remarks || 'No remarks')));
+}
+
+// =====================================================
+// CARD — middle: code · name · konveksi · (PIC + permak).
+//        right: variant + quantity (kept close) + shipment date.
+// =====================================================
+function renderCard(o) {
+  const row = o.row, selectMode = o.selectMode, selected = o.selected;
+  const img = (o.imgMap && o.imgMap[rowCode(row)]) || '';
+  return ce('div', { className: 'prr-cardbody' },
+    selectMode ? ce('div', { style: { width: 22, height: 22, borderRadius: 6, flexShrink: 0, border: '2px solid ' + (selected ? '#6366f1' : '#cbd5e1'), background: selected ? '#6366f1' : '#fff', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 } }, selected ? '✓' : '') : null,
+    ce('div', { style: { width: 56, height: 56, borderRadius: 10, flexShrink: 0, background: '#f3f4f6', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+      img ? ce('img', { src: img, style: { width: '100%', height: '100%', objectFit: 'cover' } }) : ce('span', { style: { fontSize: 20, color: '#cbd5e1' } }, '👕')),
+    ce('div', { style: { flex: 1, minWidth: 0 } },
+      ce('div', { style: { fontWeight: 700, fontSize: 14, color: '#111827', marginBottom: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, rowCode(row) || '—'),
+      ce('div', { style: { fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, row.product_name || '—'),
+      ce('div', { style: { fontSize: 11, color: '#9ca3af', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, row.konveksi_name || '—'),
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginTop: 5 } },
+        row.checking_pic ? ce('span', { style: { fontSize: 11, color: '#64748b' } }, '👤 ' + picLabel(row.checking_pic)) : null,
+        row.is_permakan ? ce('span', { style: { background: '#fef2f2', color: '#ef4444', border: '1px solid #fca5a5', borderRadius: 4, padding: '0 6px', fontSize: 10, fontWeight: 700 } }, 'PERMAK') : null)),
+    ce('div', { className: 'prr-col-meta' },
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end' } },
+        row.sku_display ? ce('span', { style: { background: '#eef2ff', color: '#4338ca', borderRadius: 4, padding: '1px 8px', fontSize: 11, fontWeight: 600 } }, row.sku_display) : null,
+        ce('span', { style: { fontSize: 18, fontWeight: 800, color: qtyColor(row.quantity), lineHeight: 1.1 } }, qtyText(row.quantity))),
+      ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginTop: 6 } }, 'Shipment'),
+      ce('div', { style: { fontSize: 12, fontWeight: 600, color: '#374151' } }, fmtDateNumeric(row.shipment_date) || '—')));
+}
+
+// =====================================================
+// BULK ACTION HANDLERS
+// =====================================================
+function bulkDelete(ids, helpers) {
+  Modal.confirm({ title: 'Delete ' + ids.length + ' result(s)?', content: 'This cannot be undone.', okText: 'Delete', okButtonProps: { danger: true },
+    onOk: () => Promise.all(ids.map(id => deleteResult(id))).then(() => { message.success('Deleted ' + ids.length + '.'); helpers.exitSelect(); helpers.reload(); }).catch(e => message.error('Bulk delete failed: ' + ((e && e.message) || e))) });
+}
+function bulkMatch(ids, helpers) {
+  // verification: selected rows must NOT already be matched to a production
+  const idList = ids.map(x => "'" + x + "'").join(',');
+  runSql('prr_match_check', "SELECT id, fk_production_id FROM production_result WHERE id IN (" + idList + ")")
+    .then(function(rows) {
+      const already = rows.filter(r => r.fk_production_id != null).map(r => r.id);
+      if (already.length) {
+        Modal.warning({ title: 'Some rows are already matched', content: already.length + ' of ' + ids.length + ' selected row(s) already have a production linked. Deselect them and try again — matching only applies to unmatched results.' });
+        return;
+      }
+      loadCode('ui_match_production')
+        .then(MP => MP.openMatchModal({ ctx, ids, onDone: () => { helpers.exitSelect(); helpers.reload(); } }))
+        .catch(e => message.error('Match module not installed yet: ' + ((e && e.message) || e)));
+    })
+    .catch(e => message.error('Verification failed: ' + ((e && e.message) || e)));
+}
+function bulkImport(ids, helpers) {
+  loadCode('ui_result_import')
+    .then(IM => IM.openImportModal({ ctx, onSaved: () => { helpers.exitSelect(); helpers.reload(); } }))
+    .catch(() => message.warning('Import module (ui_result_import) is not installed yet.'));
+}
+function bulkAdd(ids, helpers) {
+  loadCode('ui_result_bulk_add')
+    .then(BA => BA.openBulkAddModal({ ctx, onSaved: () => { helpers.exitSelect(); helpers.reload(); } }))
+    .catch(() => message.warning('Bulk-add module (ui_result_bulk_add) is not installed yet.'));
+}
+
+// =====================================================
+// VIEW CSS (prr- prefix)
+// =====================================================
+const VIEW_CSS =
+  ".prr-cardbody{display:flex;gap:12px;padding:12px;align-items:center;}" +
+  ".prr-col-meta{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;text-align:right;}" +
+  ".prr-detail-head{display:flex;flex-direction:column;gap:16px;}" +
+  ".prr-detail-img{width:100%;border-radius:12px;overflow:hidden;background:#f3f4f6;display:flex;align-items:center;justify-content:center;padding:20px;}" +
+  ".prr-detail-meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:14px;}" +
+  ".prr-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 24px;}" +
+  "@media(max-width:480px){.prr-detail-grid{grid-template-columns:1fr;}}" +
+  "@media(min-width:760px){.prr-detail-head{flex-direction:row;align-items:flex-start;}.prr-detail-img{width:260px;flex-shrink:0;}}";
+
+// =====================================================
+// CONFIG
+// =====================================================
+const config = {
+  title: 'Production Results',
+  css: VIEW_CSS,
+  searchPlaceholder: 'Search konveksi, product code, name, ref…',
+  emptyText: 'No production results match this filter',
+  pageSize: 15,
+
+  // message box below the title (engine renders it). Warn when any result is
+  // not yet linked to a production.
+  banner: function(data) {
+    const unmatched = (data || []).filter(function(r) { return !r.production_id; }).length;
+    if (!unmatched) return null;
+    return { type: 'warning', text: 'There are ' + unmatched + ' production result(s) not yet matched to a production. Please trigger the Match Production action.' };
+  },
+
+  fetchList: fetchList,
+  fetchImages: fetchImages,
+  fetchExtra: fetchExtra,
+  getImage: (row, map) => (map && map[rowCode(row)]) || '',
+
+  searchText: r => [r.konveksi_name, r.product_code, r.import_product_code, r.product_name, r.production_ref],
+
+  // main filter: NA (no mainTabs)
+
+  secondaryFilters: [
+    { key: 'production', label: 'Production', kind: 'select', search: true, allLabel: 'All',
+      options: function(data) {
+        const refs = uniq((data || []).map(function(r) { return r.production_ref; })).filter(function(x) { return x != null && x !== ''; }).sort();
+        return [{ value: '__none__', label: '(No production — unmatched)' }].concat(refs);
+      },
+      match: function(r, v) { return v === '__none__' ? !r.production_id : String(r.production_ref) === String(v); } },
+    { key: 'konveksi', label: 'Konveksi name', kind: 'select', field: 'konveksi_name', search: true, allLabel: 'All' },
+    { key: 'product_code', label: 'Product code', kind: 'select', field: 'product_code', search: true, allLabel: 'All' },
+    { key: 'product_name', label: 'Product name', kind: 'select', field: 'product_name', search: true, allLabel: 'All' },
+    { key: 'shipment', label: 'Shipment date', kind: 'dateRange', field: 'shipment_date' },
+    { key: 'is_permakan', label: 'Is permakan', kind: 'select', allLabel: 'All', options: () => [{ value: 'yes', label: 'Permakan' }, { value: 'no', label: 'Regular' }], match: (r, v) => v === 'yes' ? !!r.is_permakan : !r.is_permakan },
+    { key: 'checking_pic', label: 'Checking PIC', kind: 'select', field: 'checking_pic', search: true, allLabel: 'All' },
+  ],
+
+  sortOptions: [
+    { key: 'created_desc', label: 'Newest' },
+    { key: 'ship_desc', label: 'Shipment ↓' },
+    { key: 'ship_asc', label: 'Shipment ↑' },
+  ],
+  sortComparator: function(key) {
+    if (key === 'created_desc') return null;
+    const dir = key === 'ship_asc' ? 1 : -1;
+    return function(a, b) {
+      const av = a.shipment_date ? new Date(a.shipment_date).getTime() : (dir === 1 ? Infinity : -Infinity);
+      const bv = b.shipment_date ? new Date(b.shipment_date).getTime() : (dir === 1 ? Infinity : -Infinity);
+      return (av - bv) * dir;
+    };
+  },
+
+  renderCard: renderCard,
+
+  detailTitle: r => (rowCode(r) || ('#' + r.id)) + (r.sku_display ? ' · ' + r.sku_display : ''),
+  statusAccent: r => qtyColor(r.quantity),
+  detailRender: (row, rk, helpers) => ce(ResultDetail, { row: row, imgMap: helpers && helpers.getImage ? null : null }),
+
+  newForm: { title: 'New Production Result', width: 480,
+    initial: () => ({ shipment_date: todayStr(), production: null, sku_option: null, quantity: null, checking_pic: null, is_permakan: false, remarks: '' }),
+    validate: f => !f.production ? 'Select a production.' : (!f.sku_option ? 'Select a SKU option.' : ((f.quantity === '' || f.quantity == null) ? 'Enter a quantity.' : null)),
+    render: (form, setF, extra) => ce(ResultFormBody, { form: form, setF: setF, extra: extra }),
+    submit: createResult, successMsg: 'Production result created.' },
+
+  editForm: { title: 'Edit Production Result', width: 480,
+    load: row => ({ shipment_date: toInputDate(row.shipment_date), production: row.production_id || null, sku_option: row.sku_option_id || null, quantity: (row.quantity == null ? null : row.quantity), checking_pic: row.checking_pic || null, is_permakan: !!row.is_permakan, remarks: row.remarks || '' }),
+    validate: f => (f.quantity === '' || f.quantity == null) ? 'Enter a quantity.' : null,
+    render: (form, setF, extra) => ce(ResultFormBody, { form: form, setF: setF, extra: extra }),
+    submit: updateResult, successMsg: 'Production result updated.' },
+
+  deleteRow: deleteResult,
+  deleteTitle: 'Delete production result?',
+  deleteLabel: row => (rowCode(row) || ('#' + row.id)),
+
+  bulkActions: [
+    { label: '🗑 Delete', bg: '#ef4444', color: '#fff', run: bulkDelete },
+    { label: '🔗 Match production', bg: '#22c55e', color: '#fff', run: bulkMatch },
+    { label: '⬆ Import', bg: '#0ea5e9', color: '#fff', requireSelection: false, run: bulkImport },
+    { label: '✚ Bulk add', bg: '#4f46e5', color: '#fff', requireSelection: false, run: bulkAdd },
+  ],
+};
+
+// detailRender needs imgMap; the engine passes it through getImage(row) via helpers.
+// Wrap so the card image map is reused in the detail.
+config.detailRender = function(row, rk, helpers) {
+  const img = helpers && helpers.getImage ? helpers.getImage(row) : '';
+  return ce(ResultDetail, { row: row, imgMap: { [rowCode(row)]: img },
+    onOpenProduction: function(pid) {
+      if (helpers && helpers.closeDetail) helpers.closeDetail();
+      if (navRef.open) navRef.open('production', pid, helpers);
+    } });
+};
+
+// ── record nav host (cross-record replace navigation: production_ref → production detail) ──
+const RecordNavHost = function() {
+  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
+  useEffect(function() { loadCode('ui_record_nav').then(setMod).catch(function() {}); }, []);
+  if (!Mod || !Mod.RecordNav) return null;
+  return ce(Mod.RecordNav, { navRef: navRef });
+};
+
+// =====================================================
+// ROOT
+// =====================================================
+const Root = function() {
+  const sLV = useState(null); const LV = sLV[0]; const setLV = sLV[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+  useEffect(function() {
+    loadCode('ui_list_engine').then(function(M) { setLV(function() { return M.createListView(config); }); })
+      .catch(function(e) { setErr((e && e.message) || String(e)); });
+  }, []);
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load ui_list_engine: ' + err);
+  if (!LV) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…');
+  return ce('div', null, ce(LV), ce(RecordNavHost, null));
+};
+
+ctx.render(ce(Root));
