@@ -91,6 +91,27 @@ function AccordionItem(p) {
     p.open ? ce('div', { style: { padding: '0 4px 18px' } }, p.children) : null);
 }
 
+// reusable message box rendered below the list title. config.banner(data) may
+// return null, a string, a { type:'warning'|'info'|'error'|'success', text }
+// object, or a ready-made React element.
+const BANNER_PALETTE = {
+  warning: { bg: '#fffbeb', border: '#fcd34d', color: '#92400e', icon: '⚠' },
+  info:    { bg: '#eff6ff', border: '#bfdbfe', color: '#1e40af', icon: 'ℹ' },
+  error:   { bg: '#fef2f2', border: '#fca5a5', color: '#991b1b', icon: '⛔' },
+  success: { bg: '#f0fdf4', border: '#bbf7d0', color: '#166534', icon: '✓' },
+};
+function renderBanner(b) {
+  if (!b) return null;
+  if (React.isValidElement(b)) return b;
+  const isObj = (typeof b === 'object' && b !== null);
+  const type = isObj && b.type ? b.type : 'warning';
+  const text = isObj ? b.text : b;
+  const p = BANNER_PALETTE[type] || BANNER_PALETTE.warning;
+  return ce('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, background: p.bg, border: '1px solid ' + p.border, color: p.color, borderRadius: 10, padding: '10px 12px', marginBottom: 12, fontSize: 13, lineHeight: 1.5 } },
+    ce('span', { style: { flexShrink: 0 } }, p.icon),
+    ce('span', null, text));
+}
+
 // =====================================================
 // FACTORY
 // =====================================================
@@ -371,6 +392,8 @@ function createListView(config) {
               (config.newForm || config.renderNewDrawer) ? ce('button', { onClick: () => setNewOpen(true), style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 10, width: 40, height: 40, fontSize: 22, fontWeight: 700, cursor: 'pointer', lineHeight: 1 } }, '+') : null,
               (config.bulkActions && config.bulkActions.length) ? ce('button', { onClick: () => setSelectMode(true), title: 'Select', style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e5e7eb', background: '#fff', borderRadius: 10, width: 40, height: 40, color: '#475569', cursor: 'pointer' } },
                 ce('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none' }, ce('path', { d: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01', stroke: '#475569', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }))) : null)),
+
+      config.banner ? renderBanner(config.banner(data)) : null,
 
       ce('div', { className: 'kano-searchrow' },
         ce(SearchBar, { value: query, onChange: setQuery, placeholder: config.searchPlaceholder }),
