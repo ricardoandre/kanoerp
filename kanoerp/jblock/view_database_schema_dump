@@ -1,0 +1,169 @@
+// =====================================================
+// jblock — SCHEMA DUMP (for README maintenance)
+//
+// Standalone jblock, no dependency on any other shared module.
+//
+// Purpose: produce one copy-pasteable block of text describing the current
+// schema (collections → fields → types → relations), so you can paste it into
+// a Claude chat and ask Claude to update the README's "Canonical schema"
+// section from it.
+//
+// Sourced from NocoBase's own collection/field metadata via
+// ctx.dataSourceManager — NOT raw SQL introspection. This means:
+//   - relation fields (belongsTo/hasMany/belongsToMany) show target/foreignKey/
+//     sourceKey directly, even when NocoBase enforces the relation at the app
+//     layer rather than as a real DB foreign key (most relations here do).
+//   - no ctx.sql.save/runById calls for the schema itself, so no uid-collision
+//     risk. Row counts (optional, bottom of file) still use one combined SQL
+//     query with a single fixed uid if you want them.
+//
+// USAGE:
+//   1. Edit TABLES below — add/remove collection names. Leave it as [] to
+//      dump every collection NocoBase knows about (includes its own internal
+//      collections too — noisier, but nothing hidden).
+//   2. Drop this jblock on any page, let it load.
+//   3. Click into the text box, Ctrl+A / Cmd+A, Ctrl+C / Cmd+C.
+//   4. Paste into the chat with: "here's the current schema dump, update
+//      the README schema section."
+// =====================================================
+
+// ── EDIT THIS TO ADD/REMOVE COLLECTIONS (leave [] to dump everything) ──
+const TABLES = [
+  'production', 'product', 'product_material', 'material_details', 'raw_material',
+  'konveksi', 'production_quantity_details', 'sku_option', 'production_result',
+  'qc_result', 'production_sample', 'production_material', 'material_ledger',
+  'material_ledger_details', 'users', 'supplier', 'launch_plan', 'source_code',
+];
+
+const RELATION_TYPES = ['belongsTo', 'hasOne', 'hasMany', 'belongsToMany'];
+
+const { React, antd } = ctx.libs;
+const { useState, useEffect } = React;
+const { Spin, Button } = antd;
+const ce = React.createElement;
+
+// defensive getter: NocoBase Field instances usually expose raw config via
+// field.options, with some values also mirrored as direct getters (e.g.
+// field.type). Try direct first, fall back to .options.
+function fget(field, key) {
+  if (field[key] !== undefined) return field[key];
+  if (field.options && field.options[key] !== undefined) return field.options[key];
+  return undefined;
+}
+
+function describeField(field) {
+  const name = fget(field, 'name');
+  const type = fget(field, 'type');
+  const iface = fget(field, 'interface');
+  const parts = [name + ': ' + type + (iface ? ' (' + iface + ')' : '')];
+
+  if (RELATION_TYPES.indexOf(type) !== -1) {
+    const target = fget(field, 'target');
+    const foreignKey = fget(field, 'foreignKey');
+    const sourceKey = fget(field, 'sourceKey');
+    const through = fget(field, 'through');
+    const otherKey = fget(field, 'otherKey');
+    const relBits = [];
+    if (target) relBits.push('target=' + target);
+    if (foreignKey) relBits.push('foreignKey=' + foreignKey);
+    if (sourceKey) relBits.push('sourceKey=' + sourceKey);
+    if (through) relBits.push('through=' + through);
+    if (otherKey) relBits.push('otherKey=' + otherKey);
+    if (relBits.length) parts.push('  [' + relBits.join(', ') + ']');
+  }
+  return parts.join('');
+}
+
+function getCollections() {
+  const dataSource = ctx.dataSource || ctx.dataSourceManager.getDataSource('main');
+  if (!dataSource) throw new Error('No data source available');
+  const all = dataSource.getCollections();
+  if (!TABLES.length) return all;
+  return all.filter(col => TABLES.indexOf(col.name) !== -1);
+}
+
+function buildText(collections, counts, countsError) {
+  const lines = [];
+  lines.push('SCHEMA DUMP — generated ' + new Date().toISOString());
+  lines.push('Collections found: ' + collections.length + (TABLES.length ? ' (filtered from TABLES list)' : ' (all collections)'));
+  if (TABLES.length) {
+    const found = collections.map(c => c.name);
+    const missing = TABLES.filter(t => found.indexOf(t) === -1);
+    if (missing.length) lines.push('NOT FOUND (check spelling / not yet created): ' + missing.join(', '));
+  }
+  lines.push('');
+
+  collections.forEach(col => {
+    const cnt = counts[col.name];
+    const pk = Array.isArray(col.filterTargetKey) ? col.filterTargetKey.join(', ') : (col.filterTargetKey || 'id');
+    lines.push('### ' + col.name + (col.title && col.title !== col.name ? '  ("' + col.title + '")' : '') +
+      (cnt != null ? '  — ' + cnt + ' rows' : ''));
+    lines.push('  primaryKey: ' + pk + (col.template ? ', template: ' + col.template : ''));
+    col.getFields().forEach(f => {
+      lines.push('  - ' + describeField(f));
+    });
+    lines.push('');
+  });
+
+  if (countsError) {
+    lines.push('(row counts unavailable: ' + countsError + ')');
+  }
+
+  return lines.join('\n');
+}
+
+// optional: row counts via one combined SQL query, one fixed uid — safe,
+// no concurrency. Skips gracefully if it fails for any reason.
+function fetchCounts(collectionNames) {
+  const sql = collectionNames.map(n => "SELECT '" + n + "' AS table_name, COUNT(*) AS n FROM " + n).join(' UNION ALL ');
+  return ctx.sql.save({ uid: 'sd_counts', sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById('sd_counts', { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(rows => {
+      const counts = {};
+      (rows || []).forEach(r => { counts[r.table_name] = r.n; });
+      return counts;
+    });
+}
+
+const Root = function () {
+  const sText = useState(null); const text = sText[0]; const setText = sText[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+
+  function load() {
+    setErr(null);
+    setText(null);
+    let collections;
+    try {
+      collections = getCollections();
+    } catch (e) {
+      setErr((e && e.message) || String(e));
+      return;
+    }
+    const names = collections.map(c => c.name);
+    fetchCounts(names)
+      .then(counts => setText(buildText(collections, counts, null)))
+      .catch(e => setText(buildText(collections, {}, (e && e.message) || String(e))));
+  }
+
+  useEffect(function () { load(); }, []);
+
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load: ' + err);
+  if (text == null) return ce('div', { style: { padding: 24, textAlign: 'center' } }, ce(Spin));
+
+  return ce('div', { style: { fontFamily: 'inherit' } },
+    ce('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 } },
+      ce('div', { style: { fontSize: 14, fontWeight: 600, color: '#374151' } }, 'Schema dump — click box, Ctrl/Cmd+A then Ctrl/Cmd+C'),
+      ce(Button, { size: 'small', onClick: load }, 'Refresh')),
+    ce('textarea', {
+      readOnly: true,
+      value: text,
+      onClick: function (e) { e.target.select(); },
+      style: {
+        width: '100%', height: 480, fontFamily: 'monospace', fontSize: 12,
+        padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, background: '#fafafa',
+        whiteSpace: 'pre', resize: 'vertical',
+      },
+    }));
+};
+
+ctx.render(ce(Root));
