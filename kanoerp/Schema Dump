@@ -1,5 +1,5 @@
-SCHEMA DUMP — generated 2026-07-02T05:21:40.742Z
-Collections found: 33 (all collections)
+SCHEMA DUMP — generated 2026-07-02T06:59:59.116Z
+Collections found: 34 (all collections)
 
 ### roles  ("Roles")  — 9 rows
   primaryKey: name
@@ -408,7 +408,7 @@ Collections found: 33 (all collections)
   - archive: boolean (checkbox)
   - createdById: context
 
-### history  ("History")  — 469 rows
+### history  ("History")  — 470 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_user_id: bigInt (integer)
@@ -420,7 +420,7 @@ Collections found: 33 (all collections)
   - category: string (input)
   - create_date: date (datetime)
 
-### ads_insights  ("Ads Insights")  — 34005 rows
+### ads_insights  ("Ads Insights")  — 34039 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - ad_id: string (input)
@@ -446,7 +446,7 @@ Collections found: 33 (all collections)
   - spend: decimal (number)
   - ads_details: belongsTo (obo)  [target=ads_creative, foreignKey=ad_id]
 
-### adsets_insights  ("Adsets Insights")  — 5648 rows
+### adsets_insights  ("Adsets Insights")  — 5656 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -470,7 +470,7 @@ Collections found: 33 (all collections)
   - revenue: decimal (number)
   - spend: decimal (number)
 
-### campaigns_insights  ("Campaigns Insights")  — 1879 rows
+### campaigns_insights  ("Campaigns Insights")  — 1884 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -500,3 +500,15 @@ Collections found: 33 (all collections)
   - creative_id: string (input)
   - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_ph199nd1xyc, sourceKey=ad_id, through=t_4ylsjidv6a2, otherKey=f_ecp7hycxw1i]
   - source_url: text (textarea)
+
+### fb_ads_period_data  ("FB Ads Period Data")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - entity_type: string (input)
+  - entity_id: string (input)
+  - period_type: string (input)
+  - period_start: string (input)
+  - reach: bigInt (integer)
+  - frequency: double (number)
+  - impression: bigInt (integer)
+  - synced_at: date (datetime)
