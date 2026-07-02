@@ -261,6 +261,46 @@ function fetchQuantity(id) {
   });
 }
 
+// enum label resolver (single-select fields: checking_pic, qc_person) — show label, not value
+function pdEnumLabelMap(collectionName, fieldName) {
+  try {
+    const ds = ctx.dataSourceManager.getDataSource('main');
+    const col = ds && ds.getCollection(collectionName);
+    const field = col && col.getField(fieldName);
+    const opts = (field && field.enum) || [];
+    const map = {};
+    opts.forEach(function(o) { if (o && typeof o === 'object' && o.value != null) map[String(o.value)] = (o.label != null ? o.label : o.value); });
+    return map;
+  } catch (e) { return {}; }
+}
+const _pdPicLabels = pdEnumLabelMap('production_result', 'checking_pic');
+const _pdQcLabels = pdEnumLabelMap('qc_result', 'qc_person');
+function pdLabel(map, v) { if (v == null || v === '') return ''; const k = String(v); return map[k] != null ? map[k] : v; }
+
+// result history: production_result (Sent) + qc_result (QC), all variants, date desc.
+// Two separate queries merged in JS (avoid aggregate fan-out).
+function fetchResultHistory(id) {
+  return Promise.all([
+    runSql('pd_rh_sent_' + id,
+      "SELECT production_result.shipment_date AS event_date, production_result.quantity AS quantity, " +
+      "  production_result.checking_pic AS pic, production_result.is_permakan AS is_permakan, production_result.remarks AS remarks, " +
+      "  sku_option.display AS variant " +
+      "FROM production_result LEFT JOIN sku_option ON production_result.fk_sku_option_id = sku_option.id " +
+      "WHERE production_result.fk_production_id = '" + id + "'"),
+    runSql('pd_rh_qc_' + id,
+      "SELECT qc_result.qc_date AS event_date, qc_result.quantity AS quantity, qc_result.qc_person AS pic, " +
+      "  qc_result.is_defect AS is_defect, sku_option.display AS variant " +
+      "FROM qc_result LEFT JOIN sku_option ON qc_result.fk_sku_option_id = sku_option.id " +
+      "WHERE qc_result.fk_production_id = '" + id + "'"),
+  ]).then(function(r) {
+    const sent = (r[0] || []).map(function(x) { return { kind: 'sent', date: x.event_date, quantity: num(x.quantity), pic: pdLabel(_pdPicLabels, x.pic), is_permakan: !!x.is_permakan, is_defect: false, variant: x.variant }; });
+    const qc = (r[1] || []).map(function(x) { return { kind: 'qc', date: x.event_date, quantity: num(x.quantity), pic: pdLabel(_pdQcLabels, x.pic), is_permakan: false, is_defect: !!x.is_defect, variant: x.variant }; });
+    const all = sent.concat(qc);
+    all.sort(function(a, b) { const av = a.date ? new Date(a.date).getTime() : 0; const bv = b.date ? new Date(b.date).getTime() : 0; return bv - av; });
+    return all;
+  });
+}
+
 function fetchHistory(id) {
   return runSql('pd_dhist_' + id,
     "SELECT users.nickname AS name, history.create_date AS history_date, history.status, history.message, history.category, history.table_name AS source " +
@@ -474,6 +514,47 @@ const Section3Quantity = function(props) {
   );
 };
 
+// =====================================================
+// SectionResultHistory — combined production_result (Sent) + qc_result (QC),
+// all variants merged, chronological DESC. Columns: Date · Sent · QC · Details.
+// =====================================================
+const SectionResultHistory = function(props) {
+  const sL = useState(true); const loading = sL[0]; const setLoading = sL[1];
+  const sD = useState([]);   const rows = sD[0];    const setRows = sD[1];
+  useEffect(function() { setLoading(true); fetchResultHistory(props.id).then(function(d) { setRows(d); setLoading(false); }).catch(function() { setLoading(false); }); }, [props.id, props.refreshKey]);
+  if (loading) return ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…');
+  if (!rows.length) return ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No result history');
+
+  const rhTh = { padding: '8px 10px', fontSize: 11, fontWeight: 600, color: '#9ca3af', borderBottom: '2px solid #f3f4f6', whiteSpace: 'nowrap' };
+  const rhThR = Object.assign({}, rhTh, { textAlign: 'right' });
+  const rhTd = { padding: '7px 10px', fontSize: 12, borderBottom: '1px solid #f3f4f6', color: '#374151', verticalAlign: 'top' };
+  const rhTdR = Object.assign({}, rhTd, { textAlign: 'right', fontWeight: 700, whiteSpace: 'nowrap' });
+  function tag(text, color) { return ce('span', { style: { background: color + '18', color: color, border: '1px solid ' + color + '40', borderRadius: 10, padding: '0 7px', fontSize: 10, fontWeight: 700, whiteSpace: 'nowrap' } }, text); }
+
+  return ce('div', { style: { overflowX: 'auto' } },
+    ce('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+      ce('thead', null, ce('tr', null,
+        ce('th', { style: Object.assign({}, rhTh, { textAlign: 'left' }) }, 'Date'),
+        ce('th', { style: rhThR }, 'Sent'),
+        ce('th', { style: rhThR }, 'QC'),
+        ce('th', { style: Object.assign({}, rhTh, { textAlign: 'left' }) }, 'Details'))),
+      ce('tbody', null, rows.map(function(e, i) {
+        const isSent = e.kind === 'sent';
+        const sentColor = e.quantity < 0 ? '#dc2626' : '#0284c7';
+        const qcColor = e.is_defect ? '#dc2626' : '#16a34a';
+        return ce('tr', { key: i, style: { background: i % 2 === 0 ? '#fff' : '#fafafa' } },
+          ce('td', { style: Object.assign({}, rhTd, { fontWeight: 600, color: '#64748b', whiteSpace: 'nowrap' }) }, fmtDateNumeric(e.date) || '—'),
+          ce('td', { style: Object.assign({}, rhTdR, { color: isSent ? sentColor : '#e5e7eb' }) }, isSent ? (e.quantity > 0 ? '+' + e.quantity : String(e.quantity)) : '—'),
+          ce('td', { style: Object.assign({}, rhTdR, { color: !isSent ? qcColor : '#e5e7eb' }) }, !isSent ? String(e.quantity) : '—'),
+          ce('td', { style: Object.assign({}, rhTd, { textAlign: 'left' }) },
+            ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+              e.variant ? ce('span', { style: { background: '#eef2ff', color: '#4338ca', borderRadius: 4, padding: '0 7px', fontSize: 10, fontWeight: 600 } }, e.variant) : null,
+              e.pic ? ce('span', { style: { background: '#e0e7ff', color: '#4338ca', borderRadius: 10, padding: '0 7px', fontSize: 10, fontWeight: 600 } }, '👤 ' + e.pic) : null,
+              (isSent && e.is_permakan) ? tag(e.quantity < 0 ? 'PERMAK OUT' : 'PERMAK IN', e.quantity < 0 ? '#dc2626' : '#16a34a') : null,
+              (!isSent && e.is_defect) ? tag('DEFECT', '#dc2626') : null)));
+      }))));
+};
+
 const SectionMarker = function(props) {
   const sL = useState(true);  const loading = sL[0]; const setLoading = sL[1];
   const sM = useState('');    const marker = sM[0];  const setMarker = sM[1];
@@ -548,6 +629,7 @@ const DetailBody = function(props) {
     { title: 'Summary',  body: ce(Section1Summary, { header: header, image: image }) },
     { title: 'Material', body: ce(Section2Material, { id: id, refreshKey: rk, onOpenMaterial: props.onOpenMaterial }) },
     { title: 'Quantity', body: ce(Section3Quantity, { id: id, refreshKey: rk }) },
+    { title: 'Result history', body: ce(SectionResultHistory, { id: id, refreshKey: rk }) },
     { title: 'Remarks',  body: ce(Section4Remarks,  { id: id, refreshKey: rk }) },
     { title: 'Marker',   body: ce(SectionMarker,    { id: id, refreshKey: rk }) },
     { title: 'History',  body: ce(Section5History,  { id: id, refreshKey: rk }) },
