@@ -49,6 +49,21 @@ git clone --depth 1 https://github.com/ricardoandre/kanoerp.git
 You only need to keep current the files you're about to work on; the runtime is
 always current regardless of mirror lag.
 
+**How code actually goes live in NocoBase (deployment mechanics):**
+- **`jblock`** → create a new **Page** in NocoBase, add one big custom-code block
+  to that page, paste the code in. One page = one jblock, almost always (e.g.
+  `view_production` is its own page). This is the pattern for anything that's a
+  full custom view (production list, material list, dev tools like the schema
+  dump).
+- **`JSAction`** → used *alongside a native NocoBase table block* (the built-in
+  table UI, not a custom jblock), to extend what that table can do. Workflow:
+  start from an existing native table → add a button action on it → point that
+  button at the JSAction row → paste the shell code in. This is how the
+  `act_import_*` and `act_material_out`/`act_prepare_fabric` actions attach to
+  their respective native tables.
+- A `source_code` row by itself is never placed on a page directly — it's only
+  ever loaded via `loadCode(ctx, name)` from a `jblock` or `JSAction`.
+
 **Session close ritual:** every Claude session should end with an explicit
 "changed this session" list, so it's clear which rows to paste into NocoBase and
 which files to commit to GitHub.
@@ -118,6 +133,11 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
 
 ## 4. NocoBase API patterns
 
+- **Database engine: MySQL** (confirmed). Write SQL accordingly — backtick-quote
+  reserved words, `LIMIT n` (not `LIMIT n OFFSET m` reversed), no `information_schema`
+  reliance for relation semantics (§4's schema-introspection note below), standard
+  MySQL date functions if needed. This matters most for anyone writing raw SQL
+  directly rather than using `ctx.api.resource(...)`.
 - **SQL:** `ctx.sql.save(uid, sql)` (awaited) → `ctx.sql.runById(uid)`.
   - `uid` must be a **fixed string** in column/list contexts.
   - In **multi-row column code**, `uid` must be **dynamic per row**
@@ -179,6 +199,63 @@ or before calling `appends: ['relationName']`, check the actual field name in th
 schema file (§7) rather than assuming it matches the collection name. Never
 hand-edit or hand-recall the schema from memory for this — regenerate the dump.
 
+### 4.2 Canonical `runSql` / `execSql` template — use this, not the older simpler version
+
+The most defensive version found in the codebase, independently present in two
+files (`ui_match_production`, `ui_material_out.js`) — treat this as the default
+template for any new component's SQL helper, in preference to the simpler
+`.save().then(() => .runById())` pattern still visible in older files
+(`view_production.js`, `ui_production_edit.js`):
+
+```js
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+async function execSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'exec', dataSourceKey: 'main' }).catch(() => null);
+}
+```
+
+Two differences from the simpler pattern: `.save()` only runs when
+`ctx.flowSettingsEnabled` is true, and both `.save()` and `.runById()` swallow
+errors via `.catch()` rather than letting them propagate.
+
+⚠️ **Inferred, not confirmed:** `ctx.flowSettingsEnabled` appears to indicate
+whether the code is currently running inside NocoBase's flow-configuration/edit
+UI versus the live rendered page — the guard suggests `.save()` (which registers
+the uid→SQL mapping) is only meant to run during configuration, not repeatedly at
+runtime, and skipping it live plus catching errors avoids whatever breaks if it's
+called outside that context. **Andre — if this understanding is wrong, correct it
+here** so future sessions don't inherit a wrong mental model of what this flag
+actually does.
+
+### 4.3 `ctx` surface — confirmed members only
+
+Pulled directly from actual usage across the codebase, not assumed. If a new
+session needs something not on this list, search existing files for it before
+assuming it exists.
+
+| Member | Use |
+|---|---|
+| `ctx.libs` | `{ React, antd, dayjs }` — the three libraries available inside `new Function('React','antd','dayjs','ctx', src)`. **`dayjs` has no plugins loaded** (confirmed: zero uses of `.utc()`/`.tz()`/`.extend()` anywhere in the codebase) — do timezone math by hand (see `view_source_code_updates`'s manual UTC+7 conversion), don't assume a plugin is available. |
+| `ctx.sql` | `.save({uid, sql, dataSourceKey})` / `.runById(uid, {type, dataSourceKey})` — use the §4.2 wrapper, not raw calls. |
+| `ctx.api` | `.resource('collection').create({values})` / `.update(...)` — the reliable write path (§4). |
+| `ctx.dataSource` / `ctx.dataSourceManager` | `.getDataSource('main').getCollections()` / `.getCollection(name).getField(name)` — schema/enum introspection (§4, §7). |
+| `ctx.render` | Mounts the component tree — required at the end of every jblock. |
+| `ctx.record` | The current row, in record-scoped contexts (JSAction on a record, column code). |
+| `ctx.resource` | `.getSelectedRows()`, `.refresh()` — list/table resource; used from bulk actions and JSActions to refresh after a write. |
+| `ctx.message` | Inline feedback, e.g. `ctx.message.warning('...')`. |
+| `ctx.notification` | Toast-style feedback (`.success({...})`, `.warning({...})`) — more prominent than `ctx.message`. The convention for when to use which isn't formalized yet; currently mixed across files. |
+| `ctx.flowSettingsEnabled` | Gates `ctx.sql.save()` in the §4.2 template — see that section's caveat. |
+| `ctx.t` | i18n translation function, e.g. `ctx.t('No data source available')`. Used sparingly; unclear if translation is actually configured — treat as optional decoration unless told otherwise. |
+
 ---
 
 ## 5. Architecture principles (enforce going forward)
@@ -208,10 +285,30 @@ hand-edit or hand-recall the schema from memory for this — regenerate the dump
   writing code.
 - **Mockup before implementation** for any new UI layout — confirm the visual
   direction before writing the component.
+- **Preview before writing, opt-in before overwriting.** Any bulk-write/import
+  feature must classify rows and show a preview before committing anything —
+  new / no-op / conflict — and require explicit opt-in (e.g. a checkbox) before
+  overwriting existing non-empty data. Never auto-apply a bulk write silently.
+  All three `ui_import_*` modules (§8) independently converged on this pattern —
+  treat it as a hard rule for anything new in this category, not just something
+  those three happened to do.
 
 ---
 
 ## 6. UI conventions
+
+**What is antd?** It's [Ant Design](https://ant.design), the React UI component
+library NocoBase bundles and exposes via `ctx.libs.antd` — this is where `Modal`,
+`Table`, `Select`, `DatePicker`, etc. come from. The exact antd major version in
+this environment isn't confirmed (v4 vs v5 differ on some APIs, e.g. `Modal`'s
+static methods and how `message` is invoked), so the safest approach is to mirror
+components/props already proven to work in this codebase rather than assume a
+version. **Confirmed-working components/APIs**, pulled directly from actual files:
+`Modal` (incl. `.confirm()`, `.destroyAll()`), `Drawer`, `Dropdown`, `Select`,
+`DatePicker`, `InputNumber`, `Switch`, `Spin`, `message`, `Pagination`, `Upload`,
+`Button`, `Table`, `Alert`, `Progress`, `Input`, `Tag`. If a new component or prop
+is needed that isn't on this list, it's not necessarily broken — just unverified;
+say so explicitly rather than presenting it with full confidence.
 
 - All components use `React.createElement` aliased as `ce` — **never JSX** (no
   transpiler in the sandbox).
@@ -389,6 +486,12 @@ Separate Node.js project at `~/fb-ads-sync`, 4-file modular structure:
 - Before writing SQL or a `belongsTo` payload against a table you haven't touched
   recently, fetch the schema file (§7) — don't assume field/relation names match
   the collection name (§4.1).
+- **Claude cannot execute this code against the live NocoBase instance** — there's
+  no test environment reachable from chat. All code is written from documented
+  patterns and prior working examples, not verified by actually running it. Flag
+  assumptions and untested edges explicitly in the response rather than presenting
+  code as guaranteed-correct — the paste-by-Andre → report-errors-back loop *is*
+  the verification step, by design, not a sign something went wrong.
 
 ---
 
