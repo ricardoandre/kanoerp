@@ -54,10 +54,21 @@ always current regardless of mirror lag.
 which files to commit to GitHub.
 
 **Schema refresh ritual:** the schema lives in a separate file, not here (see §7).
-Whenever the schema changes, run the `view_schema_dump` jblock (§8), copy the text
-box, and paste it into a Claude chat with "update the schema file." Don't hand-edit
-the schema file from memory — NocoBase's relation field names routinely differ from
-what you'd guess (see §4.1), so the dump is the only reliable source.
+Whenever the schema changes, run the `view_database_schema_dump` jblock (§8), copy
+the text box, and paste it into a Claude chat with "update the schema file." Don't
+hand-edit the schema file from memory — NocoBase's relation field names routinely
+differ from what you'd guess (see §4.1), so the dump is the only reliable source.
+
+**Getting the current file list:** GitHub's web "tree" page (`/tree/main/...`)
+blocks automated fetching (`robots.txt` disallows it), so a new Claude session
+can't just browse the repo in a browser-like way. The clone command above always
+works though — after cloning, list files with:
+```
+find kanoerp -type f -not -path '*/.git/*'
+```
+Ask for this at the start of a session if you want Claude to reconcile the
+registry (§8) against what's actually in the repo, rather than trusting the
+table below blindly.
 
 ---
 
@@ -72,6 +83,20 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
   proven to work. The one proven pattern: CSV/PDF download via
   `document.createElement('a')` + `Blob` + `.click()` (used in the working CSV export
   and in `ui_prepare_fabric`'s PDF download).
+- **`fetch()` is blocked**, and **writing to any global** (e.g. `window.XLSX = ...`)
+  throws — this is SES lockdown, confirmed while building the CSV importers
+  (`ui_import_*`). Rules out loading external libraries (e.g. a binary `.xlsx`
+  parser like SheetJS) entirely: no way to fetch one in, no way to attach it to a
+  global even if you had the bytes. Users must convert `.xlsx`/`.xls` to CSV before
+  uploading.
+- **`new FileReader()` is blocked** (constructing this specific global throws), but
+  **`Blob.prototype.text()` on an existing `File` object is allowed** — it's an
+  instance method on an object you already have (e.g. from antd's `Upload`
+  component), not a global being instantiated. This is the proven pattern for
+  reading uploaded file contents in this sandbox: get the `File` from antd
+  `Upload`, call `.text()` on it, parse as delimited text (comma/semicolon/tab,
+  auto-detect). See `ui_import_material_details` / `ui_import_product_material` /
+  `ui_import_product_main_material`.
 - **`setTimeout` is blocked** in jblock sandboxes.
 - **PDF generation must not use `window.print`.** Bundle a pure JS PDF writer into a
   `source_code` row instead (see `ui_prepare_fabric`, which builds PDF bytes by hand,
@@ -122,7 +147,7 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
   **not reliable here** — most relations in this schema are enforced at the
   NocoBase application layer, not as real DB foreign key constraints, so a raw-SQL
   FK dump comes back mostly empty even though the relations very much exist and
-  work. See the `view_schema_dump` jblock (§8).
+  work. See the `view_database_schema_dump` jblock (§8).
 - **CPAS / Shopee-integrated ad accounts:** conversions only appear in
   `catalog_segment_actions` / `catalog_segment_value`; the standard
   campaign/account-level `actions`/`action_values` API silently drops conversion data
@@ -234,8 +259,8 @@ collection/field metadata (see §4's introspection note) and lives here:
 **https://raw.githubusercontent.com/ricardoandre/kanoerp/refs/heads/main/kanoerp/Schema%20Dump**
 
 Fetch that file at the start of any session that will touch SQL, `belongsTo`
-payloads, or `appends`. Regenerate it with the `view_schema_dump` jblock (§8)
-whenever the schema changes — see the "Schema refresh ritual" in §2. Do not
+payloads, or `appends`. Regenerate it with the `view_database_schema_dump` jblock
+(§8) whenever the schema changes — see the "Schema refresh ritual" in §2. Do not
 reconstruct or guess schema details from memory; relation field names in
 particular are not predictable from the collection name (§4.1).
 
@@ -251,6 +276,10 @@ column names:
 
 ## 8. Registry — current components
 
+> File names below match the repo exactly, including inconsistent `.js` extensions
+> (some rows have one, some don't — harmless, not worth normalizing yet; see §9 if
+> you want to clean it up).
+
 ### `source_code` rows (shared logic, compiled via `new Function`, loaded with `loadCode`)
 
 | File | NocoBase row name | Purpose |
@@ -262,7 +291,18 @@ column names:
 | `source_code/ui_record_nav.js` | `ui_record_nav` | Cross-record replace-navigation host. Mount one per view root; cross-links close current + open target (never stacks). Depends on both detail components + `ui_production_edit`. |
 | `source_code/ui_prepare_fabric.js` | `ui_prepare_fabric` | Prepare-fabric modal + PDF (was `preparefabric`). `buildFabricPdf` is the future `lib_pdf` extraction candidate — split only once a second PDF consumer exists. |
 | `source_code/ui_material_out.js` | `ui_material_out` | Material-out modal. Exports `openModal({ctx,pmId,onSaved})`, `fetchSummary(ctx,pmId)`, `renderSummary(data)`, `isAccType(type)`. |
-| `source_code/ui_match_production.js` | `ui_match_production` | Reusable match-production module. Exports `openMatchModal`, `fetchMatchData`, `applyMatches`. |
+| `source_code/ui_match_production` | `ui_match_production` | Reusable match-production module. Exports `openMatchModal`, `fetchMatchData`, `applyMatches`. **Not deployed/tested yet — no `act_match_production` shell exists. Deliberately for later stage; see §9.** |
+| `source_code/ui_import_material_details` | `ui_import_material_details` | Bulk-CREATE `material_details` rows from an uploaded CSV (`code`, `fk_material_code`, `variant`, `supplier_variant_code`). Create-only — existing `code` is skipped and reported, no overwrite path. |
+| `source_code/ui_import_product_main_material` | `ui_import_product_main_material` | Bulk-import `product.fk_main_fabric_code` from an uploaded CSV (`code`, `material_code`). Classifies each row: blank → ignored, `code` not found → new `product` row created, already matches → no-op, currently empty → auto-updates, differs (non-empty) → conflict table with opt-in checkboxes before overwrite. |
+| `source_code/ui_import_product_material` | `ui_import_product_material` | Bulk-CREATE `product_material` rows from an uploaded CSV (`product_code`, `material_code`, `quantity`). |
+
+All three importers share one pattern (see §3 for the underlying SES-lockdown
+constraints that forced it): `antd Modal.confirm()` with default OK/Cancel hidden
+and custom buttons in `content`, `Modal.destroyAll()` to close; file contents read
+via `Blob.prototype.text()` on the `File` object from antd `Upload`, parsed as
+delimited text (comma/semicolon/tab auto-detected) — `.xlsx`/`.xls` must be
+converted to CSV before uploading, since no binary parser can be loaded in this
+sandbox.
 
 ### `jblock` rows (inline React pasted into the DB; thin domain shells)
 
@@ -270,14 +310,15 @@ column names:
 |---|---|---|
 | `jblock/view_production.js` | `view_production` | Thin domain config → `ui_list_engine` (SQL, status colors, card layout, detail/edit loaders, mounts `ui_record_nav`). |
 | `jblock/view_production_material.js` | `view_production_material` | Thin domain config → `ui_list_engine` for `production_material`. |
-| `jblock/view_production_result.js` | `view_production_result` | Production result list. Full SQL layer, card/detail/form layouts, 7 secondary filters, 4 bulk actions (including Match Production). |
+| `jblock/view_production_result` | `view_production_result` | Production result list. Full SQL layer, card/detail/form layouts, 7 secondary filters, 4 bulk actions (including Match Production). |
 
 ### `jblock` rows — dev tools (not domain UI; used for project maintenance)
 
 | File | NocoBase row name | Purpose |
 |---|---|---|
-| `jblock/view_source_code_updates.js` | `view_source_code_updates` | Lists `source_code` rows whose `updated_at` is newer than an editable timestamp (Jakarta local, converted to UTC for the query) — shows what's still pending paste-to-GitHub. |
-| `jblock/view_schema_dump.js` | `view_schema_dump` | Produces a copy-pasteable text dump of every collection/field/relation via `ctx.dataSourceManager.getCollections()` (dynamic — no hardcoded table list). Used to regenerate the schema file (§7). |
+| `jblock/view_source_code_updates` | `view_source_code_updates` | Lists `source_code` rows whose `updated_at` is newer than an editable timestamp (Jakarta local, converted to UTC for the query) — shows what's still pending paste-to-GitHub. |
+| `jblock/view_database_schema_dump` | `view_database_schema_dump` | Produces a copy-pasteable text dump of every collection/field/relation via `ctx.dataSourceManager.getCollections()` (dynamic — no hardcoded table list). Used to regenerate the schema file (§7). |
+| `jblock/view_database_table_list` | `view_database_table_list` | Lighter-weight companion: an antd `Table` view of collections (name, title, template, primary key, field count) via the same `dataSourceManager` API — a quick visual browse rather than a copy-paste text dump. |
 
 ### `JSAction` rows (thin action shells)
 
@@ -285,23 +326,36 @@ column names:
 |---|---|---|
 | `jsaction/act_material_out.js` | `act_material_out` | Thin shell → `ui_material_out`. |
 | `jsaction/act_prepare_fabric.js` | `act_prepare_fabric` | Thin shell → `ui_prepare_fabric`. |
-| `jsaction/act_match_production.js` | `act_match_production` | Thin shell → `ui_match_production`. |
+| `jsaction/act_import_material_details` | `act_import_material_details` | Table-level action, thin shell → `ui_import_material_details`. Attach to the `material_details` list block's toolbar. |
+| `jsaction/act_import_product_main_material` | `act_import_product_main_material` | Table-level action, thin shell → `ui_import_product_main_material`. Attach to the `product` table block's toolbar. |
+| `jsaction/act_import_product_material` | `act_import_product_material` | Table-level action, thin shell → `ui_import_product_material`. Attach wherever `product_material` rows are managed. |
+
+**Not yet built:** `act_match_production` (shell for `ui_match_production`) — the
+module exists but isn't wired to a JSAction row yet, deliberately deferred; see §9.
 
 ---
 
 ## 9. What's next (pending / on the horizon)
 
 **Immediately pending:**
-- `ui_result_import` — module for importing production results.
+- `ui_result_import` — module for importing production results. (Distinct from
+  the already-built `ui_import_*` CSV importers in §8, which cover
+  `material_details`, `product.fk_main_fabric_code`, and `product_material` — not
+  `production_result`.)
 - `ui_result_bulk_add` — module for bulk-adding production results.
 - JSAction shells for both of the above (`act_result_import`, `act_result_bulk_add`
   or similar, following the `act_` thin-shell pattern).
+- `act_match_production` — JSAction shell for the already-built `ui_match_production`
+  module. Deliberately deferred: not deployed, not tested yet, for a later stage.
 
 **On the horizon:**
 - Possible future split of `ui_prepare_fabric` into a logic layer + a `lib_pdf`
   layer — only once a second consumer needs the PDF builder (extract-on-second-use).
 - Desktop adaptive branch for a full-screen detail page (currently deferred in favor
   of the single bottom-sheet mobile pattern everywhere).
+- Optional cleanup: normalize the inconsistent `.js` extensions across repo files
+  (some rows have it, some don't — cosmetic only, not urgent). See §2 for how to
+  rename a file on GitHub if/when this gets done.
 
 ---
 
