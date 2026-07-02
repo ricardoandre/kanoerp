@@ -1,0 +1,69 @@
+// Get the main data source (fallback if ctx.dataSource is not available)
+const dataSource = ctx.dataSource || ctx.dataSourceManager.getDataSource('main');
+
+if (!dataSource) {
+  ctx.render(<div style={{ padding: '20px', color: 'red' }}>
+    {ctx.t('No data source available')}
+  </div>);
+  return;
+}
+
+// Get all collections from the data source
+const collections = dataSource.getCollections();
+
+// Map collections to display data
+const tableData = collections.map((col) => ({
+  name: col.name,
+  title: col.title,
+  template: col.template || '-',
+  primaryKey: Array.isArray(col.filterTargetKey) 
+    ? col.filterTargetKey.join(', ') 
+    : col.filterTargetKey || 'id',
+  fieldCount: col.getFields().length
+}));
+
+// Render using Ant Design Table component
+const { Table } = ctx.libs.antd;
+
+ctx.render(
+  <Table
+    dataSource={tableData}
+    rowKey="name"
+    pagination={{ pageSize: 10 }}
+    size="small"
+    bordered
+    columns={[
+      {
+        title: ctx.t('Collection Name'),
+        dataIndex: 'name',
+        key: 'name',
+        width: 200,
+      },
+      {
+        title: ctx.t('Display Title'),
+        dataIndex: 'title',
+        key: 'title',
+        width: 200,
+      },
+      {
+        title: ctx.t('Template'),
+        dataIndex: 'template',
+        key: 'template',
+        width: 120,
+      },
+      {
+        title: ctx.t('Primary Key'),
+        dataIndex: 'primaryKey',
+        key: 'primaryKey',
+        width: 120,
+      },
+      {
+        title: ctx.t('Field Count'),
+        dataIndex: 'fieldCount',
+        key: 'fieldCount',
+        width: 100,
+        align: 'right',
+      }
+    ]}
+  />
+);
