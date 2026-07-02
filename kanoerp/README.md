@@ -516,9 +516,9 @@ prefer cloning if you need certainty here)
 - https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform.js
 - https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/nocobase.js
 - https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/creatives.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/sync-periodic.js *(new, see §10.1 — confirm it's actually been committed before trusting this link)*
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/backfill-periodic.js *(new, see §10.1 — same caveat)*
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform-period.js *(new, see §10.1 — same caveat)*
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/sync-periodic.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/backfill-periodic.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform-period.js
 
 **This list must be kept current by hand** — unlike the registry tables, there's
 no tool that regenerates it. Whenever a file is added/renamed in the repo, add/fix
@@ -540,8 +540,8 @@ reintroduces the exact problem it's meant to solve.
 - `act_match_production` — JSAction shell for the already-built `ui_match_production`
   module. Deliberately deferred: not deployed, not tested yet, for a later stage.
 - **FB Ads weekly/monthly reach & frequency** — see §10.1 for full detail and open
-  questions. Summary: code drafted this session, none of it confirmed pasted/
-  committed/run yet.
+  questions. Summary: code (incl. adset-level support) confirmed committed
+  2026-07-02; not yet confirmed run against real data.
 
 **On the horizon:**
 - Possible future split of `ui_prepare_fabric` into a logic layer + a `lib_pdf`
@@ -583,7 +583,7 @@ immediately, not just deleting the file (git history keeps old commits
 retrievable regardless of later deletions). `node_modules/` and `*.log` are also
 gitignored — regenerate with `npm install`, don't commit dependencies.
 
-### 10.1 Weekly/monthly reach & frequency (started 2026-07-02, NOT yet verified live)
+### 10.1 Weekly/monthly reach & frequency (started 2026-07-02, code confirmed committed 2026-07-02, NOT yet confirmed run against real data)
 
 **Problem:** `sync.js`/`backfill.js` fetch daily rows (`time_increment: 1`) via
 `lib/facebook.js`'s `fetchInsights`. Daily `reach`/`frequency` values are correct
@@ -603,7 +603,7 @@ work started):
 | field | type | notes |
 |---|---|---|
 | `id` | snowflakeId | primary key |
-| `entity_type` | string | `ad` \| `campaign` \| `account` |
+| `entity_type` | string | `ad` \| `adset` \| `campaign` \| `account` |
 | `entity_id` | string | FB id at that level |
 | `period_type` | string | `week` \| `month` |
 | `period_start` | string | `YYYY-MM-DD`; Monday for weeks, 1st-of-month for months |
@@ -615,36 +615,52 @@ work started):
 No `period_end` column — derive it from `period_type` + `period_start` at read
 time if a reporting view needs it.
 
-**Levels:** ad, campaign, and account (Andre's call — "multiple levels", not just
-one). Adset-level was deliberately left out this round; trivial to add later by
-extending `LEVELS` in the two new scripts and `LEVEL_FIELDS.adset` already exists
-in `lib/facebook.js`.
+**Levels: ad, adset, campaign, and account** (adset added 2026-07-02 — see
+"Follow-up" below; originally shipped without it).
 
-**Files changed/added this session:**
+**Files changed/added (original session):**
 - `lib/facebook.js` — **modified.** `fetchInsights` gained an optional
   `timeIncrement` param (default `1`, so `sync.js`/`backfill.js` are unaffected),
   and `LEVEL_FIELDS` gained `account: ['account_id']` (previously only
-  ad/adset/campaign existed, no account-level support at all). A full replacement
-  file was generated and handed to Andre — **not yet confirmed pasted in, and not
-  regression-tested against `sync.js`/`backfill.js` still working afterward.**
+  ad/adset/campaign existed, no account-level support at all).
 - `lib/transform-period.js` — **new.** `transformPeriodRow(level, periodType,
   periodStart, row)`, separate from `transform.js`'s `TRANSFORMERS` because this
   table's shape (entity_type/entity_id/period_type/period_start, no conversions/
   revenue) doesn't match the ad/adset/campaign-keyed daily tables.
 - `sync-periodic.js` — **new.** `node sync-periodic.js --period=week|month`.
   Computes the most recently *closed* period, calls `fetchInsights` with
-  `timeIncrement: null` for each of the three levels, upserts into
-  `fb_ads_period_data` via `upsertMany` (confirmed-real signature from
-  `lib/nocobase.js`).
+  `timeIncrement: null` per level, upserts into `fb_ads_period_data` via
+  `upsertMany`.
 - `backfill-periodic.js` — **new.** `BACKFILL_SINCE=... node backfill-periodic.js
   --period=week|month`. Same idea as `backfill.js` but chunks by whole periods
   (a week or a month), since each chunk IS the row being stored, not something
   aggregated afterward from daily data.
 
-**None of the three new/changed files have been confirmed pasted into
-`~/fb-ads-sync` on the host, committed to this repo, or actually run yet** — this
-section describes what was designed and drafted, not what's live. Verify at the
-start of the next session before assuming any of this works.
+**Confirmed committed 2026-07-02** — verified by `curl`-ing all three raw URLs
+directly (HTTP 200, real file-sized content, not the URL-echo problem noted at
+the top of this doc) rather than trusting a possibly-stale README claim. `curl`
+from a sandboxed bash tool has been more reliable for this kind of check than
+`web_fetch`-style tools in this project so far — prefer it when available.
+
+**Follow-up: adset level added (2026-07-02).** The original version deliberately
+left adset out ("trivial to add later," per the previous version of this note) —
+turned out not quite trivial, there were two spots, not one:
+- `LEVELS` array in both `sync-periodic.js` and `backfill-periodic.js` — added
+  `'adset'` (was `['ad', 'campaign', 'account']`, now
+  `['ad', 'adset', 'campaign', 'account']`).
+- `entityIdFor(level, r)` in `lib/transform-period.js` — this **explicitly
+  throws** for any level not in its if/else chain, and `adset` wasn't in it
+  (only `ad`/`campaign`/`account` were, despite `LEVEL_FIELDS.adset` already
+  existing in `lib/facebook.js`). Added `if (level === 'adset') return
+  r.adset_id;`. Without this fix, adding `'adset'` to `LEVELS` alone would have
+  made every adset-level row throw at transform time.
+
+No changes needed to `lib/facebook.js` — `LEVEL_FIELDS.adset` was already
+correct (`['adset_id', 'adset_name', 'campaign_id']`).
+
+**Not yet done:** none of this — original or adset follow-up — has been
+confirmed actually *run* against real data. Code is committed; execution is
+still unverified. Verify at the start of the next session rather than assuming.
 
 **Suggested (not installed) cron, assuming plain crontab on the host — not
 confirmed, the host might use something else (pm2, systemd timer):**
@@ -661,24 +677,27 @@ first, and only ask if genuinely still unresolved):**
    — unconfirmed whether Andre set this up when creating the table.
 2. Was the edited `lib/facebook.js` actually pasted in, and do `sync.js`/
    `backfill.js` still run correctly afterward (regression check on the
-   `timeIncrement` default-`1` path)?
-3. Were `sync-periodic.js`, `backfill-periodic.js`, `lib/transform-period.js`
-   actually added to `~/fb-ads-sync` and committed to this repo?
+   `timeIncrement` default-`1` path)? Still unconfirmed — not part of what was
+   verified in the 2026-07-02 follow-up (that only touched the two periodic
+   scripts and `transform-period.js`).
+3. ~~Were `sync-periodic.js`, `backfill-periodic.js`, `lib/transform-period.js`
+   actually added to `~/fb-ads-sync` and committed to this repo?~~ **Resolved
+   2026-07-02: yes, confirmed via direct HTTP check, not just trusting the repo
+   listing.**
 4. Has `sync-periodic.js` or `backfill-periodic.js` actually been run once,
-   successfully, against real data? (Not yet, as of this write-up.)
-5. Is adset-level reach/frequency wanted too, alongside ad/campaign/account?
+   successfully, against real data? Still no, as of the adset follow-up —
+   this is now the most important open item.
+5. ~~Is adset-level reach/frequency wanted too, alongside ad/campaign/account?~~
+   **Resolved 2026-07-02: yes, wanted, and added — see "Follow-up" above.**
 6. What does the host actually use for scheduling — plain crontab, pm2,
    something else? The cron block above is a guess based on `backfill.js`'s
    `BACKFILL_SINCE` env-var convention, not a confirmed mechanism.
-7. **`sync.js`, `backfill.js`, and `lib/transform.js`'s real content was not
-   successfully re-verified this session** — the fetch tool returned only bare
-   URL echoes on every attempt at these three specific files this session (see
-   the fetch-reliability note at the top of this doc). Everything said about them
-   in this README (e.g. `TRANSFORMERS`, `pickConv`/`pickRevenue`, the daily
-   `(ad_id, date)` upsert key) is carried over from earlier sessions' summaries
-   and was **not** re-confirmed by direct reading this time. Only `lib/nocobase.js`
-   and (eventually, after several failed attempts) `lib/facebook.js` were
-   actually read for real in this session.
+7. `sync.js`, `backfill.js`, and `lib/transform.js` were re-verified as
+   fetchable (HTTP 200) during the 2026-07-02 link-audit, but their *content*
+   wasn't re-read line-by-line in that pass — everything said about them here
+   (e.g. `TRANSFORMERS`, `pickConv`/`pickRevenue`, the daily `(ad_id, date)`
+   upsert key) is still carried over from earlier sessions' summaries, not
+   freshly re-confirmed by reading.
 
 ---
 
