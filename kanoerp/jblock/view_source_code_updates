@@ -1,0 +1,103 @@
+// =====================================================
+// jblock — SOURCE CODE UPDATES SINCE LAST COMMIT
+//
+// Standalone jblock, no dependency on ui_list_engine or any other shared module.
+// Lists `source_code` rows whose updated_at is newer than SINCE_TIMESTAMP below,
+// so you can see at a glance which source_code rows still need to be pasted into
+// the GitHub mirror.
+//
+// USAGE: after each `git commit`, edit SINCE_TIMESTAMP to "now" (Jakarta time).
+// Anything with updated_at after that point going forward is "not yet committed".
+// =====================================================
+
+// ── EDIT THIS AFTER EVERY COMMIT ──
+// Format: 'YYYY-MM-DD HH:mm:ss', Jakarta local time (WIB, UTC+7) — same wall clock
+// you'd read off your phone. The code converts this to UTC before querying, since
+// `source_code.updated_at` is stored in UTC (e.g. "2026-06-29T08:04:15.075Z").
+const SINCE_TIMESTAMP = '2026-07-01 00:00:00';
+
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Spin, Tag, Button } = antd;
+const ce = React.createElement;
+
+// Jakarta (WIB, UTC+7) wall-clock string → UTC ISO string, via an explicit offset
+// so this doesn't depend on the browser/server's own local timezone.
+function jakartaToUtcIso(local) {
+  const d = new Date(local.replace(' ', 'T') + '+07:00');
+  return d.toISOString();
+}
+const SINCE_TIMESTAMP_UTC = jakartaToUtcIso(SINCE_TIMESTAMP);
+
+function runSql(uid, sql) {
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []);
+}
+
+function fetchUpdated() {
+  const sql =
+    "SELECT name, updated_at FROM source_code " +
+    "WHERE updated_at > '" + SINCE_TIMESTAMP_UTC + "' " +
+    "ORDER BY updated_at DESC";
+  return runSql('src_updated_since', sql);
+}
+
+// UTC ISO string (from DB) → Jakarta (WIB, UTC+7) display string, computed by
+// hand with plain Date math so it doesn't depend on the browser/server's own
+// local timezone, or on dayjs having a utc plugin loaded.
+function fmtDateTimeWIB(d) {
+  if (!d) return '—';
+  const t = new Date(d);
+  if (isNaN(t.getTime())) return String(d);
+  const wib = new Date(t.getTime() + 7 * 60 * 60 * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return pad(wib.getUTCDate()) + '/' + pad(wib.getUTCMonth() + 1) + '/' + wib.getUTCFullYear() +
+    ' ' + pad(wib.getUTCHours()) + ':' + pad(wib.getUTCMinutes()) + ' WIB';
+}
+
+const CSS =
+  ".scu-wrap{font-family:inherit;}" +
+  ".scu-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}" +
+  ".scu-title{font-size:14px;font-weight:600;color:#374151;}" +
+  ".scu-sub{font-size:12px;color:#9ca3af;margin-top:2px;}" +
+  ".scu-row{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #f3f4f6;border-radius:8px;margin-bottom:6px;}" +
+  ".scu-name{font-size:13px;font-weight:600;color:#374151;font-family:monospace;}" +
+  ".scu-time{font-size:12px;color:#6b7280;}" +
+  ".scu-empty{padding:32px;text-align:center;color:#9ca3af;font-size:13px;}";
+const Styles = () => ce('style', null, CSS);
+
+function Row(row) {
+  return ce('div', { key: row.name, className: 'scu-row' },
+    ce('span', { className: 'scu-name' }, row.name),
+    ce('span', { className: 'scu-time' }, fmtDateTimeWIB(row.updated_at)));
+}
+
+const Root = function () {
+  const sRows = useState(null); const rows = sRows[0]; const setRows = sRows[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+
+  function load() {
+    setRows(null);
+    fetchUpdated()
+      .then(function (r) { setRows(r); })
+      .catch(function (e) { setErr((e && e.message) || String(e)); });
+  }
+
+  useEffect(function () { load(); }, []);
+
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load: ' + err);
+
+  return ce('div', { className: 'scu-wrap' },
+    ce(Styles),
+    ce('div', { className: 'scu-header' },
+      ce('div', null,
+        ce('div', { className: 'scu-title' }, 'Uncommitted source_code changes'),
+        ce('div', { className: 'scu-sub' }, 'Since ' + SINCE_TIMESTAMP + ' WIB')),
+      ce(Button, { size: 'small', onClick: load }, 'Refresh')),
+    !rows ? ce(Spin) :
+      rows.length === 0 ? ce('div', { className: 'scu-empty' }, 'Nothing pending — everything is committed.') :
+        ce('div', null, rows.map(Row)));
+};
+
+ctx.render(ce(Root));
