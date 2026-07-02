@@ -1,0 +1,502 @@
+SCHEMA DUMP — generated 2026-07-02T05:21:40.742Z
+Collections found: 33 (all collections)
+
+### roles  ("Roles")  — 9 rows
+  primaryKey: name
+  - name: uid (input)
+  - title: string (input)
+  - description: string
+  - strategy: json
+  - default: boolean
+  - hidden: boolean
+  - allowConfigure: boolean
+  - allowNewMenu: boolean
+  - menuUiSchemas: belongsToMany  [target=uiSchemas, foreignKey=roleName, sourceKey=name, through=rolesUischemas, otherKey=uiSchemaXUid]
+  - resources: hasMany  [target=dataSourcesRolesResources, foreignKey=roleName, sourceKey=name]
+  - snippets: set
+  - users: belongsToMany  [target=users, foreignKey=roleName, sourceKey=name, through=rolesUsers, otherKey=userId]
+  - sort: sort
+  - desktopRoutes: belongsToMany  [target=desktopRoutes, foreignKey=roleName, sourceKey=name, through=rolesDesktopRoutes, otherKey=desktopRouteId]
+  - mobileRoutes: belongsToMany  [target=mobileRoutes, foreignKey=roleName, sourceKey=name, through=rolesMobileRoutes, otherKey=mobileRouteId]
+  - allowNewMobileMenu: boolean
+  - aiEmployees: belongsToMany  [target=aiEmployees, foreignKey=roleName, sourceKey=name, through=rolesAiEmployees, otherKey=aiEmployee]
+  - allowNewAiEmployee: boolean
+
+### users  ("Users")  — 16 rows
+  primaryKey: id
+  - id: bigInt (integer)
+  - nickname: string (input)
+  - username: string (input)
+  - email: string (email)
+  - phone: string (input)
+  - password: password (password)
+  - passwordChangeTz: bigInt
+  - appLang: string
+  - resetToken: string
+  - systemSettings: json
+  - createdAt: date (createdAt)
+  - updatedAt: date (updatedAt)
+  - sort: sort
+  - roles: belongsToMany (m2m)  [target=roles, foreignKey=userId, sourceKey=id, through=rolesUsers, otherKey=roleName]
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - aiEmployees: belongsToMany  [target=aiEmployees, foreignKey=userId, sourceKey=id, through=usersAiEmployees, otherKey=aiEmployee]
+  - updatedById: context
+  - createdById: context
+
+### source_code  ("Source Code")  — 11 rows
+  primaryKey: name, template: general
+  - name: string (input)
+  - code: text (textarea)
+  - createdAt: date (createdAt)
+  - updatedAt: datetimeTz (updatedAt)
+
+### task  ("Task")  — 992 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_owner: string (input)
+  - fk_reviewed_by: string (input)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - task_name: string (input)
+  - owner: belongsTo (obo)  [target=users, foreignKey=fk_owner]
+  - reviewed_by: belongsTo (obo)  [target=users, foreignKey=fk_reviewed_by]
+  - status: string (select)
+  - sop_file: text (markdown)
+  - description: text (richText)
+  - sort_order: sort (sort)
+  - start_date: date (datetime)
+  - deadline: date (datetime)
+  - createdById: context
+  - updatedById: context
+
+### task_schedule  ("Task Schedule")  — 95 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_owner_email: string (input)
+  - fk_reviewed_by_email: string (input)
+  - period: string (select)
+  - period_start: bigInt (integer)
+  - owner: belongsTo (obo)  [target=users, foreignKey=fk_owner_email]
+  - reviewed_by: belongsTo (obo)  [target=users, foreignKey=fk_reviewed_by_email]
+  - task_name: string (input)
+  - day_required: bigInt (integer)
+  - description: text (richText)
+  - sop_file: text (markdown)
+  - sort_order: sort (sort)
+
+### supplier  ("Supplier")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - name: string (input)
+  - address: string (input)
+  - phone_number: string (input)
+  - remarks: text (textarea)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - createdById: context
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - updatedById: context
+
+### product  ("Product")  — 4687 rows
+  primaryKey: code, template: general
+  - code: string (input)
+  - fk_main_fabric_code: string (input)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - name: string (input)
+  - model: string (input)
+  - description: text (textarea)
+  - designer: string (select)
+  - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_6lmp2m73lw8, sourceKey=code, through=t_or62hf6zd06, otherKey=f_rbwo53gqjme]
+  - display: string (input)
+  - product_material: hasMany (o2m)  [target=product_material, foreignKey=fk_product_code, sourceKey=code]
+  - main_fabric: belongsTo (obo)  [target=material_details, foreignKey=fk_main_fabric_code]
+  - createdById: context
+  - updatedById: context
+
+### sku_option  ("SKU Option")  — 8 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - value: string (input)
+  - display: string (input)
+  - sort: sort (sort)
+
+### product_material  ("Product Material")  — 3405 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_material_details_code: string (input)
+  - fk_product_code: string (input)
+  - product: belongsTo (obo)  [target=product, foreignKey=fk_product_code]
+  - material_details: belongsTo (obo)  [target=material_details, foreignKey=fk_material_details_code]
+  - quantity: double (number)
+
+### production  ("Production")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_product_code: string (input)
+  - fk_konveksi_code: string (input)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - created_by_id: bigInt (integer)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - planning_rol: bigInt (integer)
+  - updated_by_id: bigInt (integer)
+  - product_code: belongsTo (obo)  [target=product, foreignKey=fk_product_code]
+  - konveksi: belongsTo (obo)  [target=konveksi, foreignKey=fk_konveksi_code]
+  - status: string (select)
+  - est_production_start: dateOnly (date)
+  - est_production_finish: dateOnly (date)
+  - remarks: text (richText)
+  - production_ref: string (input)
+  - is_new: boolean (checkbox)
+  - brand: string (select)
+  - production_sample: hasMany (o2m)  [target=production_sample, foreignKey=fk_production_id, sourceKey=id]
+  - production_material: hasMany (o2m)  [target=production_material, foreignKey=fk_production_id, sourceKey=id]
+  - do_quantity_details: hasMany (o2m)  [target=production_quantity_details, foreignKey=fk_production_id, sourceKey=id]
+  - production_result: hasMany (o2m)  [target=production_result, foreignKey=fk_production_id, sourceKey=id]
+  - qc_result: hasMany (o2m)  [target=qc_result, foreignKey=fk_production_id, sourceKey=id]
+  - marker: text (richText)
+  - createdById: context
+  - updatedById: context
+
+### konveksi  ("Konveksi")  — 8 rows
+  primaryKey: code, template: general
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - code: string (input)
+  - name: string (input)
+  - updatedById: context
+  - createdById: context
+
+### production_material  ("Production Material")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_material_details_code: string (input)
+  - fk_production_id: bigInt (integer)
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - material_details: belongsTo (obo)  [target=material_details, foreignKey=fk_material_details_code]
+  - quantity_need: double (number)
+  - material_ledger: hasMany (o2m)  [target=material_ledger, foreignKey=fk_production_material_id, sourceKey=id]
+  - status: string (select)
+  - shipment_date: dateOnly (date)
+
+### production_sample  ("Production Sample")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_production_id: bigInt (integer)
+  - fk_sample_product_code: string (input)
+  - sample_product: belongsTo (obo)  [target=product, foreignKey=fk_sample_product_code]
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - shipment_date: dateOnly (date)
+  - status: string (select)
+  - returned_date: dateOnly (date)
+
+### production_quantity_details  ("Production Quantity Details")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_production_id: bigInt (integer)
+  - fk_sku_option_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - quantity: bigInt (integer)
+  - cut_quantity: bigInt (integer)
+  - ratio: bigInt (integer)
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - sku_option: belongsTo (obo)  [target=sku_option, foreignKey=fk_sku_option_id]
+  - updatedById: context
+  - createdById: context
+
+### production_result  ("Production Result")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_sku_option_id: bigInt (integer)
+  - fk_production_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - remarks: string (input)
+  - sku_option: belongsTo (obo)  [target=sku_option, foreignKey=fk_sku_option_id]
+  - shipment_date: dateOnly (date)
+  - checking_pic: string (select)
+  - is_permakan: boolean (checkbox)
+  - import_product_code: string (input)
+  - quantity: bigInt (integer)
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - updatedById: context
+  - createdById: context
+
+### qc_result  ("QC Result")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_production_id: bigInt (integer)
+  - fk_sku_option_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - qc_date: dateOnly (date)
+  - sku_option: belongsTo (obo)  [target=sku_option, foreignKey=fk_sku_option_id]
+  - quantity: bigInt (integer)
+  - is_defect: boolean (checkbox)
+  - qc_person: string (select)
+  - remarks: string (input)
+  - import_product_code: string (input)
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - updatedById: context
+  - createdById: context
+
+### launch_plan  ("Launch Plan")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_product_code: string (input)
+  - fk_production_id: bigInt (integer)
+  - launch_date: dateOnly (date)
+  - production: belongsTo (obo)  [target=production, foreignKey=fk_production_id]
+  - brand: string (select)
+  - is_launched: boolean (checkbox)
+  - product: belongsTo (obo)  [target=product, foreignKey=fk_product_code]
+
+### raw_material  ("Raw Material")  — 297 rows
+  primaryKey: code, template: general
+  - code: string (input)
+  - type: string (select)
+  - price: double (number)
+  - price_per_unit: double (number)
+  - remarks: text (richText)
+  - default_content: bigInt (integer)
+
+### material_details  ("Material Details")  — 1273 rows
+  primaryKey: code, template: general
+  - code: string (input)
+  - fk_supplier_id: bigInt (integer)
+  - fk_material_code: string (input)
+  - material: belongsTo (obo)  [target=raw_material, foreignKey=fk_material_code]
+  - variant: string (input)
+  - supplier_variant_code: string (input)
+  - barcode: string (input)
+  - supplier: belongsTo (obo)  [target=supplier, foreignKey=fk_supplier_id]
+  - remarks: text (richText)
+
+### material_ledger  ("Material Ledger")  — 44 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_supplier_id: bigInt (integer)
+  - fk_material_code: string (input)
+  - fk_production_material_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - material: belongsTo (obo)  [target=material_details, foreignKey=fk_material_code]
+  - type: string (select)
+  - transaction_date: dateOnly (date)
+  - supplier: belongsTo (obo)  [target=supplier, foreignKey=fk_supplier_id]
+  - purpose: string (select)
+  - material_ledger_details: hasMany (o2m)  [target=material_ledger_details, foreignKey=fk_material_ledger_id, sourceKey=id]
+  - production_material: belongsTo (obo)  [target=production_material, foreignKey=fk_production_material_id]
+  - updatedById: context
+  - createdById: context
+
+### material_ledger_details  ("Material Ledger Details")  — 90 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_material_ledger_id: bigInt (integer)
+  - material_ledger: belongsTo (obo)  [target=material_ledger, foreignKey=fk_material_ledger_id]
+  - details: bigInt (integer)
+
+### sample  ("Sample")  — 76 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_accessories_code2: string (input)
+  - fk_fabric_code2: string (input)
+  - fk_accessories_code4: string (input)
+  - fk_collection_id: bigInt (integer)
+  - fk_accessories_code: string (input)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - updatedAt: date (updatedAt)
+  - updatedBy: belongsTo (updatedBy)  [target=users, foreignKey=updatedById]
+  - reference_images: belongsToMany (attachment)  [target=attachments, foreignKey=f_57nmxuosclw, sourceKey=id, through=t_wda3bnmr9c9, otherKey=f_3icqdx05qdd]
+  - type: string (select)
+  - status: string (select)
+  - is_new: boolean (checkbox)
+  - name: string (input)
+  - description: text (richText)
+  - difficulty: bigInt (integer)
+  - target_price: double (number)
+  - designer: string (select)
+  - pola_pic: string (select)
+  - remarks: text (richText)
+  - collection: belongsTo (obo)  [target=collection, foreignKey=fk_collection_id]
+  - sort: sort (sort)
+  - sample_variant: hasMany (o2m)  [target=sample_variant, foreignKey=fk_sample_variant_id, sourceKey=id]
+  - pricing_remarks: text (richText)
+  - global_sort: sort (sort)
+  - comment: hasMany (o2m)  [target=sample_comment, foreignKey=fk_sample_id, sourceKey=id]
+  - sample_material: hasMany (o2m)  [target=sample_material, foreignKey=fk_sample_id, sourceKey=id]
+  - createdById: context
+  - updatedById: context
+
+### sample_material  ("Sample Material")  — 81 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_sample_id: bigInt (integer)
+  - fk_raw_material_code: string (input)
+  - sample: belongsTo (obo)  [target=sample, foreignKey=fk_sample_id]
+  - raw_material: belongsTo (obo)  [target=raw_material, foreignKey=fk_raw_material_code]
+  - quantity: double (number)
+
+### sample_variant  ("Sample Variant")  — 123 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_fabric_code2: string (input)
+  - fk_sample_variant_id: bigInt (integer)
+  - fk_fabric_code: string (input)
+  - fabric: belongsTo (obo)  [target=material_details, foreignKey=fk_fabric_code]
+  - fabric2: belongsTo (obo)  [target=material_details, foreignKey=fk_fabric_code2]
+  - sewing_pic: string (select)
+  - status: string (select)
+  - sample: belongsTo (obo)  [target=sample, foreignKey=fk_sample_variant_id]
+  - sewing_date: dateOnly (date)
+
+### sample_comment  ("Sample Comment")  — 70 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_sample_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - comment: text (richText)
+  - sample: belongsTo (obo)  [target=sample, foreignKey=fk_sample_id]
+  - createdById: context
+
+### collection  ("Collection")  — 8 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - name: string (input)
+  - brand: string (select)
+  - target_photoshoot: dateOnly (date)
+  - photoshoot: boolean (checkbox)
+  - collection_checkpoint: hasMany (o2m)  [target=collection_checkpoint, foreignKey=fk_collection_id, sourceKey=id]
+
+### collection_checkpoint  ("Collection Checkpoint")  — 19 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_collection_id: bigInt (integer)
+  - checkpoint_date: dateOnly (date)
+  - approved_sample: bigInt (integer)
+  - collection: belongsTo (obo)  [target=collection, foreignKey=fk_collection_id]
+
+### canvas  ("Canvas")  — 3 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_collection_id: bigInt (integer)
+  - createdAt: date (createdAt)
+  - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
+  - name: string (input)
+  - collection: belongsTo (obo)  [target=collection, foreignKey=fk_collection_id]
+  - layout: text (textarea)
+  - archive: boolean (checkbox)
+  - createdById: context
+
+### history  ("History")  — 469 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_user_id: bigInt (integer)
+  - user: belongsTo (obo)  [target=users, foreignKey=fk_user_id]
+  - table_id: snowflakeId (snowflakeId)
+  - status: string (input)
+  - message: text (textarea)
+  - table_name: string (input)
+  - category: string (input)
+  - create_date: date (datetime)
+
+### ads_insights  ("Ads Insights")  — 34005 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - ad_id: string (input)
+  - createdAt: date (createdAt)
+  - updatedAt: date (updatedAt)
+  - ad_name: string (input)
+  - adset_id: string (input)
+  - campaign_id: string (input)
+  - date: dateOnly (date)
+  - reach: integer (integer)
+  - frequency: float (number)
+  - impressions: integer (integer)
+  - clicks: integer (integer)
+  - link_clicks: integer (integer)
+  - ctr: float (number)
+  - cpc: float (number)
+  - landing_page_views: integer (integer)
+  - atc: integer (integer)
+  - checkout: integer (integer)
+  - purchase: integer (integer)
+  - registration: integer (integer)
+  - revenue: decimal (number)
+  - spend: decimal (number)
+  - ads_details: belongsTo (obo)  [target=ads_creative, foreignKey=ad_id]
+
+### adsets_insights  ("Adsets Insights")  — 5648 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - createdAt: date (createdAt)
+  - updatedAt: date (updatedAt)
+  - adset_id: string (input)
+  - adset_name: string (input)
+  - campaign_id: string (input)
+  - date: dateOnly (date)
+  - reach: integer (integer)
+  - frequency: float (number)
+  - impressions: integer (integer)
+  - clicks: integer (integer)
+  - link_clicks: integer (integer)
+  - ctr: float (number)
+  - cpc: float (number)
+  - landing_page_views: integer (integer)
+  - atc: integer (integer)
+  - checkout: integer (integer)
+  - purchase: integer (integer)
+  - registration: integer (integer)
+  - revenue: decimal (number)
+  - spend: decimal (number)
+
+### campaigns_insights  ("Campaigns Insights")  — 1879 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - createdAt: date (createdAt)
+  - updatedAt: date (updatedAt)
+  - campaign_id: string (input)
+  - campaign_name: string (input)
+  - date: dateOnly (date)
+  - reach: integer (integer)
+  - frequency: float (number)
+  - impressions: integer (integer)
+  - clicks: integer (integer)
+  - link_clicks: integer (integer)
+  - ctr: float (number)
+  - cpc: float (number)
+  - landing_page_views: integer (integer)
+  - atc: integer (integer)
+  - checkout: integer (integer)
+  - purchase: integer (integer)
+  - registration: integer (integer)
+  - revenue: decimal (number)
+  - spend: decimal (number)
+
+### ads_creative  ("Ads Creative")  — 1131 rows
+  primaryKey: ad_id, template: general
+  - ad_id: string (input)
+  - ad_name: string (input)
+  - creative_id: string (input)
+  - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_ph199nd1xyc, sourceKey=ad_id, through=t_4ylsjidv6a2, otherKey=f_ecp7hycxw1i]
+  - source_url: text (textarea)
