@@ -1,0 +1,358 @@
+// =====================================================
+// ui_import_material_code — bulk-import product.fk_main_fabric_code from an
+// uploaded CSV file (2 columns: code, material_code).
+//
+// SANDBOX NOTE: this environment's SES lockdown blocks quite a lot of normal
+// browser API surface: document.* property access, fetch(), writing to any
+// global (e.g. window.XLSX), and `new FileReader()` all throw. That rules
+// out loading a binary .xlsx parser (SheetJS) entirely — there's no way to
+// fetch one in, and no way to read the file's bytes even if there were. So:
+//   - Mounting follows ui_material_out's pattern: antd Modal.confirm() with
+//     OK/Cancel hidden, custom buttons inside `content`, Modal.destroyAll()
+//     to close.
+//   - Files are read via Blob.prototype.text() on the File object antd's
+//     Upload already hands us (an instance method on an existing object,
+//     not a global we're instantiating — this one is allowed) and parsed as
+//     plain delimited text (comma/semicolon/tab, auto-detected). Convert
+//     .xlsx/.xls to CSV before uploading.
+//
+// Stored as a `source_code` row named 'ui_import_material_code'.
+// Loaded via loadCode(ctx, 'ui_import_material_code'); compiled with
+// new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
+//
+// EXPORTS (contract):
+//   openModal({ ctx, onSaved })
+//     — opens the wizard (pick file -> preview/validate -> confirm -> run ->
+//       summary) via Modal.confirm. onSaved() fires once, after the modal is
+//       closed, IF at least one row was actually updated.
+//
+// Effect per row { code, material_code }:
+//   UPDATE product SET fk_main_fabric_code = material_code WHERE code = code
+// via ctx.api.resource('product').update({ filter: { code }, values: {...} }).
+// Classification before running anything:
+//   - blank code or blank material_code            -> ignored entirely
+//   - code not found in product                    -> a NEW product row is
+//     created: { code, fk_main_fabric_code: material_code } (no confirmation
+//     needed; if `product` has other required fields the create() call will
+//     fail per-row and show up in the error list)
+//   - current fk_main_fabric_code already matches   -> skipped as a no-op
+//   - current fk_main_fabric_code is empty          -> updates automatically
+//   - current fk_main_fabric_code differs (non-empty) -> conflict; shown in
+//     its own table with checkboxes (unchecked by default) so the user
+//     explicitly opts in per row before anything gets overwritten.
+//
+// Depends on: none.
+// =====================================================
+
+const { useState } = React;
+const { Modal, Upload, Button, Table, Alert, Progress } = antd;
+const ce = React.createElement;
+
+function runSql(ctx, uid, sql) {
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []).catch(() => []);
+}
+
+// Reads the File object antd's Upload already handed us. Deliberately NOT
+// `new FileReader()` — that constructor is blocked in this sandbox, same as
+// document.* and fetch(). Blob.prototype.text() is an instance method on an
+// object the platform already gave us, not a global we're instantiating, so
+// it isn't subject to the same restriction.
+function readFileAsText(file) {
+  if (file && typeof file.text === 'function') return file.text();
+  return Promise.reject(new Error('Cannot read this file in this sandbox.'));
+}
+
+function splitDelimitedLine(line, delim) {
+  const out = []; let cur = ''; let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === delim && !inQuotes) {
+      out.push(cur); cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function detectDelimiter(firstLine) {
+  const cands = [',', ';', '\t'];
+  let best = ',', bestCount = -1;
+  cands.forEach(function (d) {
+    const c = firstLine.split(d).length - 1;
+    if (c > bestCount) { bestCount = c; best = d; }
+  });
+  return best;
+}
+
+// Shared normalizer: raw = array of row-arrays (cells). Skips a header row
+// heuristically (col A === 'code' or col B looks like 'material_code'). Rows
+// where BOTH cells are blank are dropped; a row with code but blank
+// material_code is kept (clears the FK on update).
+function rowsFromCells(raw) {
+  if (!raw || !raw.length) return [];
+  let start = 0;
+  const c0 = String(raw[0][0] == null ? '' : raw[0][0]).trim().toLowerCase();
+  const c1 = String(raw[0][1] == null ? '' : raw[0][1]).trim().toLowerCase();
+  if (c0 === 'code' || c1 === 'material_code' || c1 === 'material code') start = 1;
+  const out = [];
+  for (let i = start; i < raw.length; i++) {
+    const r = raw[i] || [];
+    const code = String(r[0] == null ? '' : r[0]).trim();
+    const material_code = String(r[1] == null ? '' : r[1]).trim();
+    if (!code && !material_code) continue;
+    out.push({ code: code, material_code: material_code, row: i + 1 });
+  }
+  return out;
+}
+
+function csvToCells(text) {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '');
+  if (!lines.length) return [];
+  const delim = detectDelimiter(lines[0]);
+  return lines.map(function (l) { return splitDelimitedLine(l, delim); });
+}
+
+function parseCsvRows(text) { return rowsFromCells(csvToCells(text)); }
+
+function ImportContent(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+  const sP = useState('pick'); const phase = sP[0]; const setPhase = sP[1]; // pick | parsing | preview | running | done
+  const sErr = useState(''); const err = sErr[0]; const setErr = sErr[1];
+  const sRows = useState([]); const rows = sRows[0]; const setRows = sRows[1];
+  const sFresh = useState([]); const fresh = sFresh[0]; const setFresh = sFresh[1]; // will update, no confirmation needed
+  const sConflicts = useState([]); const conflicts = sConflicts[0]; const setConflicts = sConflicts[1]; // needs confirmation
+  const sSelectedConflicts = useState([]); const selectedConflicts = sSelectedConflicts[0]; const setSelectedConflicts = sSelectedConflicts[1]; // rowKeys
+  const sNoop = useState([]); const noop = sNoop[0]; const setNoop = sNoop[1]; // already correct
+  const sToCreateNew = useState([]); const toCreateNew = sToCreateNew[0]; const setToCreateNew = sToCreateNew[1]; // code not found — will create new product
+  const sBlankSkipped = useState(0); const blankSkipped = sBlankSkipped[0]; const setBlankSkipped = sBlankSkipped[1]; // blank code/material_code
+  const sProg = useState({ done: 0, total: 0 }); const prog = sProg[0]; const setProg = sProg[1];
+  const sRes = useState({ updated: 0, created: 0, errors: [] }); const results = sRes[0]; const setResults = sRes[1];
+  const sBusy = useState(false); const busy = sBusy[0]; const setBusy = sBusy[1];
+  const savedAnyRef = React.useRef(false);
+
+  function reset() {
+    setPhase('pick'); setErr(''); setRows([]);
+    setFresh([]); setConflicts([]); setSelectedConflicts([]); setNoop([]); setToCreateNew([]); setBlankSkipped(0);
+    setProg({ done: 0, total: 0 }); setResults({ updated: 0, created: 0, errors: [] });
+  }
+
+  function handleFile(file) {
+    setErr(''); setPhase('parsing'); setBusy(true);
+    let parsed = [];
+    Promise.resolve()
+      .then(function () { return readFileAsText(file); })
+      .then(function (text) {
+        parsed = parseCsvRows(text);
+        if (!parsed.length) throw new Error('No data rows found in the file.');
+        setRows(parsed);
+        return runSql(ctx, 'imc_prod_codes', 'SELECT code, fk_main_fabric_code FROM product');
+      })
+      .then(function (prodRows) {
+        const current = {};
+        (prodRows || []).forEach(function (p) {
+          current[String(p.code).trim()] = p.fk_main_fabric_code == null ? '' : String(p.fk_main_fabric_code).trim();
+        });
+        const f = [], c = [], n = [], cr = [];
+        let blanks = 0;
+        parsed.forEach(function (row) {
+          if (!row.code || !row.material_code) { blanks++; return; } // blank row — ignore
+          if (!(row.code in current)) { cr.push(row); return; } // code not found — will create new product
+          const cur = current[row.code];
+          if (cur === row.material_code) { n.push(row); return; } // already correct
+          if (!cur) { f.push(row); return; } // currently empty — safe to set
+          c.push(Object.assign({}, row, { current_value: cur })); // conflict — needs confirmation
+        });
+        setFresh(f); setConflicts(c); setSelectedConflicts([]); setNoop(n); setToCreateNew(cr); setBlankSkipped(blanks);
+        setPhase('preview'); setBusy(false);
+      })
+      .catch(function (e) {
+        setErr((e && e.message) || String(e));
+        setPhase('pick'); setBusy(false);
+      });
+  }
+
+  async function runUpdates() {
+    const selectedSet = {};
+    selectedConflicts.forEach(function (k) { selectedSet[k] = true; });
+    const updates = fresh.concat(conflicts.filter(function (row) { return selectedSet[row.row]; }));
+    const creates = toCreateNew;
+    const total = updates.length + creates.length;
+    setPhase('running'); setBusy(true);
+    setProg({ done: 0, total: total });
+    let updated = 0, created = 0;
+    const errors = [];
+    for (let i = 0; i < updates.length; i++) {
+      const row = updates[i];
+      try {
+        await ctx.api.resource('product').update({
+          filter: { code: row.code },
+          values: { fk_main_fabric_code: row.material_code },
+        });
+        updated++;
+      } catch (e) {
+        errors.push({ code: row.code, message: (e && e.message) || String(e) });
+      }
+      setProg({ done: i + 1, total: total });
+    }
+    for (let i = 0; i < creates.length; i++) {
+      const row = creates[i];
+      try {
+        await ctx.api.resource('product').create({
+          values: { code: row.code, fk_main_fabric_code: row.material_code },
+        });
+        created++;
+      } catch (e) {
+        errors.push({ code: row.code, message: (e && e.message) || String(e) });
+      }
+      setProg({ done: updates.length + i + 1, total: total });
+    }
+    setResults({ updated: updated, created: created, errors: errors });
+    setBusy(false); setPhase('done');
+    if (updated > 0 || created > 0) savedAnyRef.current = true;
+  }
+
+  function close() {
+    if (busy) return;
+    Modal.destroyAll();
+    if (savedAnyRef.current) onSaved();
+  }
+
+  const freshCols = [
+    { title: 'Code', dataIndex: 'code', key: 'code' },
+    { title: 'New Material Code', dataIndex: 'material_code', key: 'material_code' },
+  ];
+  const conflictCols = [
+    { title: 'Code', dataIndex: 'code', key: 'code' },
+    { title: 'Current Value', dataIndex: 'current_value', key: 'current_value' },
+    { title: 'New Value', dataIndex: 'material_code', key: 'material_code' },
+  ];
+  const createCols = [
+    { title: 'Code (new product)', dataIndex: 'code', key: 'code' },
+    { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
+  ];
+
+  if (phase === 'pick' || phase === 'parsing') {
+    return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+      ce(Upload.Dragger, {
+        accept: '.csv,.txt,.tsv',
+        showUploadList: false,
+        disabled: phase === 'parsing',
+        beforeUpload: function (file) { handleFile(file); return false; },
+      },
+        ce('p', { style: { fontSize: 28, margin: '4px 0' } }, phase === 'parsing' ? '⏳' : '📄'),
+        ce('p', { style: { fontWeight: 600 } }, phase === 'parsing' ? 'Reading file…' : 'Click or drag a CSV file here'),
+        ce('p', { style: { fontSize: 12, color: '#9ca3af' } }, 'Column A: code, column B: material_code')),
+      err ? ce(Alert, { type: 'error', showIcon: true, message: err, style: { marginTop: 12 } }) : null,
+      ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
+        ce(Button, { onClick: close, disabled: phase === 'parsing' }, 'Cancel')));
+  }
+
+  if (phase === 'preview') {
+    const runCount = fresh.length + selectedConflicts.length + toCreateNew.length;
+    const summaryBits = [];
+    summaryBits.push(fresh.length + ' will be set');
+    if (toCreateNew.length) summaryBits.push(toCreateNew.length + ' new product(s) will be created');
+    if (noop.length) summaryBits.push(noop.length + ' already correct (skipped)');
+    if (conflicts.length) summaryBits.push(conflicts.length + ' conflict(s) — pick which to overwrite below');
+    if (blankSkipped) summaryBits.push(blankSkipped + ' blank row(s) ignored');
+
+    return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+      ce(Alert, {
+        type: conflicts.length ? 'warning' : 'info', showIcon: true,
+        message: rows.length + ' row(s) read from the file.',
+        description: summaryBits.join('. ') + '.',
+      }),
+      fresh.length ? ce('div', { style: { marginTop: 12 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Will update (' + fresh.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: freshCols, dataSource: fresh })) : null,
+      toCreateNew.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Will create new product (' + toCreateNew.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: createCols, dataSource: toCreateNew })) : null,
+      conflicts.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Conflicts — select which to overwrite (' + selectedConflicts.length + ' of ' + conflicts.length + ' selected)'),
+        ce(Table, {
+          size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: conflictCols, dataSource: conflicts,
+          rowSelection: {
+            selectedRowKeys: selectedConflicts,
+            onChange: function (keys) { setSelectedConflicts(keys); },
+          },
+        })) : null,
+      ce('div', { style: { display: 'flex', justifyContent: 'space-between', marginTop: 16 } },
+        ce(Button, { onClick: reset }, 'Back'),
+        ce('div', { style: { display: 'flex', gap: 8 } },
+          ce(Button, { onClick: close }, 'Cancel'),
+          ce(Button, { type: 'primary', disabled: !runCount, onClick: runUpdates },
+            'Run import — ' + runCount + ' row(s)'))));
+  }
+
+  if (phase === 'running') {
+    return ce('div', { style: { padding: '20px 0', textAlign: 'center' } },
+      ce(Progress, { percent: prog.total ? Math.round((prog.done / prog.total) * 100) : 0 }),
+      ce('div', { style: { marginTop: 8, color: '#6b7280', fontSize: 13 } }, 'Updating ' + prog.done + ' / ' + prog.total + '…'));
+  }
+
+  // done
+  const totalAttempted = fresh.length + selectedConflicts.length + toCreateNew.length;
+  const unresolvedConflicts = conflicts.filter(function (row) { return selectedConflicts.indexOf(row.row) === -1; });
+
+  function statRow(label, value, color) {
+    return ce('div', { style: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
+      ce('span', { style: { color: '#475569' } }, label),
+      ce('span', { style: { fontWeight: 600, color: color || '#111827' } }, value));
+  }
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+    ce(Alert, {
+      type: results.errors.length ? 'warning' : 'success', showIcon: true,
+      message: 'Updated ' + results.updated + ' and created ' + results.created + ' (of ' + totalAttempted + ' attempted).',
+    }),
+    ce('div', { style: { marginTop: 12, border: '1px solid #e5e7eb', borderRadius: 6, padding: '4px 12px' } },
+      statRow('Rows read from file', rows.length),
+      statRow('Updated successfully', results.updated, '#16a34a'),
+      statRow('New products created', results.created, '#16a34a'),
+      results.errors.length ? statRow('Failed', results.errors.length, '#dc2626') : null,
+      noop.length ? statRow('Already correct (skipped)', noop.length) : null,
+      blankSkipped ? statRow('Blank rows ignored', blankSkipped) : null,
+      unresolvedConflicts.length ? statRow('Conflicts left unresolved (not selected)', unresolvedConflicts.length, '#d97706') : null),
+    results.errors.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Failed rows'),
+      ce(Table, {
+        size: 'small', rowKey: 'code', pagination: { pageSize: 5 },
+        columns: [{ title: 'Code', dataIndex: 'code' }, { title: 'Error', dataIndex: 'message' }],
+        dataSource: results.errors,
+      })) : null,
+    unresolvedConflicts.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Conflicts not overwritten'),
+      ce(Table, {
+        size: 'small', rowKey: 'row', pagination: { pageSize: 5 },
+        columns: [{ title: 'Code', dataIndex: 'code' }, { title: 'Current Value', dataIndex: 'current_value' }, { title: 'File Value', dataIndex: 'material_code' }],
+        dataSource: unresolvedConflicts,
+      })) : null,
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
+      ce(Button, { type: 'primary', onClick: close }, 'Close')));
+}
+
+// ===== entry point: mirrors ui_material_out's openModal shell exactly =====
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+  Modal.confirm({
+    title: 'Import Fabric Code',
+    width: 640,
+    icon: null,
+    content: ce(ImportContent, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal };
