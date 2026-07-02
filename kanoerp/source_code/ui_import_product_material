@@ -1,0 +1,372 @@
+// =====================================================
+// ui_import_product_material — bulk-CREATE product_material rows from an
+// uploaded CSV file (3 columns: product_code, material_code, quantity).
+//
+// product_material fields:
+//   fk_product_code          -> product.code
+//   fk_material_details_code -> material_details.code
+//   quantity
+//
+// SANDBOX NOTE (same environment as ui_import_material_code): SES lockdown
+// blocks document.* property access, fetch(), writing to any global, and
+// `new FileReader()`. So:
+//   - Mounting follows ui_material_out's pattern: antd Modal.confirm() with
+//     OK/Cancel hidden, custom buttons inside `content`, Modal.destroyAll()
+//     to close.
+//   - Files are read via Blob.prototype.text() on the File object antd's
+//     Upload already hands us (an instance method on an existing object,
+//     not a global we're instantiating — this one is allowed), parsed as
+//     plain delimited text (comma/semicolon/tab, auto-detected).
+//
+// Stored as a `source_code` row named 'ui_import_product_material'.
+// Loaded via loadCode(ctx, 'ui_import_product_material'); compiled with
+// new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
+//
+// EXPORTS (contract):
+//   openModal({ ctx, onSaved })
+//     — opens the wizard (pick file -> preview/validate -> confirm -> run ->
+//       summary) via Modal.confirm. onSaved() fires once, after the modal is
+//       closed, IF at least one row was actually created.
+//
+// Classification before running anything, per row { product_code,
+// material_code, quantity_raw }:
+//   - all three cells blank                          -> ignored entirely
+//   - missing product_code and/or material_code       -> skipped, invalid
+//   - quantity blank (codes present)                  -> row is still
+//     created, `quantity` is simply left unset (not sent as 0 or null)
+//   - quantity present but not a valid number         -> skipped, invalid
+//   - product_code not found in product                -> skipped, listed
+//   - material_code not found in material_details       -> skipped, listed
+//   - (product_code, material_code) pair already exists
+//     in product_material                              -> skipped as duplicate
+//   - otherwise                                        -> created
+// =====================================================
+
+const { useState } = React;
+const { Modal, Upload, Button, Table, Alert, Progress } = antd;
+const ce = React.createElement;
+
+function runSql(ctx, uid, sql) {
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []).catch(() => []);
+}
+
+// Reads the File object antd's Upload already handed us. Deliberately NOT
+// `new FileReader()` — that constructor is blocked in this sandbox, same as
+// document.* and fetch(). Blob.prototype.text() is an instance method on an
+// object the platform already gave us, not a global we're instantiating, so
+// it isn't subject to the same restriction.
+function readFileAsText(file) {
+  if (file && typeof file.text === 'function') return file.text();
+  return Promise.reject(new Error('Cannot read this file in this sandbox.'));
+}
+
+function splitDelimitedLine(line, delim) {
+  const out = []; let cur = ''; let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === delim && !inQuotes) {
+      out.push(cur); cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function detectDelimiter(firstLine) {
+  const cands = [',', ';', '\t'];
+  let best = ',', bestCount = -1;
+  cands.forEach(function (d) {
+    const c = firstLine.split(d).length - 1;
+    if (c > bestCount) { bestCount = c; best = d; }
+  });
+  return best;
+}
+
+// Shared normalizer: raw = array of row-arrays (cells: product_code,
+// material_code, quantity). Skips a header row heuristically. Rows where
+// ALL THREE cells are blank are dropped silently (true blank rows); rows
+// missing only some fields are kept and classified later as invalid.
+function rowsFromCells(raw) {
+  if (!raw || !raw.length) return [];
+  let start = 0;
+  const c0 = String(raw[0][0] == null ? '' : raw[0][0]).trim().toLowerCase();
+  const c1 = String(raw[0][1] == null ? '' : raw[0][1]).trim().toLowerCase();
+  const c2 = String(raw[0][2] == null ? '' : raw[0][2]).trim().toLowerCase();
+  if (c0 === 'product_code' || c0 === 'code' || c1 === 'material_code' || c1 === 'material_details_code'
+      || c2 === 'quantity' || c2 === 'qty') start = 1;
+  const out = [];
+  for (let i = start; i < raw.length; i++) {
+    const r = raw[i] || [];
+    const product_code = String(r[0] == null ? '' : r[0]).trim();
+    const material_code = String(r[1] == null ? '' : r[1]).trim();
+    const quantity_raw = String(r[2] == null ? '' : r[2]).trim();
+    if (!product_code && !material_code && !quantity_raw) continue; // fully blank row — ignore
+    out.push({ product_code: product_code, material_code: material_code, quantity_raw: quantity_raw, row: i + 1 });
+  }
+  return out;
+}
+
+function csvToCells(text) {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '');
+  if (!lines.length) return [];
+  const delim = detectDelimiter(lines[0]);
+  return lines.map(function (l) { return splitDelimitedLine(l, delim); });
+}
+
+function parseCsvRows(text) { return rowsFromCells(csvToCells(text)); }
+
+function ImportContent(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+  const sP = useState('pick'); const phase = sP[0]; const setPhase = sP[1]; // pick | parsing | preview | running | done
+  const sErr = useState(''); const err = sErr[0]; const setErr = sErr[1];
+  const sRows = useState([]); const rows = sRows[0]; const setRows = sRows[1];
+  const sToCreate = useState([]); const toCreate = sToCreate[0]; const setToCreate = sToCreate[1];
+  const sDup = useState([]); const dup = sDup[0]; const setDup = sDup[1]; // already exists
+  const sNoProduct = useState([]); const noProduct = sNoProduct[0]; const setNoProduct = sNoProduct[1];
+  const sNoMaterial = useState([]); const noMaterial = sNoMaterial[0]; const setNoMaterial = sNoMaterial[1];
+  const sInvalid = useState([]); const invalid = sInvalid[0]; const setInvalid = sInvalid[1]; // missing fields / bad quantity
+  const sBlankSkipped = useState(0); const blankSkipped = sBlankSkipped[0]; const setBlankSkipped = sBlankSkipped[1];
+  const sProg = useState({ done: 0, total: 0 }); const prog = sProg[0]; const setProg = sProg[1];
+  const sRes = useState({ created: 0, errors: [] }); const results = sRes[0]; const setResults = sRes[1];
+  const sBusy = useState(false); const busy = sBusy[0]; const setBusy = sBusy[1];
+  const savedAnyRef = React.useRef(false);
+
+  function reset() {
+    setPhase('pick'); setErr(''); setRows([]);
+    setToCreate([]); setDup([]); setNoProduct([]); setNoMaterial([]); setInvalid([]); setBlankSkipped(0);
+    setProg({ done: 0, total: 0 }); setResults({ created: 0, errors: [] });
+  }
+
+  function handleFile(file) {
+    setErr(''); setPhase('parsing'); setBusy(true);
+    let parsed = [];
+    Promise.resolve()
+      .then(function () { return readFileAsText(file); })
+      .then(function (text) {
+        parsed = parseCsvRows(text);
+        if (!parsed.length) throw new Error('No data rows found in the file.');
+        setRows(parsed);
+        return Promise.all([
+          runSql(ctx, 'ipm_products', 'SELECT code FROM product'),
+          runSql(ctx, 'ipm_materials', 'SELECT code FROM material_details'),
+          runSql(ctx, 'ipm_existing', 'SELECT fk_product_code, fk_material_details_code FROM product_material'),
+        ]);
+      })
+      .then(function (results3) {
+        const productRows = results3[0], materialRows = results3[1], existingRows = results3[2];
+        const productSet = {};
+        (productRows || []).forEach(function (p) { productSet[String(p.code).trim()] = true; });
+        const materialSet = {};
+        (materialRows || []).forEach(function (m) { materialSet[String(m.code).trim()] = true; });
+        const existingSet = {};
+        (existingRows || []).forEach(function (e) {
+          const key = String(e.fk_product_code).trim() + '||' + String(e.fk_material_details_code).trim();
+          existingSet[key] = true;
+        });
+
+        const create = [], du = [], noProd = [], noMat = [], inv = [];
+        let blanks = 0;
+        parsed.forEach(function (row) {
+          if (!row.product_code || !row.material_code) {
+            inv.push(Object.assign({}, row, { reason: 'missing product code or material code' }));
+            return;
+          }
+          let qty = null; // null = leave quantity unset on create
+          if (row.quantity_raw !== '') {
+            const q = Number(row.quantity_raw);
+            if (isNaN(q)) {
+              inv.push(Object.assign({}, row, { reason: 'quantity is not a number' }));
+              return;
+            }
+            qty = q;
+          }
+          if (!productSet[row.product_code]) { noProd.push(row); return; }
+          if (!materialSet[row.material_code]) { noMat.push(row); return; }
+          const key = row.product_code + '||' + row.material_code;
+          if (existingSet[key]) { du.push(row); return; }
+          create.push(Object.assign({}, row, { quantity: qty }));
+        });
+        setToCreate(create); setDup(du); setNoProduct(noProd); setNoMaterial(noMat); setInvalid(inv); setBlankSkipped(blanks);
+        setPhase('preview'); setBusy(false);
+      })
+      .catch(function (e) {
+        setErr((e && e.message) || String(e));
+        setPhase('pick'); setBusy(false);
+      });
+  }
+
+  async function runCreates() {
+    setPhase('running'); setBusy(true);
+    const total = toCreate.length;
+    setProg({ done: 0, total: total });
+    let created = 0;
+    const errors = [];
+    for (let i = 0; i < toCreate.length; i++) {
+      const row = toCreate[i];
+      try {
+        const values = { fk_product_code: row.product_code, fk_material_details_code: row.material_code };
+        if (row.quantity !== null && row.quantity !== undefined) values.quantity = row.quantity;
+        await ctx.api.resource('product_material').create({ values: values });
+        created++;
+      } catch (e) {
+        errors.push({ product_code: row.product_code, material_code: row.material_code, message: (e && e.message) || String(e) });
+      }
+      setProg({ done: i + 1, total: total });
+    }
+    setResults({ created: created, errors: errors });
+    setBusy(false); setPhase('done');
+    if (created > 0) savedAnyRef.current = true;
+  }
+
+  function close() {
+    if (busy) return;
+    Modal.destroyAll();
+    if (savedAnyRef.current) onSaved();
+  }
+
+  const createCols = [
+    { title: 'Product Code', dataIndex: 'product_code', key: 'product_code' },
+    { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
+    { title: 'Quantity', dataIndex: 'quantity', key: 'quantity',
+      render: v => (v === null || v === undefined) ? ce('span', { style: { color: '#cbd5e1', fontStyle: 'italic' } }, '(not set)') : v },
+  ];
+  const dupCols = [
+    { title: 'Product Code', dataIndex: 'product_code', key: 'product_code' },
+    { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
+    { title: 'Quantity (from file)', dataIndex: 'quantity_raw', key: 'quantity_raw' },
+  ];
+  const invalidCols = [
+    { title: 'Product Code', dataIndex: 'product_code', key: 'product_code' },
+    { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
+    { title: 'Quantity', dataIndex: 'quantity_raw', key: 'quantity_raw' },
+    { title: 'Reason', dataIndex: 'reason', key: 'reason' },
+  ];
+
+  if (phase === 'pick' || phase === 'parsing') {
+    return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+      ce(Upload.Dragger, {
+        accept: '.csv,.txt,.tsv',
+        showUploadList: false,
+        disabled: phase === 'parsing',
+        beforeUpload: function (file) { handleFile(file); return false; },
+      },
+        ce('p', { style: { fontSize: 28, margin: '4px 0' } }, phase === 'parsing' ? '⏳' : '📄'),
+        ce('p', { style: { fontWeight: 600 } }, phase === 'parsing' ? 'Reading file…' : 'Click or drag a CSV file here'),
+        ce('p', { style: { fontSize: 12, color: '#9ca3af' } }, 'Column A: product_code, column B: material_code, column C: quantity')),
+      err ? ce(Alert, { type: 'error', showIcon: true, message: err, style: { marginTop: 12 } }) : null,
+      ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
+        ce(Button, { onClick: close, disabled: phase === 'parsing' }, 'Cancel')));
+  }
+
+  if (phase === 'preview') {
+    const summaryBits = [];
+    summaryBits.push(toCreate.length + ' will be created');
+    if (dup.length) summaryBits.push(dup.length + ' already exist (skipped)');
+    if (noProduct.length) summaryBits.push(noProduct.length + ' product code(s) not found (skipped)');
+    if (noMaterial.length) summaryBits.push(noMaterial.length + ' material code(s) not found (skipped)');
+    if (invalid.length) summaryBits.push(invalid.length + ' invalid row(s) (skipped)');
+    if (blankSkipped) summaryBits.push(blankSkipped + ' blank row(s) ignored');
+
+    return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+      ce(Alert, {
+        type: (dup.length || noProduct.length || noMaterial.length || invalid.length) ? 'warning' : 'info', showIcon: true,
+        message: rows.length + ' row(s) read from the file.',
+        description: summaryBits.join('. ') + '.',
+      }),
+      toCreate.length ? ce('div', { style: { marginTop: 12 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Will create (' + toCreate.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: createCols, dataSource: toCreate })) : null,
+      dup.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Already exist — skipped (' + dup.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: dup })) : null,
+      noProduct.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Product code not found (' + noProduct.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: noProduct })) : null,
+      noMaterial.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Material code not found (' + noMaterial.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: noMaterial })) : null,
+      invalid.length ? ce('div', { style: { marginTop: 16 } },
+        ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Invalid rows (' + invalid.length + ')'),
+        ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: invalidCols, dataSource: invalid })) : null,
+      ce('div', { style: { display: 'flex', justifyContent: 'space-between', marginTop: 16 } },
+        ce(Button, { onClick: reset }, 'Back'),
+        ce('div', { style: { display: 'flex', gap: 8 } },
+          ce(Button, { onClick: close }, 'Cancel'),
+          ce(Button, { type: 'primary', disabled: !toCreate.length, onClick: runCreates },
+            'Run import — ' + toCreate.length + ' row(s)'))));
+  }
+
+  if (phase === 'running') {
+    return ce('div', { style: { padding: '20px 0', textAlign: 'center' } },
+      ce(Progress, { percent: prog.total ? Math.round((prog.done / prog.total) * 100) : 0 }),
+      ce('div', { style: { marginTop: 8, color: '#6b7280', fontSize: 13 } }, 'Creating ' + prog.done + ' / ' + prog.total + '…'));
+  }
+
+  // done
+  function statRow(label, value, color) {
+    return ce('div', { style: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
+      ce('span', { style: { color: '#475569' } }, label),
+      ce('span', { style: { fontWeight: 600, color: color || '#111827' } }, value));
+  }
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
+    ce(Alert, {
+      type: results.errors.length ? 'warning' : 'success', showIcon: true,
+      message: 'Created ' + results.created + ' of ' + toCreate.length + ' attempted.',
+    }),
+    ce('div', { style: { marginTop: 12, border: '1px solid #e5e7eb', borderRadius: 6, padding: '4px 12px' } },
+      statRow('Rows read from file', rows.length),
+      statRow('Created successfully', results.created, '#16a34a'),
+      results.errors.length ? statRow('Failed during create', results.errors.length, '#dc2626') : null,
+      dup.length ? statRow('Already existed (skipped)', dup.length) : null,
+      noProduct.length ? statRow('Product code not found (skipped)', noProduct.length) : null,
+      noMaterial.length ? statRow('Material code not found (skipped)', noMaterial.length) : null,
+      invalid.length ? statRow('Invalid rows (skipped)', invalid.length) : null,
+      blankSkipped ? statRow('Blank rows ignored', blankSkipped) : null),
+    results.errors.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Failed rows'),
+      ce(Table, {
+        size: 'small', rowKey: 'product_code', pagination: { pageSize: 5 },
+        columns: [{ title: 'Product Code', dataIndex: 'product_code' }, { title: 'Material Code', dataIndex: 'material_code' }, { title: 'Error', dataIndex: 'message' }],
+        dataSource: results.errors,
+      })) : null,
+    dup.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Already existed — skipped'),
+      ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: dup })) : null,
+    noProduct.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Product code not found'),
+      ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: noProduct })) : null,
+    noMaterial.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Material code not found'),
+      ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: dupCols, dataSource: noMaterial })) : null,
+    invalid.length ? ce('div', { style: { marginTop: 16 } },
+      ce('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Invalid rows'),
+      ce(Table, { size: 'small', rowKey: 'row', pagination: { pageSize: 5 }, columns: invalidCols, dataSource: invalid })) : null,
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
+      ce(Button, { type: 'primary', onClick: close }, 'Close')));
+}
+
+// ===== entry point: mirrors ui_material_out's openModal shell exactly =====
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+  Modal.confirm({
+    title: 'Import Product Material',
+    width: 700,
+    icon: null,
+    content: ce(ImportContent, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal };
