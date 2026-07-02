@@ -227,14 +227,15 @@ Two differences from the simpler pattern: `.save()` only runs when
 `ctx.flowSettingsEnabled` is true, and both `.save()` and `.runById()` swallow
 errors via `.catch()` rather than letting them propagate.
 
-⚠️ **Inferred, not confirmed:** `ctx.flowSettingsEnabled` appears to indicate
-whether the code is currently running inside NocoBase's flow-configuration/edit
-UI versus the live rendered page — the guard suggests `.save()` (which registers
-the uid→SQL mapping) is only meant to run during configuration, not repeatedly at
-runtime, and skipping it live plus catching errors avoids whatever breaks if it's
-called outside that context. **Andre — if this understanding is wrong, correct it
-here** so future sessions don't inherit a wrong mental model of what this flag
-actually does.
+⚠️ **Semantics not fully understood — copy the pattern anyway.** `ctx.flowSettingsEnabled`
+appears to gate whether `.save()` runs, likely tied to whether the code is
+currently inside NocoBase's flow-configuration/edit UI versus the live rendered
+page — but nobody currently remembers exactly why this guard was added. It shows
+up independently in two separate files, which is strong enough evidence it's a
+deliberate, working pattern worth copying as-is for new SQL helpers, even without
+a full explanation of the underlying mechanism. If a future session ever needs to
+actually understand *why* (not just copy it), that would mean digging into
+NocoBase's own source/docs — this repo's history doesn't have the answer.
 
 ### 4.3 `ctx` surface — confirmed members only
 
