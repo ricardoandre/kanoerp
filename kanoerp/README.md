@@ -12,6 +12,16 @@ doc for any new Claude session**.
 > violate the "hard constraints" section — they have been tried and confirmed broken
 > in this environment. The database schema is **not** in this file — see §7 for
 > where to get it.
+>
+> **On getting files without asking Andre:** if you have bash/code-execution
+> access, `git clone` the repo yourself (§2) — don't ask him for file contents you
+> can get directly. If you only have a web-fetch tool, note that most such tools
+> can only fetch a URL that already appears *literally* in the conversation —
+> **a URL you construct by editing another URL's path will be rejected**, even if
+> the pattern is obvious. That's why §8.1 below lists the exact, literal raw URL
+> for every file: fetching this README puts all of them into the conversation
+> verbatim, so you can fetch any of them directly with zero construction. Use
+> those, don't build your own.
 
 ---
 
@@ -431,6 +441,58 @@ sandbox.
 **Not yet built:** `act_match_production` (shell for `ui_match_production`) — the
 module exists but isn't wired to a JSAction row yet, deliberately deferred; see §9.
 
+### 8.1 Direct raw URLs — fetch these exactly, don't construct your own
+
+Every URL below is literal and exact. See the note at the top of this file for
+why that matters (web-fetch tools reject constructed/edited URLs).
+
+**`source_code/`**
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_list_engine.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_detail.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_edit.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_material_detail.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_record_nav.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_prepare_fabric.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_material_out.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_match_production
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_material_details
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_product_main_material
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_product_material
+
+**`jblock/`**
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production_material.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production_result
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_source_code_updates
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_database_schema_dump
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_database_table_list
+
+**`jsaction/`**
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_material_out.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_prepare_fabric.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_material_details
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_product_main_material
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_product_material
+
+**Root-level / schema**
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/README.md (this file)
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/refs/heads/main/kanoerp/Schema%20Dump (also linked in §7)
+
+**`fb-ads-sync/`** (separate system, see §10 — list may lag actual repo contents,
+prefer cloning if you need certainty here)
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/sync.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/backfill.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/creatives.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/facebook.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/nocobase.js
+- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/creatives.js
+
+**This list must be kept current by hand** — unlike the registry tables, there's
+no tool that regenerates it. Whenever a file is added/renamed in the repo, add/fix
+its line here in the same commit, or this section silently goes stale and
+reintroduces the exact problem it's meant to solve.
+
 ---
 
 ## 9. What's next (pending / on the horizon)
@@ -459,8 +521,14 @@ module exists but isn't wired to a JSAction row yet, deliberately deferred; see 
 
 ## 10. Facebook Ads → NocoBase pipeline
 
-Separate Node.js project at `~/fb-ads-sync`, 4-file modular structure:
-`sync.js`, `lib/facebook.js`, `lib/transform.js`, `lib/nocobase.js`.
+Separate Node.js project, mirrored in this repo at `fb-ads-sync/` (see §8.1 for
+direct file URLs) and run from `~/fb-ads-sync` on the Unix host. Not NocoBase
+code — no `loadCode`/`jblock`/`JSAction` conventions apply here, it's plain
+Node.js run via cron/manually.
+
+Files (as of last check — this list can drift, prefer cloning if it matters):
+`sync.js`, `backfill.js`, `creatives.js`, `lib/facebook.js`, `lib/transform.js`,
+`lib/nocobase.js`, `lib/creatives.js`.
 
 - Always run scripts from the `~/fb-ads-sync` project root, not from inside `lib/`.
 - NocoBase upsert uses the `:updateOrCreate` endpoint with `filterKeys[]` for
@@ -469,6 +537,13 @@ Separate Node.js project at `~/fb-ads-sync`, 4-file modular structure:
   back to pixel arrays.
 - Backfill: `BACKFILL_SINCE=2024-01-01 node backfill.js` run from the project root.
 - See §4 above for the CPAS/Shopee conversion-data gotcha.
+
+**Secrets: `.env` is gitignored, not committed.** This repo is public. Real
+credentials (`ACCESS_TOKEN`, `NOCOBASE_API_KEY`, etc.) must never be committed —
+if `.env` was ever accidentally committed, the fix is rotating the credentials
+immediately, not just deleting the file (git history keeps old commits
+retrievable regardless of later deletions). `node_modules/` and `*.log` are also
+gitignored — regenerate with `npm install`, don't commit dependencies.
 
 ---
 
