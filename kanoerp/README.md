@@ -1,27 +1,29 @@
-# ASKA Label / Kano — code mirror
+# Internal Production System — code mirror
 
-Canonical mirror of the inline React (`jblock`) and `source_code` components for the
-Kano garment-production system on NocoBase. **NocoBase is the live source of truth**
+Canonical mirror of the inline React (`jblock`) and `source_code` components for an
+internal production-management system on NocoBase. **NocoBase is the live source of
+truth**
 (it executes the code); this repo is the history + context mirror **and the onboarding
 doc for any new Claude session**.
 
 > **For a new chat AI reading this first:** read this whole file before writing any
-> code. It contains the schema, the hard sandbox constraints, the architecture rules,
-> and the mistakes we've already made and fixed. Don't repeat them. Don't propose
-> solutions that violate the "hard constraints" section — they have been tried and
-> confirmed broken in this environment.
+> code. It contains the sandbox constraints, the architecture rules, and the mistakes
+> we've already made and fixed. Don't repeat them. Don't propose solutions that
+> violate the "hard constraints" section — they have been tried and confirmed broken
+> in this environment. The database schema is **not** in this file — see §7 for
+> where to get it.
 
 ---
 
 ## 1. What this project is
 
-**ASKA Label / Kano** ("kanoerp") is a garment production management system built as
+This is an **internal garment production management system**, built as
 inline JavaScript pasted directly into **NocoBase** (self-hosted, Jakarta timezone,
 `DD/MM/YYYY` date formatting). No filesystem deployment — every "file" in this repo
 corresponds to one row in a NocoBase table (`source_code`, `jblock`, or `JSAction`).
 
-It tracks productions across two brands — **Askalabel** and **Inkano** (identified by
-product code prefix `A` vs `O`) — through statuses: `planning → cutting → production →
+It tracks productions across two internal brands (identified by product code prefix
+`A` vs `O`) — through statuses: `planning → cutting → production →
 QC → permak → done`. Core entities: productions, konveksi (external production
 partners), products/SKU variants, materials, samples, delivery/QC results, and
 permakan (alteration/rework).
@@ -51,6 +53,12 @@ always current regardless of mirror lag.
 "changed this session" list, so it's clear which rows to paste into NocoBase and
 which files to commit to GitHub.
 
+**Schema refresh ritual:** the schema lives in a separate file, not here (see §7).
+Whenever the schema changes, run the `view_schema_dump` jblock (§8), copy the text
+box, and paste it into a Claude chat with "update the schema file." Don't hand-edit
+the schema file from memory — NocoBase's relation field names routinely differ from
+what you'd guess (see §4.1), so the dump is the only reliable source.
+
 ---
 
 ## 3. Hard sandbox constraints — NEVER violate these
@@ -71,6 +79,15 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
 - **Jblocks cannot import each other.** Shared logic must live in `source_code` rows,
   compiled via `new Function('React','antd','dayjs','ctx', src)` and loaded through a
   `loadCode(ctx, name)` helper with a module-level `_codeCache`.
+- **Concurrent `ctx.sql.save`/`runById` pairs with different uids can collide.**
+  *(Learned 2026-07-02.)* Firing several dynamic-uid SQL calls at once via
+  `Promise.all` (e.g. one query per item in a loop) threw
+  `"invalid sql schema uid used"`. Fix: combine the queries into one (e.g.
+  `UNION ALL` for per-table row counts) under a single fixed uid, or serialize the
+  calls (`.then()` chain / sequential execution) instead of running them in
+  parallel. Multiple *fixed*, *different* uids fired concurrently (e.g.
+  `ui_production_edit`'s `fetchOptions`, four parallel lookups) is a proven-safe
+  pattern — the risk is specifically *dynamic/generated* uids run in parallel.
 
 ---
 
@@ -80,14 +97,16 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
   - `uid` must be a **fixed string** in column/list contexts.
   - In **multi-row column code**, `uid` must be **dynamic per row**
     (`"prefix_" + record_id`) to prevent concurrent collisions between rows rendering
-    at the same time.
+    at the same time — but see §3: don't fire many dynamic uids in parallel from a
+    single component (e.g. a loop + `Promise.all`); combine into one query or
+    serialize instead.
 - **Writes:** use `ctx.api.resource('collection').create({ values: {...} })` for
   inserts — this is reliable and avoids snowflake-ID issues that raw SQL `INSERT`
   runs into.
 - **belongsTo associations** require nested payloads:
   `{ [relFieldName]: { [targetKey]: value } }` — never send a raw FK value alone,
-  it fails required-field validation. (See `ui_production_edit`'s belongsTo
-  resolution table for `product` and `konveksi`.)
+  it fails required-field validation. **The relation field name is not always
+  predictable — see §4.1, check the schema file.**
 - **Image/attachment fields** are relations through obfuscated junction tables
   (`t_xxx`), not plain SQL columns. Use the resource API with
   `appends: ['image']`, or JOIN junction → attachments table via SQL. Relative
@@ -95,11 +114,45 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
 - **Enum / single-select options** resolve via
   `ctx.dataSourceManager.getDataSource('main').getCollection(...).getField(...).enum`
   — do not try to pull enum labels via SQL.
+- **Schema/field introspection: use NocoBase's own metadata API, not raw SQL.**
+  *(Learned 2026-07-02.)* `ctx.dataSource || ctx.dataSourceManager.getDataSource('main')`
+  → `.getCollections()` gives every collection synchronously (`.name`, `.title`,
+  `.template`, `.filterTargetKey`, `.getFields()`). This is authoritative for
+  relation types/targets/keys. Raw SQL `information_schema` FK introspection is
+  **not reliable here** — most relations in this schema are enforced at the
+  NocoBase application layer, not as real DB foreign key constraints, so a raw-SQL
+  FK dump comes back mostly empty even though the relations very much exist and
+  work. See the `view_schema_dump` jblock (§8).
 - **CPAS / Shopee-integrated ad accounts:** conversions only appear in
   `catalog_segment_actions` / `catalog_segment_value`; the standard
   campaign/account-level `actions`/`action_values` API silently drops conversion data
   for these accounts. Ad-level (`ads_insights`) is the only reliable source for
   conversion rollups.
+
+### 4.1 Relation field names are not predictable — always check the schema file
+
+*(Learned 2026-07-02, from the first real `view_schema_dump` output.)* NocoBase's
+`belongsTo`/`hasMany`/`belongsToMany` **relation accessor field name** is frequently
+*different* from both the target collection's name and the raw FK column name.
+Guessing it wrong will silently misbehave — wrong field written, or required-field
+validation failures on create/update. Confirmed examples from the live schema:
+
+- A `belongsTo` relation field's name doesn't have to match its target collection's
+  name (e.g. a relation to `product` was named something other than `product`).
+- A `hasMany` relation field's name doesn't have to match the related collection's
+  name either.
+- Some tables carry **legacy/duplicate raw audit columns** alongside the standard
+  NocoBase `createdBy`/`updatedBy` belongsTo pair (plain `bigInt` columns with
+  similar names) — prefer the belongsTo pair; treat the raw duplicates as legacy
+  and don't build new logic on them without checking why they exist first.
+- New, previously-undocumented relations can exist that aren't obvious from the
+  collection's "primary" purpose (e.g. a product-level relation into materials
+  beyond the expected `product_material` join table).
+
+**Rule going forward:** before writing a `belongsTo` nested-payload create/update,
+or before calling `appends: ['relationName']`, check the actual field name in the
+schema file (§7) rather than assuming it matches the collection name. Never
+hand-edit or hand-recall the schema from memory for this — regenerate the dump.
 
 ---
 
@@ -173,69 +226,26 @@ page context.
 
 ---
 
-## 7. Canonical schema
+## 7. Database schema — see separate file, not here
 
-Always reference this for table/FK structure before writing SQL — don't guess column
-names.
+The schema is **not** kept in this README. It's regenerated from NocoBase's own
+collection/field metadata (see §4's introspection note) and lives here:
 
-```
-production: id; fk_product_code→product.code; fk_konveksi_code→konveksi.code;
-  planning_rol; status; production_ref; is_new; brand; est_production_start;
-  est_production_finish; remarks;
-  hasMany→production_quantity_details, production_result, qc_result,
-          production_sample, production_material
+**https://raw.githubusercontent.com/ricardoandre/kanoerp/refs/heads/main/kanoerp/Schema%20Dump**
 
-product: image(relation); name; model; description; designer; display;
-  hasMany product_material
+Fetch that file at the start of any session that will touch SQL, `belongsTo`
+payloads, or `appends`. Regenerate it with the `view_schema_dump` jblock (§8)
+whenever the schema changes — see the "Schema refresh ritual" in §2. Do not
+reconstruct or guess schema details from memory; relation field names in
+particular are not predictable from the collection name (§4.1).
 
-product_material: id; fk_material_details_code→material_details.code;
-  fk_product_code→product.code; quantity
-
-material_details: code; fk_supplier_id→supplier.id; fk_material_code→raw_material.code;
-  variant; supplier_variant_code; barcode; remarks
-
-raw_material: code; type; price; price_per_unit; remarks; default_content
-
-konveksi: code; name
-
-production_quantity_details: id; fk_sku_option_id→sku_option.id;
-  fk_production_id→production.id; ratio; quantity; cut_quantity
-
-sku_option: id; value; display; sort
-
-production_result: id; fk_production_id→production.id;
-  fk_sku_option_id→sku_option.id; shipment_date; quantity; checking_pic;
-  is_permakan; import_product_code; remarks
-
-qc_result: id; fk_production_id→production.id; fk_sku_option_id→sku_option.id;
-  qc_date; quantity; qc_person; is_defect; remarks; import_product_code
-
-production_sample: id; fk_production_id→production.id;
-  fk_sample_product_code→product.code; status; shipment_date; returned_date
-
-production_material: id; fk_material_details_code→material_details.code;
-  fk_production_id→production.id; status; shipment_date; quantity_need;
-  hasMany material_ledger
-
-material_ledger: id; fk_supplier_id→supplier.id; fk_material_code→material_details.code;
-  fk_production_material_id→production_material.id; type; transaction_date; purpose;
-  hasMany material_ledger_details
-
-material_ledger_details: id; fk_material_ledger_id→material_ledger.id; details
-
-users: id; nickname; username; email; phone; password; roles
-
-supplier: id; name; address; phone_number; remarks
-
-launch_plan: id; fk_product_code→product.code; fk_production_id→production.id;
-  launch_date; is_launched; brand
-```
-
-Schema notes:
+Two schema-adjacent notes worth keeping here since they're about *behavior*, not
+column names:
 - All production FKs are standardized to `fk_production_id`.
-- `material_ledger` captures supplier **per transaction** (a point-in-time snapshot),
-  because the supplier for a given material can change over time — don't assume the
-  current `material_details.fk_supplier_id` reflects historical transactions.
+- `material_ledger` captures supplier **per transaction** (a point-in-time
+  snapshot), because the supplier for a given material can change over time —
+  don't assume the current material's supplier FK reflects historical
+  transactions.
 
 ---
 
@@ -261,6 +271,13 @@ Schema notes:
 | `jblock/view_production.js` | `view_production` | Thin domain config → `ui_list_engine` (SQL, status colors, card layout, detail/edit loaders, mounts `ui_record_nav`). |
 | `jblock/view_production_material.js` | `view_production_material` | Thin domain config → `ui_list_engine` for `production_material`. |
 | `jblock/view_production_result.js` | `view_production_result` | Production result list. Full SQL layer, card/detail/form layouts, 7 secondary filters, 4 bulk actions (including Match Production). |
+
+### `jblock` rows — dev tools (not domain UI; used for project maintenance)
+
+| File | NocoBase row name | Purpose |
+|---|---|---|
+| `jblock/view_source_code_updates.js` | `view_source_code_updates` | Lists `source_code` rows whose `updated_at` is newer than an editable timestamp (Jakarta local, converted to UTC for the query) — shows what's still pending paste-to-GitHub. |
+| `jblock/view_schema_dump.js` | `view_schema_dump` | Produces a copy-pasteable text dump of every collection/field/relation via `ctx.dataSourceManager.getCollections()` (dynamic — no hardcoded table list). Used to regenerate the schema file (§7). |
 
 ### `JSAction` rows (thin action shells)
 
@@ -315,10 +332,14 @@ Separate Node.js project at `~/fb-ads-sync`, 4-file modular structure:
 - Always remind Andre, at the end of a session, to (a) paste the finalized code into
   the matching NocoBase row and (b) commit the same change to this GitHub mirror, so
   the canonical source stays in sync with the live runtime.
+- Before writing SQL or a `belongsTo` payload against a table you haven't touched
+  recently, fetch the schema file (§7) — don't assume field/relation names match
+  the collection name (§4.1).
 
 ---
 
 ## 12. Footer
 
 Public repo: `github.com/ricardoandre/kanoerp`. Structure: `source_code/`, `jblock/`,
-`jsaction/` folders, mirroring the NocoBase row types above.
+`jsaction/` folders, mirroring the NocoBase row types above. Schema lives in a
+separate file — see §7.
