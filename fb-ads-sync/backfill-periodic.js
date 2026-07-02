@@ -17,7 +17,7 @@ const { upsertMany } = require('./lib/nocobase');
 
 const COLLECTION = 'fb_ads_period_data';
 const FILTER_KEYS = ['entity_type', 'entity_id', 'period_type', 'period_start'];
-const LEVELS = ['ad', 'campaign', 'account'];
+const LEVELS = ['ad', 'adset', 'campaign', 'account'];
 
 const SINCE = process.env.BACKFILL_SINCE || '2024-01-01';
 
@@ -90,6 +90,10 @@ async function run() {
         const msg = e.response?.data?.error?.message || e.message;
         console.error(`  ${level} failed: ${msg}`);
       }
+      // Small pause between levels to stay well under the app's rate limit,
+      // on top of fetchInsights' own retry-with-backoff (facebook.js) which
+      // handles the case where we still get rate-limited despite pacing.
+      await new Promise((r) => setTimeout(r, 1000));
     }
   }
 

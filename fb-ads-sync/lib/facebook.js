@@ -30,6 +30,37 @@ const LEVEL_FIELDS = {
   account: ['account_id'],
 };
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Facebook rate-limit errors: code 4 ("Application request limit reached"),
+// code 17 ("User request limit reached"), code 32, or code 613. Detected by
+// code first, falling back to a message match in case the code isn't present
+// (some SDKs/proxies strip it).
+function isRateLimitError(err) {
+  const fbErr = err.response?.data?.error;
+  if (!fbErr) return false;
+  if ([4, 17, 32, 613].includes(fbErr.code)) return true;
+  return /request limit/i.test(fbErr.message || '');
+}
+
+// Retries with exponential backoff (30s, 60s, 120s, 240s, 480s) on rate-limit
+// errors specifically. Any other error is rethrown immediately, unretried —
+// no point backing off on e.g. an invalid parameter, that won't fix itself.
+async function withRetry(fn, { maxAttempts = 5, baseDelayMs = 30_000 } = {}) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRateLimitError(err) || attempt === maxAttempts) throw err;
+      const delay = baseDelayMs * 2 ** (attempt - 1);
+      console.warn(`  Rate limited (attempt ${attempt}/${maxAttempts}), waiting ${delay / 1000}s...`);
+      await sleep(delay);
+    }
+  }
+}
+
 // Fetch one breakdown level for a date range, following cursor pagination to the end.
 // timeIncrement: 1 (default) -> one row PER DAY, used by the daily sync (sync.js/backfill.js).
 //                null/false   -> one row for the WHOLE [since, until] range, used by the
@@ -57,7 +88,7 @@ async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
   let reqParams = params;
 
   while (url) {
-    const resp = await axios.get(url, { params: reqParams });
+    const resp = await withRetry(() => axios.get(url, { params: reqParams }));
     const { data, paging } = resp.data;
     if (Array.isArray(data)) rows.push(...data);
 

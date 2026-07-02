@@ -16,7 +16,7 @@ const { upsertMany } = require('./lib/nocobase');
 
 const COLLECTION = 'fb_ads_period_data';
 const FILTER_KEYS = ['entity_type', 'entity_id', 'period_type', 'period_start'];
-const LEVELS = ['ad', 'campaign', 'account'];
+const LEVELS = ['ad', 'adset', 'campaign', 'account'];
 
 function ymd(d) {
   return d.toISOString().slice(0, 10);
