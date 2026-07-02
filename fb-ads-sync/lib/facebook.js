@@ -27,20 +27,30 @@ const LEVEL_FIELDS = {
   ad: ['ad_id', 'ad_name', 'adset_id', 'campaign_id'],
   adset: ['adset_id', 'adset_name', 'campaign_id'],
   campaign: ['campaign_id', 'campaign_name'],
+  account: ['account_id'],
 };
 
 // Fetch one breakdown level for a date range, following cursor pagination to the end.
-async function fetchInsights({ level, since, until }) {
+// timeIncrement: 1 (default) -> one row PER DAY, used by the daily sync (sync.js/backfill.js).
+//                null/false   -> one row for the WHOLE [since, until] range, used by the
+//                                weekly/monthly reach sync (sync-periodic.js/backfill-periodic.js),
+//                                since reach/frequency are not additive across days and must
+//                                be requested pre-aggregated directly from the API.
+async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
   const baseUrl = `https://graph.facebook.com/${API_VERSION}/${AD_ACCOUNT_ID}/insights`;
   const params = {
     access_token: ACCESS_TOKEN,
     level,
     fields: [...LEVEL_FIELDS[level], ...METRIC_FIELDS].join(','),
     time_range: JSON.stringify({ since, until }),
-    time_increment: 1, // one row PER DAY -> fills the `date` column
     use_unified_attribution_setting: true, // use the ad set's configured attribution window
     limit: 200,
   };
+
+  if (timeIncrement) {
+    params.time_increment = timeIncrement; // one row PER DAY -> fills the `date` column
+  }
+  // else: omitted entirely -> API returns one aggregated row per entity for the whole range
 
   const rows = [];
   let url = baseUrl;
