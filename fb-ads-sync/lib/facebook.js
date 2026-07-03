@@ -100,4 +100,41 @@ async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
   return rows;
 }
 
-module.exports = { fetchInsights, LEVEL_FIELDS };
+// Object endpoint per level — NOT /insights. effective_status is a property
+// of the campaign/adset/ad object itself, not a date-range metric, so it's
+// fetched from /{account}/campaigns /{account}/adsets /{account}/ads instead.
+// No time_range/time_increment at all — this is always "right now."
+const STATUS_EDGE = { campaign: 'campaigns', adset: 'adsets', ad: 'ads' };
+
+// Fetches every entity's CURRENT effective_status at the given level. Used by
+// fetch-status.js to populate fb_ads_status — a current-snapshot table
+// (upserted, not period-keyed), deliberately separate from fb_ads_period_data.
+// Historical "was it active in period X" is answered by delivery presence in
+// the insights tables instead, not by this — see README §10.1 and chat for
+// why a single current-status table is enough and a full history table isn't
+// needed.
+async function fetchEntityStatus(level) {
+  const edge = STATUS_EDGE[level];
+  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${AD_ACCOUNT_ID}/${edge}`;
+  const params = {
+    access_token: ACCESS_TOKEN,
+    fields: 'id,effective_status',
+    limit: 500,
+  };
+
+  const rows = [];
+  let url = baseUrl;
+  let reqParams = params;
+
+  while (url) {
+    const resp = await withRetry(() => axios.get(url, { params: reqParams }));
+    const { data, paging } = resp.data;
+    if (Array.isArray(data)) rows.push(...data);
+    url = paging && paging.next ? paging.next : null;
+    reqParams = undefined;
+  }
+
+  return rows; // [{ id, effective_status }]
+}
+
+module.exports = { fetchInsights, fetchEntityStatus, LEVEL_FIELDS };

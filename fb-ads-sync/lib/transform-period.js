@@ -15,6 +15,7 @@ function int(v) {
 
 function entityIdFor(level, r) {
   if (level === 'ad') return r.ad_id;
+  if (level === 'adset') return r.adset_id;
   if (level === 'campaign') return r.campaign_id;
   if (level === 'account') return r.account_id;
   throw new Error(`fb_ads_period_data does not support level: ${level}`);
