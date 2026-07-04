@@ -1,5 +1,5 @@
-SCHEMA DUMP — generated 2026-07-02T10:32:35.705Z
-Collections found: 35 (all collections)
+SCHEMA DUMP — generated 2026-07-04T06:55:11.826Z
+Collections found: 36 (all collections)
 
 ### roles  ("Roles")  — 9 rows
   primaryKey: name
@@ -22,7 +22,7 @@ Collections found: 35 (all collections)
   - aiEmployees: belongsToMany  [target=aiEmployees, foreignKey=roleName, sourceKey=name, through=rolesAiEmployees, otherKey=aiEmployee]
   - allowNewAiEmployee: boolean
 
-### users  ("Users")  — 16 rows
+### users  ("Users")  — 18 rows
   primaryKey: id
   - id: bigInt (integer)
   - nickname: string (input)
@@ -51,7 +51,7 @@ Collections found: 35 (all collections)
   - createdAt: date (createdAt)
   - updatedAt: datetimeTz (updatedAt)
 
-### task  ("Task")  — 992 rows
+### task  ("Task")  — 1044 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_owner: string (input)
@@ -134,7 +134,7 @@ Collections found: 35 (all collections)
   - material_details: belongsTo (obo)  [target=material_details, foreignKey=fk_material_details_code]
   - quantity: double (number)
 
-### production  ("Production")  — 0 rows
+### production  ("Production")  — 1 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_product_code: string (input)
@@ -175,7 +175,7 @@ Collections found: 35 (all collections)
   - updatedById: context
   - createdById: context
 
-### production_material  ("Production Material")  — 0 rows
+### production_material  ("Production Material")  — 8 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_material_details_code: string (input)
@@ -187,7 +187,7 @@ Collections found: 35 (all collections)
   - status: string (select)
   - shipment_date: dateOnly (date)
 
-### production_sample  ("Production Sample")  — 0 rows
+### production_sample  ("Production Sample")  — 4 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_production_id: bigInt (integer)
@@ -198,7 +198,7 @@ Collections found: 35 (all collections)
   - status: string (select)
   - returned_date: dateOnly (date)
 
-### production_quantity_details  ("Production Quantity Details")  — 0 rows
+### production_quantity_details  ("Production Quantity Details")  — 5 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_production_id: bigInt (integer)
@@ -314,7 +314,7 @@ Collections found: 35 (all collections)
   - material_ledger: belongsTo (obo)  [target=material_ledger, foreignKey=fk_material_ledger_id]
   - details: bigInt (integer)
 
-### sample  ("Sample")  — 81 rows
+### sample  ("Sample")  — 102 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_accessories_code2: string (input)
@@ -347,7 +347,7 @@ Collections found: 35 (all collections)
   - createdById: context
   - updatedById: context
 
-### sample_material  ("Sample Material")  — 86 rows
+### sample_material  ("Sample Material")  — 106 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_sample_id: bigInt (integer)
@@ -356,7 +356,7 @@ Collections found: 35 (all collections)
   - raw_material: belongsTo (obo)  [target=raw_material, foreignKey=fk_raw_material_code]
   - quantity: double (number)
 
-### sample_variant  ("Sample Variant")  — 132 rows
+### sample_variant  ("Sample Variant")  — 171 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_fabric_code2: string (input)
@@ -388,7 +388,7 @@ Collections found: 35 (all collections)
   - photoshoot: boolean (checkbox)
   - collection_checkpoint: hasMany (o2m)  [target=collection_checkpoint, foreignKey=fk_collection_id, sourceKey=id]
 
-### collection_checkpoint  ("Collection Checkpoint")  — 19 rows
+### collection_checkpoint  ("Collection Checkpoint")  — 22 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_collection_id: bigInt (integer)
@@ -408,7 +408,7 @@ Collections found: 35 (all collections)
   - archive: boolean (checkbox)
   - createdById: context
 
-### history  ("History")  — 486 rows
+### history  ("History")  — 553 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_user_id: bigInt (integer)
@@ -420,7 +420,7 @@ Collections found: 35 (all collections)
   - category: string (input)
   - create_date: date (datetime)
 
-### ads_insights  ("Ads Insights")  — 34039 rows
+### ads_insights  ("Ads Insights")  — 63030 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - ad_id: string (input)
@@ -445,8 +445,9 @@ Collections found: 35 (all collections)
   - ads_details: belongsTo (obo)  [target=ads_creative, foreignKey=ad_id]
   - revenue: decimal (number)
   - spend: decimal (number)
+  - account: string (input)
 
-### adsets_insights  ("Adsets Insights")  — 5656 rows
+### adsets_insights  ("Adsets Insights")  — 12750 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -469,8 +470,9 @@ Collections found: 35 (all collections)
   - registration: integer (integer)
   - revenue: decimal (number)
   - spend: decimal (number)
+  - account: string (input)
 
-### campaigns_insights  ("Campaigns Insights")  — 1897 rows
+### campaigns_insights  ("Campaigns Insights")  — 5250 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -493,16 +495,18 @@ Collections found: 35 (all collections)
   - revenue_new: decimal (number)
   - revenue: decimal (number)
   - spend: decimal (number)
+  - account: string (input)
 
-### ads_creative  ("Ads Creative")  — 1131 rows
+### ads_creative  ("Ads Creative")  — 2108 rows
   primaryKey: ad_id, template: general
   - ad_id: string (input)
   - ad_name: string (input)
   - creative_id: string (input)
   - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_ph199nd1xyc, sourceKey=ad_id, through=t_4ylsjidv6a2, otherKey=f_ecp7hycxw1i]
   - source_url: text (textarea)
+  - account: string (input)
 
-### fb_ads_period_data  ("FB Ads Period Data")  — 9709 rows
+### fb_ads_period_data  ("FB Ads Period Data")  — 18953 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - entity_type: string (input)
@@ -513,11 +517,20 @@ Collections found: 35 (all collections)
   - frequency: double (number)
   - impression: bigInt (integer)
   - synced_at: date (datetime)
+  - account: string (input)
 
-### fb_ads_status  ("FB Ads Status")  — 0 rows
+### fb_ads_status  ("FB Ads Status")  — 1233 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - entity_type: string (input)
   - entity_id: string (input)
   - status: string (input)
   - synced_at: date (datetime)
+  - account: string (input)
+
+### fb_ads_target  ("FB Ads Target")  — 4 rows
+  primaryKey: metric_key, template: general
+  - metric_key: string (input)
+  - target_value: double (number)
+  - label: string (input)
+  - direction: string (select)
