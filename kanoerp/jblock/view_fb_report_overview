@@ -1,0 +1,348 @@
+// =====================================================
+// jblock — FACEBOOK ADS REPORT (Overview)
+//
+// Single view: account-wide totals only. No objective tabs — those were
+// removed because a "bucket" (Reach/ATC/Purchase) isn't a real Facebook
+// entity, so bucket-level reach could never be more than a sum of
+// per-campaign numbers (never truly deduplicated). Objective-level
+// drill-down with real per-entity data lives in the Structure and Details
+// reports instead. This report answers exactly one question well: how is
+// the whole account doing.
+//
+// Spend/Link Clicks/ATC/Purchase/Revenue are genuinely additive — summed
+// straight from campaigns_insights across every campaign under the
+// account, exact, no approximation needed. Reach/Impressions/Frequency are
+// NOT additive across days, so they come ONLY from fb_ads_period_data
+// (entity_type='account'), which only exists at Weekly/Monthly grain today
+// (sync-periodic.js) — there is no daily equivalent yet. Rather than
+// approximate a fake daily/weekly/monthly reach number, Daily granularity
+// has been removed entirely from this report, and any Weekly/Monthly
+// period missing its fb_ads_period_data row shows "—" with a warning
+// instead of falling back to a derived number. Add Daily back here once a
+// real daily account-level reach source exists.
+//
+// Shared logic/UI lives in source_code rows (fn_fbads_data,
+// ui_fbads_controls) — see view_fb_ads_structure.js for the same pattern.
+// =====================================================
+
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Spin, Button, Checkbox, Select } = antd;
+const ce = React.createElement;
+
+const DEFAULT_GRANULARITY = 'weekly';
+const DEFAULT_PERIOD_COUNT = 8;
+const GRANULARITY_OPTIONS = [{ label: 'Weekly', value: 'weekly' }, { label: 'Monthly', value: 'monthly' }]; // no Daily — see header note
+
+// ── shared code loader (README §3) ──
+let fn = null, ui = null;
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const uid = 'code_' + name;
+  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+  const src = (rows && rows[0] && rows[0].code) || '';
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// =====================================================
+// ── data fetchers ──
+// =====================================================
+// Additive metrics only — real, exact, summed across every campaign under
+// the account. No reach/impressions here; see fetchAccountPeriodReach.
+function fetchAccountTotalsAgg(granularity, periods, account) {
+  const since = periods[periods.length - 1].start, until = periods[0].end;
+  const keyExpr = fn.periodKeyExpr(granularity);
+  return fn.runSql(ctx, 'fbov_totals',
+    "SELECT " + keyExpr + " AS period_key, " +
+    "       COALESCE(SUM(spend),0) AS spend, " +
+    "       COALESCE(SUM(link_clicks),0) AS link_clicks, " +
+    "       COALESCE(SUM(atc),0) AS atc, " +
+    "       COALESCE(SUM(purchase),0) AS purchase, " +
+    "       COALESCE(SUM(revenue),0) AS revenue " +
+    "FROM campaigns_insights " +
+    "WHERE date BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    fn.accountFilterSql(account) +
+    "GROUP BY period_key"
+  );
+}
+// Real, deduplicated account-level reach/impressions — the only source
+// used for these fields. No fallback approximation: a period with no row
+// here just stays missing (see buildOverallMap / reachMissing below).
+function fetchAccountPeriodReach(periodType, periods, account) {
+  const since = periods[periods.length - 1].start, until = periods[0].start;
+  return fn.runSql(ctx, 'fbov_acct_reach',
+    "SELECT period_start AS period_key, " +
+    "       COALESCE(SUM(reach),0) AS reach, COALESCE(SUM(impression),0) AS impressions " +
+    "FROM fb_ads_period_data " +
+    "WHERE entity_type = 'account' AND period_type = '" + periodType + "' " +
+    "  AND period_start BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    fn.accountFilterSql(account) +
+    "GROUP BY period_start"
+  );
+}
+
+function buildOverallMap(totalsRows, periods) {
+  const periodKeys = new Set(periods.map(function (p) { return p.key; }));
+  const overall = {};
+  totalsRows.forEach(function (r) {
+    if (!periodKeys.has(r.period_key)) return;
+    overall[r.period_key] = {
+      period_key: r.period_key,
+      spend: fn.num(r.spend), link_clicks: fn.num(r.link_clicks), atc: fn.num(r.atc),
+      purchase: fn.num(r.purchase), revenue: fn.num(r.revenue),
+      reach: 0, impressions: 0, reachMissing: true, // set true until fetchAccountPeriodReach proves otherwise
+    };
+  });
+  return overall;
+}
+function applyAccountReach(overallMap, reachRows) {
+  reachRows.forEach(function (r) {
+    if (overallMap[r.period_key]) {
+      overallMap[r.period_key].reach = fn.num(r.reach);
+      overallMap[r.period_key].impressions = fn.num(r.impressions);
+      overallMap[r.period_key].reachMissing = false;
+    }
+  });
+}
+
+// =====================================================
+// ── metric rows — dependsOnReach flags which rows must show "—" instead
+// of a number when a period's reachMissing is true, rather than ever
+// deriving/approximating them.
+// =====================================================
+function metricRows(fn_) {
+  return [
+    { key: 'spend', label: 'Total Spend', fmt: fn_.fmtMoney, calc: r => r.spend },
+    { key: 'reach', label: 'Total Reach', fmt: fn_.fmtNum, calc: r => r.reach, dependsOnReach: true },
+    { key: 'cost_reach', label: 'Cost / Reach', fmt: fn_.fmtRatio, calc: r => fn_.safeDiv(r.spend, r.reach), dependsOnReach: true },
+    { key: 'link_clicks', label: 'Link Clicks', fmt: fn_.fmtNum, calc: r => r.link_clicks },
+    { key: 'cplc', label: 'Cost / Link Click', fmt: fn_.fmtMoney, calc: r => fn_.safeDiv(r.spend, r.link_clicks) },
+    { key: 'atc', label: 'ATC', fmt: fn_.fmtNum, calc: r => r.atc },
+    { key: 'cost_atc', label: 'Cost / ATC', fmt: fn_.fmtMoney, calc: r => fn_.safeDiv(r.spend, r.atc) },
+    { key: 'purchase', label: 'Purchase', fmt: fn_.fmtNum, calc: r => r.purchase },
+    { key: 'cost_purchase', label: 'Cost / Purchase', fmt: fn_.fmtMoney, calc: r => fn_.safeDiv(r.spend, r.purchase) },
+    { key: 'revenue', label: 'Purchase Amt', fmt: fn_.fmtMoney, calc: r => r.revenue },
+    { key: 'roas', label: 'ROAS', fmt: fn_.fmtRatio, calc: r => fn_.safeDiv(r.revenue, r.spend) },
+    { key: 'freq', label: 'Frequency', fmt: fn_.fmtRatio, calc: r => fn_.safeDiv(r.impressions, r.reach), dependsOnReach: true },
+  ];
+}
+const MOM_METRICS = ['spend', 'reach', 'revenue']; // period-over-period coloring
+
+function colGroup(periods) {
+  return ce('colgroup', null,
+    ce('col', { style: { width: 160 } }),
+    periods.map(function (p) { return ce('col', { key: p.key, style: { width: 130 } }); }));
+}
+function thStyle(left) {
+  const base = { textAlign: left ? 'left' : 'right', padding: '8px 10px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb', fontWeight: 600, color: '#374151', whiteSpace: 'nowrap' };
+  if (left) { base.position = 'sticky'; base.left = 0; base.zIndex = 3; base.boxShadow = '2px 0 4px -2px rgba(0,0,0,0.08)'; }
+  return base;
+}
+function tdStyle(left, extra) {
+  const base = { textAlign: left ? 'left' : 'right', padding: '6px 10px', borderBottom: '1px solid #f3f4f6', fontWeight: left ? 600 : 400, color: left ? '#111827' : '#374151', verticalAlign: 'top' };
+  if (left) { base.position = 'sticky'; base.left = 0; base.zIndex = 2; base.boxShadow = '2px 0 4px -2px rgba(0,0,0,0.08)'; base.background = '#fff'; }
+  return Object.assign(base, extra || {});
+}
+
+const LINE_COLORS = ['#6366f1', '#f59e0b', '#22c55e', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6', '#ec4899', '#84cc16', '#f97316', '#64748b'];
+
+// Trend chart plots whatever calc() returns even for reachMissing periods
+// (a numeric 0) — it can't visually represent "missing" as a gap the way
+// the table's "—" cells do. The table is the source of truth for data
+// quality; the chart is just a shape.
+function MultiTrendChart(props) {
+  const periods = props.periods, getRow = props.getRow, selected = props.selected, METRIC_ROWS = props.metricRows;
+  const orderedPeriods = periods.slice().reverse();
+  const W = 800, H = 240, PAD = 40;
+  const stepX = orderedPeriods.length > 1 ? (W - PAD * 2) / (orderedPeriods.length - 1) : 0;
+
+  const series = selected.map(function (key, si) {
+    const mr = METRIC_ROWS.find(function (m) { return m.key === key; });
+    if (!mr) return null;
+    const values = orderedPeriods.map(function (p) { return fn.num(mr.calc(getRow(p.key) || {})); });
+    const maxV = Math.max.apply(null, values.concat([1]));
+    const pts = values.map(function (v, i) {
+      return { x: PAD + i * stepX, y: H - PAD - (maxV > 0 ? (v / maxV) * (H - PAD * 2) : 0), v: v };
+    });
+    return { key: key, label: mr.label, fmt: mr.fmt, color: LINE_COLORS[si % LINE_COLORS.length], pts: pts };
+  }).filter(Boolean);
+
+  return ce('div', { style: { marginBottom: 24 } },
+    ce('svg', { width: '100%', viewBox: '0 0 ' + W + ' ' + H, style: { maxWidth: W } },
+      ce('line', { x1: PAD, y1: H - PAD, x2: W - PAD, y2: H - PAD, stroke: '#e5e7eb' }),
+      orderedPeriods.map(function (p, i) {
+        return ce('text', { key: p.key, x: PAD + i * stepX, y: H - PAD + 16, fontSize: 10, textAnchor: 'middle', fill: '#9ca3af' }, p.label);
+      }),
+      series.map(function (s) {
+        const pathD = s.pts.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ',' + p.y; }).join(' ');
+        return ce('g', { key: s.key },
+          ce('path', { d: pathD, fill: 'none', stroke: s.color, strokeWidth: 2 }),
+          s.pts.map(function (p, i) { return ce('circle', { key: i, cx: p.x, cy: p.y, r: 3, fill: s.color }); }));
+      })),
+    ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 6 } },
+      series.map(function (s) {
+        return ce('div', { key: s.key, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+          ce('span', { style: { width: 10, height: 10, borderRadius: 5, background: s.color, display: 'inline-block' } }),
+          s.label);
+      })));
+}
+
+// =====================================================
+// ── SUMMARY TABLE ──
+// =====================================================
+function SummaryTable(props) {
+  const periods = props.periods, getRow = props.getRow, targetRules = props.targetRules, METRIC_ROWS = props.metricRows;
+
+  function momColor(rowKey, pIdx) {
+    if (pIdx === periods.length - 1) return null;
+    const mr = METRIC_ROWS.find(function (m) { return m.key === rowKey; });
+    const curRow = getRow(periods[pIdx].key) || {}, prevRow = getRow(periods[pIdx + 1].key) || {};
+    if (mr.dependsOnReach && (curRow.reachMissing || prevRow.reachMissing)) return null; // can't compare confidently
+    return fn.growthColorFromValues(fn.num(mr.calc(curRow)), fn.num(mr.calc(prevRow)));
+  }
+  function roasColor(row) {
+    const v = fn.safeDiv(row.revenue, row.spend);
+    return fn.targetColorFromValue(v, row.spend, targetRules.roas);
+  }
+
+  const rows = METRIC_ROWS.map(function (mr, i) {
+    const rowBg = i % 2 ? '#fafafa' : '#fff';
+    const cells = periods.map(function (p, pi) {
+      const row = getRow(p.key) || {};
+      if (mr.dependsOnReach && row.reachMissing) {
+        return ce('td', { key: p.key, style: tdStyle(false, { color: '#d1d5db' }) }, '—');
+      }
+      let color = null;
+      if (MOM_METRICS.indexOf(mr.key) !== -1) color = momColor(mr.key, pi);
+      if (mr.key === 'roas') color = roasColor(row);
+      return ce('td', { key: p.key, style: tdStyle(false, color ? { color: color, fontWeight: 700 } : {}) }, mr.fmt(mr.calc(row)));
+    });
+    return ce('tr', { key: mr.key, style: { background: rowBg } },
+      ce('td', { style: tdStyle(true, { background: rowBg }) }, mr.label),
+      cells);
+  });
+
+  return ce('div', { style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', tableLayout: 'fixed', fontSize: 12 } },
+      colGroup(periods),
+      ce('thead', null, ce('tr', null,
+        ce('th', { style: thStyle(true) }, 'Metric'),
+        periods.map(function (p) { return ce('th', { key: p.key, style: thStyle(false) }, p.label); }))),
+      ce('tbody', null, rows)));
+}
+
+// =====================================================
+// ── ROOT ──
+// =====================================================
+const Root = function () {
+  const sReady = useState(false); const ready = sReady[0]; const setReady = sReady[1];
+  const sLoadErr = useState(null); const loadErr = sLoadErr[0]; const setLoadErr = sLoadErr[1];
+
+  const sGranularity = useState(DEFAULT_GRANULARITY); const granularity = sGranularity[0]; const setGranularity = sGranularity[1];
+  const sCount = useState(DEFAULT_PERIOD_COUNT); const periodCount = sCount[0]; const setCount = sCount[1];
+  const sLastDate = useState(dayjs().startOf('day')); const lastDate = sLastDate[0]; const setLastDate = sLastDate[1];
+  const sOverall = useState(null); const overall = sOverall[0]; const setOverall = sOverall[1];
+  const sPeriods = useState(null); const periods = sPeriods[0]; const setPeriods = sPeriods[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+  const sLoading = useState(true); const loading = sLoading[0]; const setLoading = sLoading[1];
+  const sSelMetrics = useState(['spend', 'reach', 'revenue']); const selMetrics = sSelMetrics[0]; const setSelMetrics = sSelMetrics[1];
+  const sTargetRules = useState(null); const targetRules = sTargetRules[0]; const setTargetRules = sTargetRules[1];
+
+  const sAvailableAccounts = useState([]); const availableAccounts = sAvailableAccounts[0]; const setAvailableAccounts = sAvailableAccounts[1];
+  const sSelectedAccount = useState(null); const selectedAccount = sSelectedAccount[0]; const setSelectedAccount = sSelectedAccount[1];
+
+  function generate(gran, count, account, lastDateParam) {
+    setLoading(true); setErr(null);
+    const p = fn.buildPeriods(gran, count, lastDateParam);
+    const periodType = gran === 'monthly' ? 'month' : 'week';
+
+    Promise.all([fetchAccountTotalsAgg(gran, p, account), fetchAccountPeriodReach(periodType, p, account)])
+      .then(function (res) {
+        const totalsRows = res[0], reachRows = res[1];
+        const overallMap = buildOverallMap(totalsRows, p);
+        applyAccountReach(overallMap, reachRows);
+        setPeriods(p);
+        setOverall(overallMap);
+        setLoading(false);
+      })
+      .catch(function (e) { setErr((e && e.message) || String(e)); setLoading(false); });
+  }
+
+  function handleAccountChange(account) { setSelectedAccount(account); generate(granularity, periodCount, account, lastDate); }
+  function handleApplyTimeWindow(gran, count, ld) {
+    setGranularity(gran); setCount(count); setLastDate(ld);
+    generate(gran, count, selectedAccount, ld);
+  }
+  function handleReload() { generate(granularity, periodCount, selectedAccount, lastDate); }
+
+  useEffect(function () {
+    Promise.all([loadCode('fn_fbads_data'), loadCode('ui_fbads_controls')])
+      .then(function (mods) {
+        fn = mods[0]; ui = mods[1];
+        setSelectedAccount(fn.DEFAULT_ACCOUNT);
+        setReady(true);
+      })
+      .catch(function (e) { setLoadErr((e && e.message) || String(e)); });
+  }, []);
+
+  useEffect(function () {
+    if (!ready) return;
+    generate(granularity, periodCount, selectedAccount, lastDate);
+    fn.fetchAccountList(ctx).then(function (rows) { setAvailableAccounts(rows.map(function (r) { return r.account; })); }).catch(function () {});
+    fn.fetchTargetRules(ctx).then(function (rules) { setTargetRules(rules); });
+  }, [ready]);
+
+  if (loadErr) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load shared FB Ads modules: ' + loadErr);
+  if (!ready || !targetRules) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading…'));
+
+  const METRIC_ROWS = metricRows(fn);
+  const periodUnitLabel = granularity === 'monthly' ? 'months' : 'weeks';
+
+  const filterBar = ce('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', padding: '14px 20px', background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ui.Field('Account', ce(Select, {
+      value: selectedAccount, onChange: handleAccountChange,
+      style: { width: 200 }, placeholder: 'All accounts', allowClear: true,
+      options: availableAccounts.map(function (a) { return { label: a, value: a }; }),
+    })),
+    ui.Field('Time window', ce(ui.TimeWindowPopover, {
+      granularity: granularity, periodCount: periodCount, lastDate: lastDate, loading: loading,
+      onApply: handleApplyTimeWindow, granularityOptions: GRANULARITY_OPTIONS,
+    })),
+    ui.Field('', ce(Button, { onClick: handleReload, title: 'Reload with current filters', style: { borderColor: '#0891b2', color: '#0891b2' } }, loading ? 'Refreshing…' : '↻ Refresh')));
+
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load report: ' + err);
+
+  const missingReachPeriods = (periods || []).filter(function (p) { const r = overall && overall[p.key]; return !r || r.reachMissing; }).map(function (p) { return p.label; });
+
+  return ce('div', { style: { padding: 16 } },
+    ce('div', { style: { fontSize: 18, fontWeight: 700, marginBottom: 4 } }, 'Facebook Ads — Report'),
+    ce('div', { style: { fontSize: 13, color: '#6b7280', marginBottom: 4 } },
+      granularity + ' · last ' + periodCount + ' ' + periodUnitLabel + ' · ' + (selectedAccount || 'All accounts')),
+    ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 12 } },
+      'Targets — Cost/ATC < ' + fn.fmtMoney(targetRules.cost_atc.target) + ', Cost/Reach < ' + fn.fmtRatio(targetRules.cost_reach.target) +
+        ', ROAS > ' + fn.fmtRatio(targetRules.roas.target) + ', Cost/Purchase < ' + fn.fmtMoney(targetRules.cost_purchase.target) + ' (edit in fb_ads_target)'),
+    ce('div', { style: { marginBottom: 16 } }, filterBar),
+
+    missingReachPeriods.length > 0 && !loading && ce('div', {
+      style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', marginBottom: 12, background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 6, fontSize: 12, color: '#9a3412' },
+    },
+      ce('span', { style: { width: 8, height: 8, borderRadius: 4, background: '#f97316', flexShrink: 0 } }),
+      'No account-level reach data yet for ' + missingReachPeriods.join(', ') + ' — showing "—" instead of a derived number. Reach/Cost-Reach/Frequency will appear once fb_ads_period_data is backfilled for ' + (missingReachPeriods.length > 1 ? 'those periods' : 'this period') + '.'),
+
+    loading || !overall || !periods
+      ? ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading…'))
+      : ce('div', null,
+          ce('div', { style: { fontWeight: 700, fontSize: 13, marginBottom: 8 } }, 'Trend'),
+          ce(Checkbox.Group, {
+            value: selMetrics, onChange: setSelMetrics, style: { marginBottom: 8, fontSize: 12 },
+            options: METRIC_ROWS.map(function (m) { return { label: m.label, value: m.key }; }),
+          }),
+          ce(MultiTrendChart, { periods: periods, getRow: function (k) { return overall[k]; }, selected: selMetrics, metricRows: METRIC_ROWS }),
+          ce('div', { style: { fontWeight: 700, fontSize: 13, marginBottom: 8 } }, 'Summary'),
+          ce(SummaryTable, { periods: periods, getRow: function (k) { return overall[k]; }, targetRules: targetRules, metricRows: METRIC_ROWS })));
+};
+
+ctx.render(ce(Root));
