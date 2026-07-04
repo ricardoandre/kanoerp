@@ -318,7 +318,7 @@ const Root = function () {
   const missingReachPeriods = (periods || []).filter(function (p) { const r = overall && overall[p.key]; return !r || r.reachMissing; }).map(function (p) { return p.label; });
 
   return ce('div', { style: { padding: 16 } },
-    ce('div', { style: { fontSize: 18, fontWeight: 700, marginBottom: 4 } }, 'Facebook Ads — Report'),
+    ce('div', { style: { fontSize: 18, fontWeight: 700, marginBottom: 4 } }, 'Facebook Ads — Overview'),
     ce('div', { style: { fontSize: 13, color: '#6b7280', marginBottom: 4 } },
       granularity + ' · last ' + periodCount + ' ' + periodUnitLabel + ' · ' + (selectedAccount || 'All accounts')),
     ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 12 } },
