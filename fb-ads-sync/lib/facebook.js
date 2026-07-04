@@ -2,7 +2,8 @@ const axios = require('axios');
 
 const API_VERSION = process.env.FB_API_VERSION || 'v23.0';
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
-const AD_ACCOUNT_ID = process.env.AD_ACCOUNT_ID; // must include the act_ prefix, e.g. act_1234567890
+// AD_ACCOUNT_ID is gone from here — accountId is now passed in per-call by
+// the caller, which loops over accounts.parseAccounts(). See lib/accounts.js.
 
 // Metric fields requested at every level
 const METRIC_FIELDS = [
@@ -22,7 +23,11 @@ const METRIC_FIELDS = [
   'date_stop',
 ];
 
-// Identity fields that differ per level
+// Identity fields that differ per level. 'account' added here — this is the
+// facebook.js.patch that sync-periodic.js/backfill-periodic.js's comments
+// have been referencing but that was never actually applied (their
+// `LEVELS` arrays include 'account', which was silently failing/returning
+// nothing useful without this).
 const LEVEL_FIELDS = {
   ad: ['ad_id', 'ad_name', 'adset_id', 'campaign_id'],
   adset: ['adset_id', 'adset_name', 'campaign_id'],
@@ -30,45 +35,24 @@ const LEVEL_FIELDS = {
   account: ['account_id'],
 };
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Facebook rate-limit errors: code 4 ("Application request limit reached"),
-// code 17 ("User request limit reached"), code 32, or code 613. Detected by
-// code first, falling back to a message match in case the code isn't present
-// (some SDKs/proxies strip it).
-function isRateLimitError(err) {
-  const fbErr = err.response?.data?.error;
-  if (!fbErr) return false;
-  if ([4, 17, 32, 613].includes(fbErr.code)) return true;
-  return /request limit/i.test(fbErr.message || '');
-}
-
-// Retries with exponential backoff (30s, 60s, 120s, 240s, 480s) on rate-limit
-// errors specifically. Any other error is rethrown immediately, unretried —
-// no point backing off on e.g. an invalid parameter, that won't fix itself.
-async function withRetry(fn, { maxAttempts = 5, baseDelayMs = 30_000 } = {}) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (!isRateLimitError(err) || attempt === maxAttempts) throw err;
-      const delay = baseDelayMs * 2 ** (attempt - 1);
-      console.warn(`  Rate limited (attempt ${attempt}/${maxAttempts}), waiting ${delay / 1000}s...`);
-      await sleep(delay);
-    }
-  }
-}
-
-// Fetch one breakdown level for a date range, following cursor pagination to the end.
-// timeIncrement: 1 (default) -> one row PER DAY, used by the daily sync (sync.js/backfill.js).
-//                null/false   -> one row for the WHOLE [since, until] range, used by the
-//                                weekly/monthly reach sync (sync-periodic.js/backfill-periodic.js),
-//                                since reach/frequency are not additive across days and must
-//                                be requested pre-aggregated directly from the API.
-async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
-  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${AD_ACCOUNT_ID}/insights`;
+// Fetch one breakdown level for a date range, for ONE ad account, following
+// cursor pagination to the end.
+// accountId:     the act_XXXXXXXXXX id to query — required now that a single
+//                process loops over several accounts (see lib/accounts.js).
+// timeIncrement: 1 (default) -> one row PER DAY, used by sync.js/backfill.js.
+//                null        -> one row for the WHOLE [since, until] range,
+//                               used by sync-periodic.js/backfill-periodic.js,
+//                               since reach/frequency are not additive across
+//                               days and must come pre-aggregated from the API.
+//                This is the other half of the facebook.js.patch mentioned
+//                above — previously always hardcoded to 1, so passing
+//                `timeIncrement: null` from the periodic scripts was a no-op:
+//                they were fetching (and then mis-storing) daily rows the
+//                whole time, not period-aggregated ones. See the comment in
+//                lib/transform-period.js for the other half of the fallout.
+async function fetchInsights({ accountId, level, since, until, timeIncrement = 1 }) {
+  if (!accountId) throw new Error('fetchInsights: accountId is required');
+  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${accountId}/insights`;
   const params = {
     access_token: ACCESS_TOKEN,
     level,
@@ -88,7 +72,7 @@ async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
   let reqParams = params;
 
   while (url) {
-    const resp = await withRetry(() => axios.get(url, { params: reqParams }));
+    const resp = await axios.get(url, { params: reqParams });
     const { data, paging } = resp.data;
     if (Array.isArray(data)) rows.push(...data);
 
@@ -100,41 +84,4 @@ async function fetchInsights({ level, since, until, timeIncrement = 1 }) {
   return rows;
 }
 
-// Object endpoint per level — NOT /insights. effective_status is a property
-// of the campaign/adset/ad object itself, not a date-range metric, so it's
-// fetched from /{account}/campaigns /{account}/adsets /{account}/ads instead.
-// No time_range/time_increment at all — this is always "right now."
-const STATUS_EDGE = { campaign: 'campaigns', adset: 'adsets', ad: 'ads' };
-
-// Fetches every entity's CURRENT effective_status at the given level. Used by
-// fetch-status.js to populate fb_ads_status — a current-snapshot table
-// (upserted, not period-keyed), deliberately separate from fb_ads_period_data.
-// Historical "was it active in period X" is answered by delivery presence in
-// the insights tables instead, not by this — see README §10.1 and chat for
-// why a single current-status table is enough and a full history table isn't
-// needed.
-async function fetchEntityStatus(level) {
-  const edge = STATUS_EDGE[level];
-  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${AD_ACCOUNT_ID}/${edge}`;
-  const params = {
-    access_token: ACCESS_TOKEN,
-    fields: 'id,effective_status',
-    limit: 500,
-  };
-
-  const rows = [];
-  let url = baseUrl;
-  let reqParams = params;
-
-  while (url) {
-    const resp = await withRetry(() => axios.get(url, { params: reqParams }));
-    const { data, paging } = resp.data;
-    if (Array.isArray(data)) rows.push(...data);
-    url = paging && paging.next ? paging.next : null;
-    reqParams = undefined;
-  }
-
-  return rows; // [{ id, effective_status }]
-}
-
-module.exports = { fetchInsights, fetchEntityStatus, LEVEL_FIELDS };
+module.exports = { fetchInsights, LEVEL_FIELDS };

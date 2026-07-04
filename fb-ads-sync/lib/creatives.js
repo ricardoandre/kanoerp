@@ -2,13 +2,15 @@ const axios = require('axios');
 
 const API_VERSION = process.env.FB_API_VERSION || 'v23.0';
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
-const AD_ACCOUNT_ID = process.env.AD_ACCOUNT_ID;
+// AD_ACCOUNT_ID is gone from here too — accountId is now passed in per-call
+// by creatives.js, which loops over accounts.parseAccounts(). See lib/accounts.js.
 
-// Pull every ad in the account together with its creative. Creatives rarely
+// Pull every ad in ONE account together with its creative. Creatives rarely
 // change, so this is meant to run occasionally (weekly / after new launches),
 // NOT on the daily insights cron.
-async function fetchAdsWithCreative() {
-  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${AD_ACCOUNT_ID}/ads`;
+async function fetchAdsWithCreative(accountId) {
+  if (!accountId) throw new Error('fetchAdsWithCreative: accountId is required');
+  const baseUrl = `https://graph.facebook.com/${API_VERSION}/${accountId}/ads`;
   const params = {
     access_token: ACCESS_TOKEN,
     fields: 'id,name,creative{id,name,image_url,thumbnail_url,object_story_spec,asset_feed_spec}',

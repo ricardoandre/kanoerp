@@ -15,6 +15,15 @@ function int(v) {
 
 function entityIdFor(level, r) {
   if (level === 'ad') return r.ad_id;
+  // BUGFIX: this was missing an 'adset' case, so every adset-level row hit
+  // the `throw` below and was silently dropped — caught per-level in
+  // sync-periodic.js's try/catch and logged as "adset failed: fb_ads_period_data
+  // does not support level: adset" (easy to miss in cron logs). sync-periodic.js's
+  // LEVELS array has included 'adset' this whole time, so fb_ads_period_data
+  // has never actually had adset rows in it until this fix. After deploying,
+  // run `node backfill-periodic.js --period=week` and `--period=month`
+  // (optionally with --account=... to target one account) to backfill the
+  // adset data retroactively — see the LEVELS note in backfill-periodic.js.
   if (level === 'adset') return r.adset_id;
   if (level === 'campaign') return r.campaign_id;
   if (level === 'account') return r.account_id;
@@ -25,7 +34,10 @@ function entityIdFor(level, r) {
 // periodStart: 'YYYY-MM-DD', the canonical key for the row (Monday for
 // weeks, 1st-of-month for months) — NOT necessarily r.date_start, though
 // they should match when the query range was built correctly.
-function transformPeriodRow(level, periodType, periodStart, r) {
+// accountLabel: the label from lib/accounts.js's parseAccounts() — stored as
+// a plain column, same as the daily tables. Not part of the row's identity
+// (entity ids are globally unique on Facebook, not scoped per account).
+function transformPeriodRow(level, periodType, periodStart, r, accountLabel) {
   return {
     entity_type: level,
     entity_id: entityIdFor(level, r),
@@ -35,6 +47,7 @@ function transformPeriodRow(level, periodType, periodStart, r) {
     frequency: num(r.frequency),
     impression: int(r.impressions),
     synced_at: new Date().toISOString(),
+    account: accountLabel,
   };
 }
 

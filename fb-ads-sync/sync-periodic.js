@@ -3,12 +3,8 @@ require('dotenv').config();
 const { fetchInsights } = require('./lib/facebook');
 const { transformPeriodRow } = require('./lib/transform-period');
 const { upsertMany } = require('./lib/nocobase');
+const { parseAccounts } = require('./lib/accounts');
 
-// Requires the lib/facebook.js patch (facebook.js.patch) that adds:
-//   - an optional `timeIncrement` param to fetchInsights (omit it to get
-//     one aggregated row per entity for the whole range, instead of daily rows)
-//   - an 'account' entry in LEVEL_FIELDS
-//
 // Reach and frequency are NOT additive across days, so unlike sync.js
 // (daily rows), this asks Facebook for the whole period in ONE request
 // per entity and stores that as its own row. Only run for CLOSED periods
@@ -52,23 +48,27 @@ function getClosedPeriod(periodType, ref = new Date()) {
 }
 
 async function syncPeriod(periodType) {
+  const accounts = parseAccounts();
   const { since, until, period_start } = getClosedPeriod(periodType);
-  console.log(`Syncing FB Ads ${periodType} reach/frequency ${since} -> ${until}`);
+  console.log(`Syncing FB Ads ${periodType} reach/frequency ${since} -> ${until} for ${accounts.length} account(s): ${accounts.map((a) => a.label).join(', ')}`);
 
-  for (const level of LEVELS) {
-    try {
-      // timeIncrement omitted -> one aggregated row per entity for [since, until]
-      const raw = await fetchInsights({ level, since, until, timeIncrement: null });
-      const rows = raw.map((r) => transformPeriodRow(level, periodType, period_start, r));
-      const ok = await upsertMany(COLLECTION, rows, FILTER_KEYS);
-      console.log(`  ${level}: ${ok}/${rows.length} rows upserted into ${COLLECTION}`);
-    } catch (e) {
-      const msg = e.response?.data?.error?.message || e.message;
-      console.error(`  ${level} failed: ${msg}`);
+  for (const account of accounts) {
+    console.log(`\n== ${account.label} (${account.id}) ==`);
+    for (const level of LEVELS) {
+      try {
+        // timeIncrement omitted -> one aggregated row per entity for [since, until]
+        const raw = await fetchInsights({ accountId: account.id, level, since, until, timeIncrement: null });
+        const rows = raw.map((r) => transformPeriodRow(level, periodType, period_start, r, account.label));
+        const ok = await upsertMany(COLLECTION, rows, FILTER_KEYS);
+        console.log(`  ${level}: ${ok}/${rows.length} rows upserted into ${COLLECTION}`);
+      } catch (e) {
+        const msg = e.response?.data?.error?.message || e.message;
+        console.error(`  ${level} failed: ${msg}`);
+      }
     }
   }
 
-  console.log('Done.');
+  console.log('\nDone.');
 }
 
 async function run() {

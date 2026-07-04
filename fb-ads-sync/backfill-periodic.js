@@ -3,20 +3,29 @@ require('dotenv').config();
 const { fetchInsights } = require('./lib/facebook');
 const { transformPeriodRow } = require('./lib/transform-period');
 const { upsertMany } = require('./lib/nocobase');
+const { parseAccounts, filterAccountsFromArgs } = require('./lib/accounts');
 
 // One-time historical backfill for weekly/monthly reach & frequency.
-// Requires the lib/facebook.js patch (see facebook.js.patch).
 //
 // Usage:
 //   BACKFILL_SINCE=2024-01-01 node backfill-periodic.js --period=week
 //   BACKFILL_SINCE=2024-01-01 node backfill-periodic.js --period=month
+//   BACKFILL_SINCE=2024-01-01 node backfill-periodic.js --period=week --account=Shop1
 //
 // Chunks are whole periods (a week or a month), since each chunk IS the
 // row being stored — there's no daily data to aggregate afterward.
-// Safe to re-run/resume: upsert means re-running a chunk just refreshes it.
+// Safe to re-run/resume: upsert means re-running a chunk just refreshes it —
+// so --account is a convenience (skip accounts already backfilled), not a
+// correctness requirement.
 
 const COLLECTION = 'fb_ads_period_data';
 const FILTER_KEYS = ['entity_type', 'entity_id', 'period_type', 'period_start'];
+// 'adset' added here — previously omitted, which happened to paper over
+// entityIdFor's missing 'adset' case in transform-period.js (now fixed).
+// Since that bug meant adset rows never actually landed in
+// fb_ads_period_data, run this once after deploying to backfill them
+// retroactively (existing ad/campaign/account rows are unaffected — upsert
+// just refreshes what's already there).
 const LEVELS = ['ad', 'adset', 'campaign', 'account'];
 
 const SINCE = process.env.BACKFILL_SINCE || '2024-01-01';
@@ -70,30 +79,30 @@ async function run() {
   const periodType = arg ? arg.split('=')[1] : null;
 
   if (!['week', 'month'].includes(periodType)) {
-    console.error('Usage: node backfill-periodic.js --period=week|month');
+    console.error('Usage: node backfill-periodic.js --period=week|month [--account=Label1,Label2]');
     process.exit(1);
   }
 
+  const accounts = filterAccountsFromArgs(parseAccounts());
   const until = ymd(yesterday());
   const chunks = periodChunks(periodType, SINCE, until);
-  console.log(`Backfilling ${periodType} reach/frequency: ${SINCE} -> ${until} in ${chunks.length} chunks`);
+  console.log(`Backfilling ${periodType} reach/frequency: ${SINCE} -> ${until} in ${chunks.length} chunks for ${accounts.length} account(s): ${accounts.map((a) => a.label).join(', ')}`);
 
-  for (const { since, until: chunkUntil, period_start } of chunks) {
-    console.log(`\n== ${since} -> ${chunkUntil} ==`);
-    for (const level of LEVELS) {
-      try {
-        const raw = await fetchInsights({ level, since, until: chunkUntil, timeIncrement: null });
-        const rows = raw.map((r) => transformPeriodRow(level, periodType, period_start, r));
-        const ok = await upsertMany(COLLECTION, rows, FILTER_KEYS);
-        console.log(`  ${level}: ${ok}/${rows.length} -> ${COLLECTION}`);
-      } catch (e) {
-        const msg = e.response?.data?.error?.message || e.message;
-        console.error(`  ${level} failed: ${msg}`);
+  for (const account of accounts) {
+    console.log(`\n#### ${account.label} (${account.id}) ####`);
+    for (const { since, until: chunkUntil, period_start } of chunks) {
+      console.log(`\n== ${since} -> ${chunkUntil} ==`);
+      for (const level of LEVELS) {
+        try {
+          const raw = await fetchInsights({ accountId: account.id, level, since, until: chunkUntil, timeIncrement: null });
+          const rows = raw.map((r) => transformPeriodRow(level, periodType, period_start, r, account.label));
+          const ok = await upsertMany(COLLECTION, rows, FILTER_KEYS);
+          console.log(`  ${level}: ${ok}/${rows.length} -> ${COLLECTION}`);
+        } catch (e) {
+          const msg = e.response?.data?.error?.message || e.message;
+          console.error(`  ${level} failed: ${msg}`);
+        }
       }
-      // Small pause between levels to stay well under the app's rate limit,
-      // on top of fetchInsights' own retry-with-backoff (facebook.js) which
-      // handles the case where we still get rate-limited despite pacing.
-      await new Promise((r) => setTimeout(r, 1000));
     }
   }
 

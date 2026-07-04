@@ -3,12 +3,18 @@ require('dotenv').config();
 const { fetchInsights } = require('./lib/facebook');
 const { TRANSFORMERS } = require('./lib/transform');
 const { upsertMany } = require('./lib/nocobase');
+const { parseAccounts, filterAccountsFromArgs } = require('./lib/accounts');
 
 // One-time historical backfill. Set the start date below (or via env), then run:
 //   node backfill.js
+//   node backfill.js --account=Shop1              (just one account)
+//   node backfill.js --account=Shop1,Shop2         (a subset — comma-separated,
+//                                                    matches label or raw act_ id)
 // Facebook keeps insights for ~37 months, so don't go further back than that.
 // Pulls month-by-month so each request stays small. Safe to re-run / resume:
-// the upsert means re-running a chunk just refreshes those rows, no duplicates.
+// the upsert means re-running a chunk just refreshes those rows, no duplicates —
+// so --account is a convenience (skip accounts you've already backfilled),
+// not a correctness requirement.
 
 const SINCE = process.env.BACKFILL_SINCE || '2024-01-01'; // <-- earliest date to fetch
 const UNTIL = process.env.BACKFILL_UNTIL || ymd(yesterday());
@@ -46,20 +52,24 @@ function monthChunks(since, until) {
 }
 
 async function run() {
+  const accounts = filterAccountsFromArgs(parseAccounts());
   const chunks = monthChunks(SINCE, UNTIL);
-  console.log(`Backfilling ${SINCE} -> ${UNTIL} in ${chunks.length} monthly chunks`);
+  console.log(`Backfilling ${SINCE} -> ${UNTIL} in ${chunks.length} monthly chunks for ${accounts.length} account(s): ${accounts.map((a) => a.label).join(', ')}`);
 
-  for (const { since, until } of chunks) {
-    console.log(`\n== ${since} -> ${until} ==`);
-    for (const { level, collection, filterKeys } of LEVELS) {
-      try {
-        const raw = await fetchInsights({ level, since, until });
-        const rows = raw.map(TRANSFORMERS[level]);
-        const ok = await upsertMany(collection, rows, filterKeys);
-        console.log(`  ${level}: ${ok}/${rows.length} -> ${collection}`);
-      } catch (e) {
-        const msg = e.response?.data?.error?.message || e.message;
-        console.error(`  ${level} failed: ${msg}`);
+  for (const account of accounts) {
+    console.log(`\n#### ${account.label} (${account.id}) ####`);
+    for (const { since, until } of chunks) {
+      console.log(`\n== ${since} -> ${until} ==`);
+      for (const { level, collection, filterKeys } of LEVELS) {
+        try {
+          const raw = await fetchInsights({ accountId: account.id, level, since, until });
+          const rows = raw.map(TRANSFORMERS[level]).map((r) => ({ ...r, account: account.label }));
+          const ok = await upsertMany(collection, rows, filterKeys);
+          console.log(`  ${level}: ${ok}/${rows.length} -> ${collection}`);
+        } catch (e) {
+          const msg = e.response?.data?.error?.message || e.message;
+          console.error(`  ${level} failed: ${msg}`);
+        }
       }
     }
   }
