@@ -1,0 +1,138 @@
+// =====================================================
+// source_code — ui_fbads_controls
+//
+// Contract: shared presentational React pieces for the 3 FB Ads jblocks.
+// Compiled via `new Function('React','antd','dayjs','ctx', src)`. Pure UI —
+// takes data/handlers as props, never touches ctx/SQL itself, so it does
+// NOT depend on fn_fbads_data; both are loaded independently by each caller.
+// =====================================================
+const { useState } = React;
+const { Segmented, Button, InputNumber, DatePicker, Popover, Select } = antd;
+const ce = React.createElement;
+
+// ── layout atom — label + control stack, used in every filter bar ──
+function Field(label, control) {
+  return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+    ce('span', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase', letterSpacing: 0.3, visibility: label ? 'visible' : 'hidden' } }, label || '\u00A0'),
+    control);
+}
+function vDivider() {
+  return ce('div', { style: { width: 1, alignSelf: 'stretch', background: '#e5e7eb' } });
+}
+
+// ── objective badge — real fb_ads_status.objective_key bucket ──
+const OBJ_COLOR = { purchase: '#16a34a', atc: '#f59e0b', reach: '#3b82f6', other: '#6b7280' };
+const OBJ_LABEL = { purchase: 'Purchase', atc: 'ATC', reach: 'Reach', other: 'Other' };
+const OBJ_OPTIONS = [
+  { label: 'All', value: 'all' },
+  { label: 'Reach', value: 'reach' },
+  { label: 'ATC', value: 'atc' },
+  { label: 'Purchase', value: 'purchase' },
+  { label: 'Other', value: 'other' },
+];
+function badge(obj) {
+  return ce('span', {
+    style: { display: 'inline-block', padding: '1px 7px', borderRadius: 999, fontSize: 10, fontWeight: 700,
+             background: (OBJ_COLOR[obj] || '#6b7280') + '20', color: OBJ_COLOR[obj] || '#6b7280', marginRight: 6 },
+  }, OBJ_LABEL[obj] || obj);
+}
+
+// Small non-blocking indicator for WHY a classification might be
+// provisional — never blocks rendering, just tells you to double check:
+//   - guessed:      no objective_key yet (not synced) — old name-based guess
+//   - inconsistent: adsets under this campaign disagree on custom_event_type
+function objectiveMetaBadge(info) {
+  if (!info) return null;
+  if (info.isGuessed) {
+    return ce('span', {
+      style: { display: 'inline-block', padding: '1px 6px', borderRadius: 999, fontSize: 9, fontWeight: 700, background: '#f3f4f6', color: '#9ca3af', marginRight: 6, border: '1px dashed #d1d5db' },
+      title: 'No synced Facebook objective yet (fetch-status.js) — classified by campaign name instead',
+    }, 'guessed');
+  }
+  if (!info.isConsistent) {
+    return ce('span', {
+      style: { display: 'inline-block', padding: '1px 6px', borderRadius: 999, fontSize: 9, fontWeight: 700, background: '#fef3c7', color: '#b45309', marginRight: 6 },
+      title: 'This campaign\'s adsets have mixed/inconsistent custom_event_type values — objective is a best-effort pick',
+    }, '⚠ mixed');
+  }
+  return null;
+}
+
+// ── Facebook effective_status badge — single visual source: fb_ads_status ──
+const STATUS_COLOR = {
+  ACTIVE: '#16a34a',
+  PAUSED: '#9ca3af', CAMPAIGN_PAUSED: '#9ca3af', ADSET_PAUSED: '#9ca3af',
+  ARCHIVED: '#6b7280', DELETED: '#6b7280',
+  DISAPPROVED: '#dc2626',
+  PENDING_REVIEW: '#f59e0b', IN_PROCESS: '#f59e0b', WITH_ISSUES: '#f59e0b',
+  PREAPPROVED: '#3b82f6',
+};
+function statusBadge(status) {
+  if (!status) return null;
+  const color = STATUS_COLOR[status] || '#6b7280';
+  return ce('span', {
+    style: { display: 'inline-block', padding: '1px 7px', borderRadius: 999, fontSize: 10, fontWeight: 700, background: color + '20', color: color, marginRight: 6 },
+    title: 'Facebook status (fb_ads_status)',
+  }, status.replace(/_/g, ' '));
+}
+
+// ── Time window popover — Group by / Periods back / Last date + local
+// Apply, exactly matching the Structure report's pattern. Self-contained:
+// owns its own pending-state scratch copy and open/close state, only calls
+// back into the parent on Apply — parent doesn't need to thread 6 separate
+// pieces of state itself.
+//
+// Props: { granularity, periodCount, lastDate, loading, onApply(gran,count,lastDate), granularityOptions? }
+// granularityOptions defaults to all three (Daily/Weekly/Monthly) — pass a
+// subset (e.g. Overview passes just Weekly/Monthly, no Daily) to restrict.
+const ALL_GRANULARITY_OPTIONS = [{ label: 'Daily', value: 'daily' }, { label: 'Weekly', value: 'weekly' }, { label: 'Monthly', value: 'monthly' }];
+function TimeWindowPopover(props) {
+  const granularity = props.granularity, periodCount = props.periodCount, lastDate = props.lastDate;
+  const loading = props.loading, onApply = props.onApply;
+  const granularityOptions = props.granularityOptions || ALL_GRANULARITY_OPTIONS;
+
+  const sPendingGranularity = useState(granularity); const pendingGranularity = sPendingGranularity[0]; const setPendingGranularity = sPendingGranularity[1];
+  const sPendingPeriodCount = useState(periodCount); const pendingPeriodCount = sPendingPeriodCount[0]; const setPendingPeriodCount = sPendingPeriodCount[1];
+  const sPendingLastDate = useState(lastDate); const pendingLastDate = sPendingLastDate[0]; const setPendingLastDate = sPendingLastDate[1];
+  const sOpen = useState(false); const open = sOpen[0]; const setOpen = sOpen[1];
+
+  function handleOpenChange(nextOpen) {
+    if (nextOpen) { setPendingGranularity(granularity); setPendingPeriodCount(periodCount); setPendingLastDate(lastDate); }
+    setOpen(nextOpen);
+  }
+  function handleApply() {
+    onApply(pendingGranularity, pendingPeriodCount, pendingLastDate);
+    setOpen(false);
+  }
+
+  const periodUnitLabel = function (gran) { return gran === 'monthly' ? 'months' : gran === 'daily' ? 'days' : 'weeks'; };
+  const lastDateFieldLabel = function (gran) { return gran === 'monthly' ? 'Last month' : gran === 'weekly' ? 'Last week' : 'Last date'; };
+  const datePickerMode = function (gran) { return gran === 'monthly' ? 'month' : gran === 'weekly' ? 'week' : 'date'; };
+  const disableFutureDates = function (current) { return current && current > dayjs().endOf('day'); };
+
+  const summary = granularity.charAt(0).toUpperCase() + granularity.slice(1) + ' · last ' + periodCount + ' ' + periodUnitLabel(granularity) + ' · ' + lastDate.format('D MMM YYYY');
+
+  const panel = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, width: 260 } },
+    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      ce('span', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase' } }, 'Group by'),
+      ce(Segmented, { value: pendingGranularity, onChange: setPendingGranularity, block: true, options: granularityOptions })),
+    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      ce('span', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase' } }, 'Periods back'),
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+        ce(InputNumber, { min: 1, max: 180, value: pendingPeriodCount, onChange: function (v) { setPendingPeriodCount(v || 1); }, style: { width: 90 } }),
+        ce('span', { style: { fontSize: 12, color: '#6b7280' } }, periodUnitLabel(pendingGranularity)))),
+    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      ce('span', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase' } }, lastDateFieldLabel(pendingGranularity)),
+      ce(DatePicker, {
+        value: pendingLastDate, onChange: function (d) { if (d) setPendingLastDate(d.startOf('day')); },
+        picker: datePickerMode(pendingGranularity), allowClear: false, disabledDate: disableFutureDates, style: { width: '100%' },
+      })),
+    ce(Button, { type: 'primary', block: true, onClick: handleApply }, loading ? 'Applying…' : 'Apply'));
+
+  return ce(Popover, {
+    content: panel, title: 'Time window', trigger: 'click',
+    open: open, onOpenChange: handleOpenChange, placement: 'bottomLeft',
+  }, ce(Button, null, '📅 ' + summary + ' ▾'));
+}
+
+return { Field, vDivider, OBJ_COLOR, OBJ_LABEL, OBJ_OPTIONS, badge, objectiveMetaBadge, STATUS_COLOR, statusBadge, TimeWindowPopover };
