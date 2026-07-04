@@ -1,245 +1,169 @@
 # Internal Production System — code mirror
 
-Canonical mirror of the inline React (`jblock`) and `source_code` components for an
-internal production-management system on NocoBase. **NocoBase is the live source of
-truth**
-(it executes the code); this repo is the history + context mirror **and the onboarding
-doc for any new Claude session**.
+Canonical mirror of inline React (`jblock`) and `source_code` components for an
+internal production-management system on NocoBase. **NocoBase is the live source
+of truth** (it executes the code); this repo is the history/context mirror and
+the onboarding doc for any new Claude session.
 
-> **For a new chat AI reading this first:** read this whole file before writing any
-> code. It contains the sandbox constraints, the architecture rules, and the mistakes
-> we've already made and fixed. Don't repeat them. Don't propose solutions that
-> violate the "hard constraints" section — they have been tried and confirmed broken
-> in this environment. The database schema is **not** in this file — see §7 for
-> where to get it.
+> **New session, read this whole file before writing code.** It has the sandbox
+> constraints, architecture rules, and mistakes already made/fixed — don't repeat
+> them, and don't propose anything that violates §3 (tried and confirmed broken).
+> Schema is **not** in this file — see §7.
 >
-> **On getting files without asking Andre:** if you have bash/code-execution
-> access, `git clone` the repo yourself (§2) — don't ask him for file contents you
-> can get directly. If you only have a web-fetch tool, note that most such tools
-> can only fetch a URL that already appears *literally* in the conversation —
-> **a URL you construct by editing another URL's path will be rejected**, even if
-> the pattern is obvious. That's why §8.1 below lists the exact, literal raw URL
-> for every file: fetching this README puts all of them into the conversation
-> verbatim, so you can fetch any of them directly with zero construction. Use
-> those, don't build your own.
->
-> **A second, separate fetch-reliability problem (learned 2026-07-02):** even a
-> literal, correctly-typed URL from §8.1 can come back from a `web_fetch`-style
-> tool as just the URL text itself, with no error — indistinguishable from a
-> successful fetch unless you actually look at what came back. This happened
-> repeatedly in one session, including on this exact README's own URL fetched
-> twice in a row. **Before treating a fetch as successful, or writing anything
-> about a file based on it, confirm the returned content actually looks like the
-> file** (real code / real prose), not the URL string echoed back. If it's not
-> real content, say so and retry rather than proceeding on a guess — a wrong
-> guess stated with confidence is worse than an honest "I couldn't read this."
+> **Claude cannot clone or browse this repo on its own** (no reliable file-listing
+> tool, and web-fetch-style tools only work on an exact URL already present in the
+> conversation — a URL built by editing another one gets rejected). When you need
+> a file, **ask Andre for its raw URL or ask him to paste the content** — don't
+> guess a path. Two more things worth knowing: (1) a "successful" fetch can
+> sometimes just echo the request URL back instead of real content — confirm what
+> came back actually looks like code/prose before trusting it; (2) `raw.
+> githubusercontent.com` caches for a few minutes after a push, so a fetch right
+> after a commit can return a stale version — don't assume a fetch mismatch means
+> the commit failed. And don't assume a copy of *this* file fetched earlier in a
+> long session is still current — other work can land on the repo mid-session;
+> ask before editing it.
 
 ---
 
 ## 1. What this project is
 
-This is an **internal garment production management system**, built as
-inline JavaScript pasted directly into **NocoBase** (self-hosted, Jakarta timezone,
-`DD/MM/YYYY` date formatting). No filesystem deployment — every "file" in this repo
-corresponds to one row in a NocoBase table (`source_code`, `jblock`, or `JSAction`).
+Internal garment production management system, built as inline JavaScript pasted
+directly into **NocoBase** (self-hosted, Jakarta timezone, `DD/MM/YYYY` dates). No
+filesystem deployment — every "file" here corresponds to one NocoBase row
+(`source_code`, `jblock`, or `JSAction`).
 
-It tracks productions across two internal brands (identified by product code prefix
-`A` vs `O`) — through statuses: `planning → cutting → production →
-QC → permak → done`. Core entities: productions, konveksi (external production
-partners), products/SKU variants, materials, samples, delivery/QC results, and
-permakan (alteration/rework).
+Tracks productions across two internal brands (product code prefix `A` vs `O`)
+through `planning → cutting → production → QC → permak → done`. Core entities:
+productions, konveksi (external production partners), products/SKU variants,
+materials, samples, delivery/QC results, permakan (alteration/rework).
 
-A second, unrelated component of this project is a **Facebook Ads → NocoBase data
-pipeline** (`~/fb-ads-sync`, Node.js) that syncs ad performance data in.
+Separate component: a **Facebook Ads → NocoBase pipeline** (`~/fb-ads-sync`,
+Node.js) plus **3 FB Ads reporting jblocks** built on top of it — see §10.
 
 ---
 
-## 2. Sync workflow (steady state)
+## 2. Sync workflow
 
 1. Code is generated/edited in a Claude session.
-2. Paste into the matching NocoBase row (it runs immediately — NocoBase is live).
-3. Commit the same change here (the mirror) — paste-and-commit, no delete/reupload.
-4. Next session: clone this repo fresh, or share the raw URL of the file(s) in play,
-   so Claude reads current state before editing.
+2. Paste into the matching NocoBase row (runs immediately — NocoBase is live).
+3. Commit the same change here (paste-and-commit, no delete/reupload).
+4. Next session: get current file(s) before editing — see the callout at the top.
 
-Clone command (components nested under `kanoerp/kanoerp/`):
+Clone (if Claude has bash+network, or for Andre to run and paste the output):
 ```
 git clone --depth 1 https://github.com/ricardoandre/kanoerp.git
-```
-
-You only need to keep current the files you're about to work on; the runtime is
-always current regardless of mirror lag.
-
-**How code actually goes live in NocoBase (deployment mechanics):**
-- **`jblock`** → create a new **Page** in NocoBase, add one big custom-code block
-  to that page, paste the code in. One page = one jblock, almost always (e.g.
-  `view_production` is its own page). This is the pattern for anything that's a
-  full custom view (production list, material list, dev tools like the schema
-  dump).
-- **`JSAction`** → used *alongside a native NocoBase table block* (the built-in
-  table UI, not a custom jblock), to extend what that table can do. Workflow:
-  start from an existing native table → add a button action on it → point that
-  button at the JSAction row → paste the shell code in. This is how the
-  `act_import_*` and `act_material_out`/`act_prepare_fabric` actions attach to
-  their respective native tables.
-- A `source_code` row by itself is never placed on a page directly — it's only
-  ever loaded via `loadCode(ctx, name)` from a `jblock` or `JSAction`.
-
-**Session close ritual:** every Claude session should end with an explicit
-"changed this session" list, so it's clear which rows to paste into NocoBase and
-which files to commit to GitHub.
-
-**Schema refresh ritual:** the schema lives in a separate file, not here (see §7).
-Whenever the schema changes, run the `view_database_schema_dump` jblock (§8), copy
-the text box, and paste it into a Claude chat with "update the schema file." Don't
-hand-edit the schema file from memory — NocoBase's relation field names routinely
-differ from what you'd guess (see §4.1), so the dump is the only reliable source.
-
-**Getting the current file list:** GitHub's web "tree" page (`/tree/main/...`)
-blocks automated fetching (`robots.txt` disallows it), so a new Claude session
-can't just browse the repo in a browser-like way. The clone command above always
-works though — after cloning, list files with:
-```
 find kanoerp -type f -not -path '*/.git/*'
 ```
-Ask for this at the start of a session if you want Claude to reconcile the
-registry (§8) against what's actually in the repo, rather than trusting the
-table below blindly.
+GitHub's web "tree" page blocks automated fetching (`robots.txt`), so that's not
+an option — the clone above (or asking Andre to run it) is the only reliable way
+to get a current file list.
+
+**How code goes live:** `jblock` → new NocoBase Page, one custom-code block,
+paste in (one page per jblock). `JSAction` → attached to a native table block's
+toolbar button (not a custom jblock). A `source_code` row is never placed on a
+page directly — only loaded via `loadCode(name)` from a `jblock`/`JSAction` (see
+§3 for the exact signature actually in use).
+
+**Session close ritual:** end every session with an explicit "changed this
+session" list — which rows to paste into NocoBase, which files to commit here.
+
+**Schema refresh ritual:** schema lives in a separate file (§7), regenerated by
+the `view_database_schema_dump` jblock. Never hand-edit it from memory — relation
+field names aren't predictable from the collection name (§4.1).
 
 ---
 
-## 3. Hard sandbox constraints — NEVER violate these
+## 3. Hard sandbox constraints — never violate these
 
-These have been stated and re-confirmed many times. Any new code must respect them.
-If a solution requires one of the "blocked" items below, it is wrong — find another way.
-
-- **`window.*` is fully blocked.** No `window.print`, `window.open`, `window.innerWidth`,
-  `window.addEventListener`, `window.location`. Never propose a `window.*`-based fix.
-- **`document` is not freely available in all contexts** — only use it where already
-  proven to work. The one proven pattern: CSV/PDF download via
-  `document.createElement('a')` + `Blob` + `.click()` (used in the working CSV export
-  and in `ui_prepare_fabric`'s PDF download).
-- **`fetch()` is blocked**, and **writing to any global** (e.g. `window.XLSX = ...`)
-  throws — this is SES lockdown, confirmed while building the CSV importers
-  (`ui_import_*`). Rules out loading external libraries (e.g. a binary `.xlsx`
-  parser like SheetJS) entirely: no way to fetch one in, no way to attach it to a
-  global even if you had the bytes. Users must convert `.xlsx`/`.xls` to CSV before
-  uploading.
-- **`new FileReader()` is blocked** (constructing this specific global throws), but
-  **`Blob.prototype.text()` on an existing `File` object is allowed** — it's an
-  instance method on an object you already have (e.g. from antd's `Upload`
-  component), not a global being instantiated. This is the proven pattern for
-  reading uploaded file contents in this sandbox: get the `File` from antd
-  `Upload`, call `.text()` on it, parse as delimited text (comma/semicolon/tab,
-  auto-detect). See `ui_import_material_details` / `ui_import_product_material` /
-  `ui_import_product_main_material`.
-- **`setTimeout` is blocked** in jblock sandboxes.
-- **PDF generation must not use `window.print`.** Bundle a pure JS PDF writer into a
-  `source_code` row instead (see `ui_prepare_fabric`, which builds PDF bytes by hand,
-  no external library, no CDN — validated with `qpdf` + `pdftoppm`).
-- **Jblocks cannot import each other.** Shared logic must live in `source_code` rows,
-  compiled via `new Function('React','antd','dayjs','ctx', src)` and loaded through a
-  `loadCode(ctx, name)` helper with a module-level `_codeCache`.
-- **Concurrent `ctx.sql.save`/`runById` pairs with different uids can collide.**
-  *(Learned 2026-07-02.)* Firing several dynamic-uid SQL calls at once via
-  `Promise.all` (e.g. one query per item in a loop) threw
-  `"invalid sql schema uid used"`. Fix: combine the queries into one (e.g.
-  `UNION ALL` for per-table row counts) under a single fixed uid, or serialize the
-  calls (`.then()` chain / sequential execution) instead of running them in
-  parallel. Multiple *fixed*, *different* uids fired concurrently (e.g.
-  `ui_production_edit`'s `fetchOptions`, four parallel lookups) is a proven-safe
-  pattern — the risk is specifically *dynamic/generated* uids run in parallel.
+- **`window.*` fully blocked** (`print`, `open`, `innerWidth`, `addEventListener`,
+  `location`, etc.). Never propose a `window.*` fix.
+- **`document` only works where already proven** — the one confirmed pattern:
+  `document.createElement('a')` + `Blob` + `.click()` for CSV/PDF download.
+- **`fetch()` is blocked; writing to any global throws (SES lockdown)** — no
+  external libraries can be loaded (e.g. no binary `.xlsx` parser). CSV only;
+  users convert `.xlsx`→CSV before upload.
+- **`new FileReader()` is blocked**, but **`Blob.prototype.text()` on an existing
+  `File`** (e.g. from antd `Upload`) works fine — it's an instance method, not a
+  global construction. Use this to read uploaded file contents.
+- **`setTimeout` is blocked.**
+- **PDF generation must not use `window.print`** — build PDF bytes by hand in a
+  `source_code` row instead (see `ui_prepare_fabric`).
+- **Jblocks cannot import each other.** Shared logic lives in `source_code` rows,
+  compiled via `new Function('React','antd','dayjs','ctx', src)` and loaded with a
+  `loadCode` helper each caller defines locally (not itself shared). **Confirmed
+  working signature: `loadCode(name)`** — no `ctx` param, closes over the caller's
+  own top-level `ctx`:
+  ```js
+  const _codeCache = {};
+  async function loadCode(name) {
+    if (_codeCache[name]) return _codeCache[name];
+    const uid = 'code_' + name;
+    const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+      .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+    const src = (rows && rows[0] && rows[0].code) || '';
+    _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+    return _codeCache[name];
+  }
+  ```
+  A `source_code` row's content is a function **body** (not a declaration), ending
+  in `return {...}` of its exports. Any exported function needing SQL should take
+  `ctx` as its own explicit parameter (e.g. `runSql(ctx, prefix, sql)`) rather than
+  relying on the outer closure — the cached module could be invoked by a different
+  caller/ctx later. `dayjs`/`React`/`antd` are safe to close over directly.
+  **Not yet directly verified:** a real `source_code` row's raw content, to
+  100% confirm the `return {...}` shape — only inferred from `view_production.js`'s
+  usage. Row *names* are confirmed correct via `ls` (§8), just not a row's body.
+- **Concurrent dynamic-uid `ctx.sql` calls can collide** (`"invalid sql schema uid
+  used"`). Fix: one combined query (e.g. `UNION ALL`) under a fixed uid, or
+  serialize instead of `Promise.all`-ing several dynamic uids. Multiple *fixed*,
+  *different* uids run concurrently is fine.
 
 ---
 
 ## 4. NocoBase API patterns
 
-- **Database engine: MySQL** (confirmed). Write SQL accordingly — backtick-quote
-  reserved words, `LIMIT n` (not `LIMIT n OFFSET m` reversed), no `information_schema`
-  reliance for relation semantics (§4's schema-introspection note below), standard
-  MySQL date functions if needed. This matters most for anyone writing raw SQL
-  directly rather than using `ctx.api.resource(...)`.
-- **SQL:** `ctx.sql.save(uid, sql)` (awaited) → `ctx.sql.runById(uid)`.
-  - `uid` must be a **fixed string** in column/list contexts.
-  - In **multi-row column code**, `uid` must be **dynamic per row**
-    (`"prefix_" + record_id`) to prevent concurrent collisions between rows rendering
-    at the same time — but see §3: don't fire many dynamic uids in parallel from a
-    single component (e.g. a loop + `Promise.all`); combine into one query or
-    serialize instead.
-- **Writes:** use `ctx.api.resource('collection').create({ values: {...} })` for
-  inserts — this is reliable and avoids snowflake-ID issues that raw SQL `INSERT`
-  runs into.
-- **belongsTo associations** require nested payloads:
-  `{ [relFieldName]: { [targetKey]: value } }` — never send a raw FK value alone,
-  it fails required-field validation. **The relation field name is not always
-  predictable — see §4.1, check the schema file.**
-- **Image/attachment fields** are relations through obfuscated junction tables
-  (`t_xxx`), not plain SQL columns. Use the resource API with
-  `appends: ['image']`, or JOIN junction → attachments table via SQL. Relative
-  `/storage/uploads/…` URLs work directly in `<img src>`.
-- **Enum / single-select options** resolve via
-  `ctx.dataSourceManager.getDataSource('main').getCollection(...).getField(...).enum`
-  — do not try to pull enum labels via SQL.
-- **Schema/field introspection: use NocoBase's own metadata API, not raw SQL.**
-  *(Learned 2026-07-02.)* `ctx.dataSource || ctx.dataSourceManager.getDataSource('main')`
-  → `.getCollections()` gives every collection synchronously (`.name`, `.title`,
-  `.template`, `.filterTargetKey`, `.getFields()`). This is authoritative for
-  relation types/targets/keys. Raw SQL `information_schema` FK introspection is
-  **not reliable here** — most relations in this schema are enforced at the
-  NocoBase application layer, not as real DB foreign key constraints, so a raw-SQL
-  FK dump comes back mostly empty even though the relations very much exist and
-  work. See the `view_database_schema_dump` jblock (§8).
-- **CPAS / Shopee-integrated ad accounts:** conversions only appear in
-  `catalog_segment_actions` / `catalog_segment_value`; the standard
-  campaign/account-level `actions`/`action_values` API silently drops conversion data
-  for these accounts. Ad-level (`ads_insights`) is the only reliable source for
-  conversion rollups.
-- **Reach and frequency are NOT additive across days.** *(Learned 2026-07-02, from
-  the FB Ads weekly/monthly reporting work — see §10.1.)* Summing daily `reach`
-  values, or averaging daily `frequency` values, over a week or month double-counts
-  anyone reached more than once in that window and produces a wrong number — not
-  an approximation, an actually incorrect one. The Marketing API only returns a
-  correct reach/frequency figure when queried with `time_range` set to the exact
-  period wanted and **no `time_increment`** (or one matching the period length).
-  This applies at every level (ad/campaign/account) — account-level reach also
-  dedupes across ads within the account, so it isn't derivable from campaign- or
-  ad-level numbers either. Any other additive metric (spend, impressions, clicks,
-  conversions) is fine to sum from daily rows as before; only reach/frequency need
-  a separate, period-scoped fetch.
+- **MySQL.** Backtick reserved words, `LIMIT n`, no `information_schema` for
+  relations (see below).
+- **SQL:** `ctx.sql.save({uid,sql,dataSourceKey})` (awaited) → `ctx.sql.
+  runById(uid,...)`. Fixed `uid` in column/list contexts; dynamic per-row uid in
+  multi-row column code — but don't fire many dynamic uids in parallel (§3).
+- **Writes:** `ctx.api.resource('collection').create({values:{...}})` — reliable,
+  avoids raw-SQL-`INSERT` snowflake-ID issues.
+- **`belongsTo` needs nested payloads:** `{ [relFieldName]: { [targetKey]: value } }`
+  — a raw FK value alone fails validation. Relation field names aren't
+  predictable from the collection name — check the schema file (§4.1, §7).
+- **Image/attachment fields** are relations through obfuscated junction tables —
+  use `appends:['image']` via the resource API, or JOIN to attachments via SQL.
+- **Enums:** resolve via `ctx.dataSourceManager.getDataSource('main').
+  getCollection(...).getField(...).enum` — not raw SQL.
+- **Schema introspection:** use `ctx.dataSourceManager.getDataSource('main').
+  getCollections()` (`.name`/`.title`/`.template`/`.filterTargetKey`/
+  `.getFields()`), not `information_schema` — most relations here are enforced at
+  the app layer, not real DB FKs, so a raw FK dump comes back mostly empty.
+- **CPAS/Shopee accounts:** conversions only in `catalog_segment_actions`/
+  `catalog_segment_value` — standard `actions`/`action_values` silently drops
+  them; ad-level (`ads_insights`) is the reliable source. This is scoped to
+  conversion **metrics** only — CPAS objective metadata (`campaign.objective`,
+  `adset.promoted_object.custom_event_type`) comes through completely normally.
+- **Reach/frequency are NOT additive** — not across days, not across entities
+  (e.g. campaigns grouped into a report "bucket"), at any level (ad/campaign/
+  account). Only a period-scoped fetch (no `time_increment`) or a genuinely
+  single entity/single day row is correct; anything summed across days or
+  entities is wrong, not approximate. No daily-grain deduplicated reach source
+  exists for any entity today (`fb_ads_period_data` is week/month only) — see
+  §10.
 
-### 4.1 Relation field names are not predictable — always check the schema file
+### 4.1 Relation field names aren't predictable
 
-*(Learned 2026-07-02, from the first real `view_schema_dump` output.)* NocoBase's
-`belongsTo`/`hasMany`/`belongsToMany` **relation accessor field name** is frequently
-*different* from both the target collection's name and the raw FK column name.
-Guessing it wrong will silently misbehave — wrong field written, or required-field
-validation failures on create/update. Confirmed examples from the live schema:
+A `belongsTo`/`hasMany` field's name routinely differs from its target
+collection's name or FK column name. Some tables carry legacy duplicate raw
+audit columns alongside the standard `createdBy`/`updatedBy` belongsTo pair —
+prefer the belongsTo pair. Always check the schema file (§7) before writing a
+nested payload or `appends` — never guess or hand-recall from memory.
 
-- A `belongsTo` relation field's name doesn't have to match its target collection's
-  name (e.g. a relation to `product` was named something other than `product`).
-- A `hasMany` relation field's name doesn't have to match the related collection's
-  name either.
-- Some tables carry **legacy/duplicate raw audit columns** alongside the standard
-  NocoBase `createdBy`/`updatedBy` belongsTo pair (plain `bigInt` columns with
-  similar names) — prefer the belongsTo pair; treat the raw duplicates as legacy
-  and don't build new logic on them without checking why they exist first.
-- New, previously-undocumented relations can exist that aren't obvious from the
-  collection's "primary" purpose (e.g. a product-level relation into materials
-  beyond the expected `product_material` join table).
+### 4.2 Canonical `runSql`/`execSql` template
 
-**Rule going forward:** before writing a `belongsTo` nested-payload create/update,
-or before calling `appends: ['relationName']`, check the actual field name in the
-schema file (§7) rather than assuming it matches the collection name. Never
-hand-edit or hand-recall the schema from memory for this — regenerate the dump.
-
-### 4.2 Canonical `runSql` / `execSql` template — use this, not the older simpler version
-
-The most defensive version found in the codebase, independently present in two
-files (`ui_match_production`, `ui_material_out.js`) — treat this as the default
-template for any new component's SQL helper, in preference to the simpler
-`.save().then(() => .runById())` pattern still visible in older files
-(`view_production.js`, `ui_production_edit.js`):
-
+Preferred over the simpler `.save().then(()=>.runById())` seen in older files:
 ```js
 async function runSql(ctx, uid, sql) {
   if (ctx.flowSettingsEnabled) {
@@ -248,437 +172,342 @@ async function runSql(ctx, uid, sql) {
   return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
     .then(r => r || []).catch(() => []);
 }
-async function execSql(ctx, uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'exec', dataSourceKey: 'main' }).catch(() => null);
-}
 ```
-
-Two differences from the simpler pattern: `.save()` only runs when
-`ctx.flowSettingsEnabled` is true, and both `.save()` and `.runById()` swallow
-errors via `.catch()` rather than letting them propagate.
-
-⚠️ **Semantics not fully understood — copy the pattern anyway.** `ctx.flowSettingsEnabled`
-appears to gate whether `.save()` runs, likely tied to whether the code is
-currently inside NocoBase's flow-configuration/edit UI versus the live rendered
-page — but nobody currently remembers exactly why this guard was added. It shows
-up independently in two separate files, which is strong enough evidence it's a
-deliberate, working pattern worth copying as-is for new SQL helpers, even without
-a full explanation of the underlying mechanism. If a future session ever needs to
-actually understand *why* (not just copy it), that would mean digging into
-NocoBase's own source/docs — this repo's history doesn't have the answer.
+(`execSql` is the same shape with `type: 'exec'`.) `.save()` only runs when
+`ctx.flowSettingsEnabled` is true (likely flow-config-UI vs. live page, exact
+reason not fully understood — copy the pattern anyway, it's proven in two
+independent files); both calls swallow errors.
 
 ### 4.3 `ctx` surface — confirmed members only
 
-Pulled directly from actual usage across the codebase, not assumed. If a new
-session needs something not on this list, search existing files for it before
-assuming it exists.
-
 | Member | Use |
 |---|---|
-| `ctx.libs` | `{ React, antd, dayjs }` — the three libraries available inside `new Function('React','antd','dayjs','ctx', src)`. **`dayjs` has no plugins loaded** (confirmed: zero uses of `.utc()`/`.tz()`/`.extend()` anywhere in the codebase) — do timezone math by hand (see `view_source_code_updates`'s manual UTC+7 conversion), don't assume a plugin is available. |
-| `ctx.sql` | `.save({uid, sql, dataSourceKey})` / `.runById(uid, {type, dataSourceKey})` — use the §4.2 wrapper, not raw calls. |
-| `ctx.api` | `.resource('collection').create({values})` / `.update(...)` — the reliable write path (§4). |
-| `ctx.dataSource` / `ctx.dataSourceManager` | `.getDataSource('main').getCollections()` / `.getCollection(name).getField(name)` — schema/enum introspection (§4, §7). |
+| `ctx.libs` | `{ React, antd, dayjs }`. `dayjs` has **no plugins** — do timezone math by hand. |
+| `ctx.sql` | `.save({uid,sql,dataSourceKey})` / `.runById(uid,{type,dataSourceKey})` — use §4.2's wrapper. |
+| `ctx.api` | `.resource('collection').create({values})`/`.update(...)` — reliable write path. |
+| `ctx.dataSource`/`ctx.dataSourceManager` | `.getDataSource('main').getCollections()` — schema introspection. |
 | `ctx.render` | Mounts the component tree — required at the end of every jblock. |
-| `ctx.record` | The current row, in record-scoped contexts (JSAction on a record, column code). |
-| `ctx.resource` | `.getSelectedRows()`, `.refresh()` — list/table resource; used from bulk actions and JSActions to refresh after a write. |
-| `ctx.message` | Inline feedback, e.g. `ctx.message.warning('...')`. |
-| `ctx.notification` | Toast-style feedback (`.success({...})`, `.warning({...})`) — more prominent than `ctx.message`. The convention for when to use which isn't formalized yet; currently mixed across files. |
-| `ctx.flowSettingsEnabled` | Gates `ctx.sql.save()` in the §4.2 template — see that section's caveat. |
-| `ctx.t` | i18n translation function, e.g. `ctx.t('No data source available')`. Used sparingly; unclear if translation is actually configured — treat as optional decoration unless told otherwise. |
+| `ctx.record` | Current row, record-scoped contexts. |
+| `ctx.resource` | `.getSelectedRows()`, `.refresh()`. |
+| `ctx.message` / `ctx.notification` | Inline vs. toast feedback — convention not formalized, mixed usage. |
+| `ctx.flowSettingsEnabled` | Gates `ctx.sql.save()` in §4.2. |
+| `ctx.t` | i18n — used sparingly, unclear if actually configured. |
+
+If something's needed that's not on this list, search existing files before
+assuming it exists.
 
 ---
 
-## 5. Architecture principles (enforce going forward)
+## 5. Architecture principles
 
-- **Extract-on-second-use.** Write inline first. Only promote something to a shared
-  `source_code` row once it's genuinely needed a second time. Don't pre-abstract.
-- **Downward-only dependencies:** `ui_` → `fn_` → `lib_`. Never sideways, never
-  circular — circular deps are very hard to debug under `new Function` compilation.
-- **Stable contracts per module.** One-line comment at the top of every shared module
-  stating its input/output shape. Never bolt caller-specific props onto a shared
-  component — if a caller needs something new, extend the contract deliberately.
-- **Single canonical version.** Edit shared modules in place. All callers pick up the
-  change together — no forked copies.
-- **Rename in place, never delete-and-recreate jblocks.** Block UIDs feed filter
-  controllers; recreating a jblock breaks those silently even if the new one looks
-  identical.
-- **Jblock names ≠ importable strings.** Only `source_code` rows are loadable by
-  string via `loadCode(ctx, name)`. A jblock's name is just a label in NocoBase's UI.
-- **Naming convention**, underscore-separated (slashes are invalid in flowSql UIDs):
-  - `ui_` / `fn_` / `lib_` → `source_code` rows
-  - `view_` → `jblock` rows
-  - `act_` → `JSAction` rows
-- **`ctx` is always threaded as a function parameter**, never captured at compile
-  time — modules must stay reusable across hosts.
-- **Change scope discipline:** full-file replacement for complex/widespread changes;
-  targeted find/replace for small changes. When ambiguous, confirm direction before
-  writing code.
-- **Mockup before implementation** for any new UI layout — confirm the visual
-  direction before writing the component.
-- **Preview before writing, opt-in before overwriting.** Any bulk-write/import
-  feature must classify rows and show a preview before committing anything —
-  new / no-op / conflict — and require explicit opt-in (e.g. a checkbox) before
-  overwriting existing non-empty data. Never auto-apply a bulk write silently.
-  All three `ui_import_*` modules (§8) independently converged on this pattern —
-  treat it as a hard rule for anything new in this category, not just something
-  those three happened to do.
+- **Extract-on-second-use.** Write inline first; promote to `source_code` only on
+  genuine 2nd+ use. (`fn_fbads_data`/`ui_fbads_controls`, §10, were extracted on
+  their 3rd shared use.)
+- **Downward-only deps:** `ui_` → `fn_` → `lib_`. Never sideways/circular.
+- **Stable contracts per module** — one-line shape comment at the top. Extend a
+  shared component's contract deliberately (e.g. add an optional prop with a
+  backward-compatible default) rather than forking a copy.
+- **Single canonical version** — edit shared modules in place.
+- **Rename in place, never delete-and-recreate jblocks** — block UIDs feed filter
+  controllers; recreating breaks them silently.
+- **Jblock names ≠ importable strings** — only `source_code` rows load by name
+  via `loadCode`.
+- **Naming:** `ui_`/`fn_`/`lib_` → `source_code`; `view_` → `jblock`; `act_` →
+  `JSAction`. (Note: the 3 FB Ads jblocks don't follow `view_fb_ads_*` — see §8's
+  registry for their actual names, `view_fb_report_*`.)
+- **`ctx` always threaded as a parameter, never captured at compile time.**
+- **Change scope discipline:** full-file replacement for complex changes,
+  targeted find/replace for small ones; confirm direction first when ambiguous.
+- **Mockup before implementation** for new UI layout.
+- **Preview before writing, opt-in before overwriting** — any bulk-write/import
+  feature classifies rows (new/no-op/conflict) and previews before committing;
+  overwriting existing non-empty data needs explicit opt-in. Never silent.
+- **Don't guess unseen files/schemas/env vars — ask or fetch instead.** Two
+  concrete incidents this cost: inventing wrong contents for files before
+  actually fetching them, and guessing an env var (`AD_ACCOUNT_ID`) that no
+  longer existed post-migration, causing a live crash. Both happened *despite*
+  this rule already being written down.
+- **Prefer "—" + a warning over approximating a number when a real source is
+  structurally unavailable** (new, §10's Overview redesign) — for new work. Older
+  approximate-fallback behavior elsewhere (e.g. Structure/Details' adset/ad-level
+  reach) was deliberately left as-is since a real number does eventually backfill
+  there, unlike the case that prompted this rule.
 
 ---
 
 ## 6. UI conventions
 
-**What is antd?** It's [Ant Design](https://ant.design), the React UI component
-library NocoBase bundles and exposes via `ctx.libs.antd` — this is where `Modal`,
-`Table`, `Select`, `DatePicker`, etc. come from. The exact antd major version in
-this environment isn't confirmed (v4 vs v5 differ on some APIs, e.g. `Modal`'s
-static methods and how `message` is invoked), so the safest approach is to mirror
-components/props already proven to work in this codebase rather than assume a
-version. **Confirmed-working components/APIs**, pulled directly from actual files:
-`Modal` (incl. `.confirm()`, `.destroyAll()`), `Drawer`, `Dropdown`, `Select`,
-`DatePicker`, `InputNumber`, `Switch`, `Spin`, `message`, `Pagination`, `Upload`,
-`Button`, `Table`, `Alert`, `Progress`, `Input`, `Tag`. If a new component or prop
-is needed that isn't on this list, it's not necessarily broken — just unverified;
-say so explicitly rather than presenting it with full confidence.
+**antd** ([Ant Design](https://ant.design)) via `ctx.libs.antd` — version not
+confirmed, so mirror components already proven in this codebase rather than
+assume an API. Confirmed working: `Modal` (`.confirm()`, `.destroyAll()`),
+`Drawer`, `Dropdown`, `Select`, `DatePicker`, `InputNumber`, `Switch`, `Spin`,
+`message`, `Pagination`, `Upload`, `Button`, `Table`, `Alert`, `Progress`,
+`Input`, `Tag`, `Segmented`, `Checkbox`, `Popover`.
 
-- All components use `React.createElement` aliased as `ce` — **never JSX** (no
-  transpiler in the sandbox).
-- CSS via injected `<style>` tags with scoped class prefixes, to avoid leaking styles
-  into the rest of the NocoBase page.
-- Any scrollable popup/drawer/bottom sheet must end with a dummy spacer div
-  (~80–120px) so the last item isn't clipped by the viewport or a sticky footer.
-- **Mobile detail pattern:** single expandable bottom sheet with always-visible main
-  details + single-open accordion sub-sections (history, comments, materials,
-  variants). Detail actions live as `Edit` + `•••` top-right. No separate page on
-  mobile. (Desktop adaptive branch with a full-screen detail page is deferred.)
-- **Cross-record navigation** uses *replace*, never stack: close the current
-  drawer, open the target. Implemented via `ui_record_nav`, a sibling-mounted host
-  with a `navRef = { open: null }` channel that detail bodies call into.
-- Clickable cross-links: `›` chevron in indigo (`#4338ca`), no underline.
-- **Status colors** (consistent across the whole app):
-  - planning → `#f97316`
-  - cutting / production → `#d97706`
-  - QC → `#84cc16`
-  - permak → `#ef4444`
-  - done → `#22c55e`
-  - Orange = pending/not done · Green = done · Zero quantity = orange.
+- `React.createElement` aliased `ce` — **never JSX** (no transpiler).
+- Scoped `<style>` tags, not global CSS.
+- Scrollable popups/drawers need a trailing ~80–120px spacer div.
+- **Mobile detail pattern:** single expandable bottom sheet, always-visible main
+  details + single-open accordion sub-sections. `Edit`+`•••` top-right. No
+  separate desktop page yet.
+- **Cross-record nav replaces, never stacks** — via `ui_record_nav`.
+- Cross-links: `›` chevron, indigo `#4338ca`, no underline.
+- **Status colors:** planning `#f97316` · cutting/production `#d97706` · QC
+  `#84cc16` · permak `#ef4444` · done `#22c55e`. Orange = pending, green = done,
+  zero qty = orange.
+- **FB Ads reports (§10):** objective badges — purchase `#16a34a`, atc `#f59e0b`,
+  reach `#3b82f6` (also covers merged traffic objectives), other `#6b7280`.
+  Dashed "guessed" badge = no synced `objective_key` yet; amber "⚠ mixed" =
+  adsets disagree on `custom_event_type`. Both informational only. Missing real
+  data → "—" + warning banner, never a silent approximation.
 
-### Two known component patterns — only one is correct
-
-**DETAILS CODE pattern (correct — use for any detail/popup page context):**
-`ctx.libs.React`, `async bootstrap()` inside `useEffect`, a `runSql()` helper
-(`.save` + `.runById`), rendered through `ctx.render()`. Sections: highlight card,
-qty summary (DO/Cut/Sent/QC + diffs, orange = not done / green = done), variant
-table (same color logic), permakan (pending orange / done green), activity history
-(grouped, variant tags, defect badges).
-
-**COLUMN CODE pattern (broken — do not use for detail pages):**
-`ctx.element.innerHTML` with chained `.then()` SQL queries, no React / `ctx.render`.
-This pattern only belongs in simple list-column cell renderers, never in a detail
-page context.
+**Two known patterns — only one correct:** DETAILS CODE (`ctx.libs.React`, async
+`bootstrap()` in `useEffect`, `runSql()`, `ctx.render()`) is correct for any
+detail/popup. COLUMN CODE (`ctx.element.innerHTML`, chained `.then()`, no React)
+is broken for detail pages — only use it for simple list-column cells.
 
 ---
 
-## 7. Database schema — see separate file, not here
+## 7. Database schema — separate file
 
-The schema is **not** kept in this README. It's regenerated from NocoBase's own
-collection/field metadata (see §4's introspection note) and lives here:
-
+Not in this README — regenerated from NocoBase metadata, lives at:
 **https://raw.githubusercontent.com/ricardoandre/kanoerp/refs/heads/main/kanoerp/Schema%20Dump**
 
-Fetch that file at the start of any session that will touch SQL, `belongsTo`
-payloads, or `appends`. Regenerate it with the `view_database_schema_dump` jblock
-(§8) whenever the schema changes — see the "Schema refresh ritual" in §2. Do not
-reconstruct or guess schema details from memory; relation field names in
-particular are not predictable from the collection name (§4.1).
+Fetch before touching SQL/`belongsTo`/`appends`. Regenerate via
+`view_database_schema_dump` (§2's ritual). Never guess from memory (§4.1).
 
-Two schema-adjacent notes worth keeping here since they're about *behavior*, not
-column names:
-- All production FKs are standardized to `fk_production_id`.
-- `material_ledger` captures supplier **per transaction** (a point-in-time
-  snapshot), because the supplier for a given material can change over time —
-  don't assume the current material's supplier FK reflects historical
-  transactions.
+Behavioral notes (not column names, so kept here): all production FKs are
+`fk_production_id`; `material_ledger` snapshots supplier **per transaction**
+(the material's current supplier FK doesn't reflect history).
 
-`fb_ads_period_data` (a `fb-ads-sync`-related NocoBase table, not part of the main
-production schema) is documented in §10.1 instead of the schema dump file, since
-it's small and specific to that pipeline.
+Three small FB-ads-specific tables are documented in §10 instead of the schema
+dump (small, pipeline-specific): `fb_ads_period_data`, `fb_ads_status` (incl.
+`objective_key`), `fb_ads_target`.
 
 ---
 
-## 8. Registry — current components
+## 8. Registry
 
-> File names below match the repo exactly, including inconsistent `.js` extensions
-> (some rows have one, some don't — harmless, not worth normalizing yet; see §9 if
-> you want to clean it up).
+> Names below match the repo exactly (confirmed via `ls`, 2026-07), including
+> inconsistent `.js` extensions — not worth normalizing yet (§9).
 
-### `source_code` rows (shared logic, compiled via `new Function`, loaded with `loadCode`)
+### `source_code`
 
-| File | NocoBase row name | Purpose |
-|---|---|---|
-| `source_code/ui_list_engine.js` | `ui_list_engine` | Generic list/card/drawer engine; views are thin configs on top of it (was `kano_listview`). Exposes a `banner(data)` hook for warning banners. |
-| `source_code/ui_production_detail.js` | `ui_production_detail` | Canonical production detail. Self-contained: `{ productionId, onClose }`, fetches its own data. All entry points render this identical experience. Includes a Result History accordion section. |
-| `source_code/ui_production_edit.js` | `ui_production_edit` | Production new/edit drawer. |
-| `source_code/ui_production_material_detail.js` | `ui_production_material_detail` | Material detail + edit drawer (project mirror was previously misnamed `..._details` plural; the row name is singular). |
-| `source_code/ui_record_nav.js` | `ui_record_nav` | Cross-record replace-navigation host. Mount one per view root; cross-links close current + open target (never stacks). Depends on both detail components + `ui_production_edit`. |
-| `source_code/ui_prepare_fabric.js` | `ui_prepare_fabric` | Prepare-fabric modal + PDF (was `preparefabric`). `buildFabricPdf` is the future `lib_pdf` extraction candidate — split only once a second PDF consumer exists. |
-| `source_code/ui_material_out.js` | `ui_material_out` | Material-out modal. Exports `openModal({ctx,pmId,onSaved})`, `fetchSummary(ctx,pmId)`, `renderSummary(data)`, `isAccType(type)`. |
-| `source_code/ui_match_production` | `ui_match_production` | Reusable match-production module. Exports `openMatchModal`, `fetchMatchData`, `applyMatches`. **Not deployed/tested yet — no `act_match_production` shell exists. Deliberately for later stage; see §9.** |
-| `source_code/ui_import_material_details` | `ui_import_material_details` | Bulk-CREATE `material_details` rows from an uploaded CSV (`code`, `fk_material_code`, `variant`, `supplier_variant_code`). Create-only — existing `code` is skipped and reported, no overwrite path. |
-| `source_code/ui_import_product_main_material` | `ui_import_product_main_material` | Bulk-import `product.fk_main_fabric_code` from an uploaded CSV (`code`, `material_code`). Classifies each row: blank → ignored, `code` not found → new `product` row created, already matches → no-op, currently empty → auto-updates, differs (non-empty) → conflict table with opt-in checkboxes before overwrite. |
-| `source_code/ui_import_product_material` | `ui_import_product_material` | Bulk-CREATE `product_material` rows from an uploaded CSV (`product_code`, `material_code`, `quantity`). |
+| Row name | Purpose |
+|---|---|
+| `ui_list_engine.js` | Generic list/card/drawer engine; views are thin configs on it. Exposes `banner(data)`. |
+| `ui_production_detail.js` | Canonical production detail, self-contained `{ productionId, onClose }`. |
+| `ui_production_edit.js` | Production new/edit drawer. |
+| `ui_production_material_detail.js` | Material detail + edit drawer. |
+| `ui_record_nav.js` | Cross-record replace-navigation host; mount one per view root. |
+| `ui_prepare_fabric.js` | Prepare-fabric modal + hand-built PDF. `buildFabricPdf` = future `lib_pdf` candidate. |
+| `ui_material_out.js` | Material-out modal. Exports `openModal({ctx,pmId,onSaved})`, `fetchSummary`, `renderSummary`, `isAccType`. |
+| `ui_match_production` | Match-production module. Exports `openMatchModal`/`fetchMatchData`/`applyMatches`. **No JSAction shell yet — deferred (§9).** |
+| `ui_import_material_details` | Bulk-CREATE `material_details` from CSV. Create-only, no overwrite. |
+| `ui_import_product_main_material` | Bulk-import `product.fk_main_fabric_code` from CSV. Full classify/preview/opt-in-overwrite flow. |
+| `ui_import_product_material` | Bulk-CREATE `product_material` from CSV. |
+| `fn_fbads_data` | **FB Ads (§10).** Format/SQL helpers, single-select `accountFilterSql`/`fetchAccountList`, `buildPeriods`/`periodKeyExpr`, `resolveObjective`/`classifyObjective`/`REACH_OBJECTIVES`/`SALES_OBJECTIVES`, `fetchObjectiveMap`/`fetchStatusMap`, `DEFAULT_TARGET_RULES`/`fetchTargetRules`/`targetColorFromValue`/`growthColorFromValues`. No dep on `ui_fbads_controls`. |
+| `ui_fbads_controls` | **FB Ads (§10).** `Field`, `vDivider`, objective badge (`badge`/`OBJ_COLOR`/`OBJ_LABEL`/`OBJ_OPTIONS`), `objectiveMetaBadge`, `statusBadge`/`STATUS_COLOR`, `TimeWindowPopover` (optional `granularityOptions` prop). Pure UI, no ctx/SQL, no dep on `fn_fbads_data`. |
 
-All three importers share one pattern (see §3 for the underlying SES-lockdown
-constraints that forced it): `antd Modal.confirm()` with default OK/Cancel hidden
-and custom buttons in `content`, `Modal.destroyAll()` to close; file contents read
-via `Blob.prototype.text()` on the `File` object from antd `Upload`, parsed as
-delimited text (comma/semicolon/tab auto-detected) — `.xlsx`/`.xls` must be
-converted to CSV before uploading, since no binary parser can be loaded in this
-sandbox.
+All 3 importers share: `Modal.confirm()` w/ custom buttons + `Modal.destroyAll()`,
+file read via `Blob.prototype.text()` on the antd `Upload` `File`, delimited-text
+parsing (comma/semicolon/tab auto-detect) — CSV only (§3).
 
-### `jblock` rows (inline React pasted into the DB; thin domain shells)
+### `jblock`
 
-| File | NocoBase row name | Purpose |
-|---|---|---|
-| `jblock/view_production.js` | `view_production` | Thin domain config → `ui_list_engine` (SQL, status colors, card layout, detail/edit loaders, mounts `ui_record_nav`). |
-| `jblock/view_production_material.js` | `view_production_material` | Thin domain config → `ui_list_engine` for `production_material`. |
-| `jblock/view_production_result` | `view_production_result` | Production result list. Full SQL layer, card/detail/form layouts, 7 secondary filters, 4 bulk actions (including Match Production). |
+| Row name | Purpose |
+|---|---|
+| `view_production.js` | Thin config → `ui_list_engine`. |
+| `view_production_material.js` | Thin config → `ui_list_engine` for `production_material`. |
+| `view_production_result` | Production result list — full SQL layer, 7 filters, 4 bulk actions. |
+| `view_source_code_updates` | Dev tool: `source_code` rows newer than an editable timestamp. |
+| `view_database_schema_dump` | Dev tool: regenerates the schema file (§7). |
+| `view_database_table_list` | Dev tool: lightweight `Table` view of collections. |
+| `view_fb_report_details` | **FB Ads (§10).** Campaign→Adset→Ad drilldown, all objectives, real classification, single-select Account, Time-window popover, sort combo, live targets. |
+| `view_fb_report_creatives` | **FB Ads (§10).** Campaign/Adset/Creative drilldown for ONE objective at a time, ad thumbnails, target-colored cells, same filter conventions. |
+| `view_fb_report_overview` | **FB Ads (§10).** Single account-total view, no objective tabs, Weekly/Monthly only. |
 
-### `jblock` rows — dev tools (not domain UI; used for project maintenance)
+### `JSAction`
 
-| File | NocoBase row name | Purpose |
-|---|---|---|
-| `jblock/view_source_code_updates` | `view_source_code_updates` | Lists `source_code` rows whose `updated_at` is newer than an editable timestamp (Jakarta local, converted to UTC for the query) — shows what's still pending paste-to-GitHub. |
-| `jblock/view_database_schema_dump` | `view_database_schema_dump` | Produces a copy-pasteable text dump of every collection/field/relation via `ctx.dataSourceManager.getCollections()` (dynamic — no hardcoded table list). Used to regenerate the schema file (§7). |
-| `jblock/view_database_table_list` | `view_database_table_list` | Lighter-weight companion: an antd `Table` view of collections (name, title, template, primary key, field count) via the same `dataSourceManager` API — a quick visual browse rather than a copy-paste text dump. |
+| Row name | Purpose |
+|---|---|
+| `act_material_out.js` | Thin shell → `ui_material_out`. |
+| `act_prepare_fabric.js` | Thin shell → `ui_prepare_fabric`. |
+| `act_import_material_details` | Thin shell → `ui_import_material_details`. |
+| `act_import_product_main_material` | Thin shell → `ui_import_product_main_material`. |
+| `act_import_product_material` | Thin shell → `ui_import_product_material`. |
 
-### `JSAction` rows (thin action shells)
-
-| File | NocoBase row name | Purpose |
-|---|---|---|
-| `jsaction/act_material_out.js` | `act_material_out` | Thin shell → `ui_material_out`. |
-| `jsaction/act_prepare_fabric.js` | `act_prepare_fabric` | Thin shell → `ui_prepare_fabric`. |
-| `jsaction/act_import_material_details` | `act_import_material_details` | Table-level action, thin shell → `ui_import_material_details`. Attach to the `material_details` list block's toolbar. |
-| `jsaction/act_import_product_main_material` | `act_import_product_main_material` | Table-level action, thin shell → `ui_import_product_main_material`. Attach to the `product` table block's toolbar. |
-| `jsaction/act_import_product_material` | `act_import_product_material` | Table-level action, thin shell → `ui_import_product_material`. Attach wherever `product_material` rows are managed. |
-
-**Not yet built:** `act_match_production` (shell for `ui_match_production`) — the
-module exists but isn't wired to a JSAction row yet, deliberately deferred; see §9.
-
-### 8.1 Direct raw URLs — fetch these exactly, don't construct your own
-
-Every URL below is literal and exact. See the note at the top of this file for
-why that matters (web-fetch tools reject constructed/edited URLs) — and see the
-second note right after it about fetches silently returning the URL instead of
-content, which is a different problem from construction and can happen even here.
-
-**`source_code/`**
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_list_engine.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_detail.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_edit.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_production_material_detail.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_record_nav.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_prepare_fabric.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_material_out.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_match_production
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_material_details
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_product_main_material
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/source_code/ui_import_product_material
-
-**`jblock/`**
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production_material.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_production_result
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_source_code_updates
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_database_schema_dump
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jblock/view_database_table_list
-
-**`jsaction/`**
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_material_out.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_prepare_fabric.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_material_details
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_product_main_material
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/jsaction/act_import_product_material
-
-**Root-level / schema**
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/kanoerp/README.md (this file)
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/refs/heads/main/kanoerp/Schema%20Dump (also linked in §7)
-
-**`fb-ads-sync/`** (separate system, see §10 — list may lag actual repo contents,
-prefer cloning if you need certainty here)
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/sync.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/backfill.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/creatives.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/facebook.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/nocobase.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/creatives.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/sync-periodic.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/backfill-periodic.js
-- https://raw.githubusercontent.com/ricardoandre/kanoerp/main/fb-ads-sync/lib/transform-period.js
-
-**This list must be kept current by hand** — unlike the registry tables, there's
-no tool that regenerates it. Whenever a file is added/renamed in the repo, add/fix
-its line here in the same commit, or this section silently goes stale and
-reintroduces the exact problem it's meant to solve.
+**Not yet built:** `act_match_production` (shell for `ui_match_production`) —
+deliberately deferred (§9).
 
 ---
 
-## 9. What's next (pending / on the horizon)
+## 9. What's next
 
-**Immediately pending:**
-- `ui_result_import` — module for importing production results. (Distinct from
-  the already-built `ui_import_*` CSV importers in §8, which cover
-  `material_details`, `product.fk_main_fabric_code`, and `product_material` — not
-  `production_result`.)
-- `ui_result_bulk_add` — module for bulk-adding production results.
-- JSAction shells for both of the above (`act_result_import`, `act_result_bulk_add`
-  or similar, following the `act_` thin-shell pattern).
-- `act_match_production` — JSAction shell for the already-built `ui_match_production`
-  module. Deliberately deferred: not deployed, not tested yet, for a later stage.
-- **FB Ads weekly/monthly reach & frequency** — see §10.1 for full detail and open
-  questions. Summary: code (incl. adset-level support) confirmed committed
-  2026-07-02; not yet confirmed run against real data.
+**Pending:**
+- `ui_result_import` / `ui_result_bulk_add` (+ matching `act_*` shells) — import
+  and bulk-add for `production_result` (distinct from the existing importers,
+  which cover `material_details`/`product.fk_main_fabric_code`/`product_material`).
+- `act_match_production` shell for the already-built `ui_match_production`.
+- **FB Ads (§10):** confirm `fb_ads_status.objective_key` column actually exists
+  in NocoBase and re-run `fetch-status.js` end-to-end since its multi-account
+  fix; spot-check a larger sample of `objective_key` values than the ~30
+  reviewed so far; settle the `loadCode(name)` export-contract question (§3).
+- Multi-account: confirm whether `sync.js` (daily insights) also needs the
+  `lib/accounts.js` loop that `fetch-status.js`/`creatives.js` got.
 
 **On the horizon:**
-- Possible future split of `ui_prepare_fabric` into a logic layer + a `lib_pdf`
-  layer — only once a second consumer needs the PDF builder (extract-on-second-use).
-- Desktop adaptive branch for a full-screen detail page (currently deferred in favor
-  of the single bottom-sheet mobile pattern everywhere).
-- Optional cleanup: normalize the inconsistent `.js` extensions across repo files
-  (some rows have it, some don't — cosmetic only, not urgent). See §2 for how to
-  rename a file on GitHub if/when this gets done.
+- Split `ui_prepare_fabric` into logic + `lib_pdf` once a 2nd PDF consumer exists.
+- Desktop full-screen detail page (deferred in favor of the mobile bottom sheet).
+- Normalize inconsistent `.js` extensions across rows (cosmetic, not urgent).
+- **FB Ads daily account-level reach** — if a real per-day, per-account
+  deduplicated reach source is ever added, Daily granularity can return to
+  `view_fb_report_overview` (deliberately removed, not approximated — §10).
 
 ---
 
 ## 10. Facebook Ads → NocoBase pipeline
 
-Node.js project at `~/fb-ads-sync`. Two scripts currently exist, run independently,
-sharing account config and a NocoBase client:
+`~/fb-ads-sync`, several independent scripts sharing account config + a NocoBase
+client. Real file listing (confirmed via `ls`): `sync.js`, `sync-today.js`,
+`sync-periodic.js`, `backfill.js`, `backfill-periodic.js`, `creatives.js`,
+`fetch-status.js`, `lib/{accounts,creatives,facebook,nocobase,transform,
+transform-period}.js`.
 
-- **`sync.js`** — daily ad performance/insights sync via `lib/facebook.js`
-  (`fetchInsights`). **Still single-account only** via `AD_ACCOUNT_ID` — not
-  updated to multi-account this session (scope was `creatives.js` only).
-- **`creatives.js`** — occasional creative/image sync (run weekly, or manually
-  after launching new ads). Pulls `id,name,creative{...}` per ad, stores the
-  creative image as a NocoBase attachment. **Multi-account aware.**
-- **`lib/accounts.js`** — shared account resolver (pre-existing, also used by
-  `backfill.js`/`backfill-periodic.js`). `AD_ACCOUNTS` env format:
-  `Label1:act_xxx,Label2:act_yyy` (a bare `act_xxx` with no label also works —
-  its label becomes the id itself). Falls back to legacy single `AD_ACCOUNT_ID`
-  if `AD_ACCOUNTS` isn't set. `--account=Label1,Label2` on the CLI narrows to a
-  subset, case-insensitive, matches label or id.
-- **`lib/creatives.js`** — Graph API calls for `creatives.js`, with retry/backoff
-  and paging built around the gotchas below.
-- **`lib/nocobase.js`** — thin REST client: `upsert` (`POST
-  /<collection>:updateOrCreate?filterKeys[]=...`), `getOne` (`GET
-  /<collection>:list?filter=...`), `uploadAttachment` (`POST
-  /attachments:create?attachmentField=<collection>.<field>`).
-- Always run scripts from the `~/fb-ads-sync` project root, not from inside `lib/`.
-- Use the `pickConv` / `pickRevenue` fallback pattern: try CPAS arrays first,
-  fall back to pixel arrays.
-- Backfill: `BACKFILL_SINCE=2024-01-01 node backfill.js` run from the project root.
-- See §4 above for the CPAS/Shopee conversion-data gotcha.
+- **`lib/accounts.js`** — `parseAccounts()` reads `AD_ACCOUNTS`
+  (`Label:act_xxx,Label2:act_yyy`, bare `act_xxx` OK too), falls back to legacy
+  single `AD_ACCOUNT_ID`. `filterAccountsFromArgs(accounts, argv)` supports
+  `--account=Label1,Label2`. **Every Graph API script must loop
+  `parseAccounts()` itself** — `lib/facebook.js`'s `fetchInsights`/
+  `fetchEntityStatus` take `accountId` per call, no internal looping.
+- **`lib/facebook.js`** — `fetchInsights({accountId, level, since, until,
+  timeIncrement})` (`timeIncrement:1`=daily row, `null`=one aggregated row for
+  periodic scripts, since reach/frequency must come pre-aggregated — §4) and
+  `fetchEntityStatus({accountId, level})` (object endpoints `/campaigns`
+  `/adsets` `/ads`, not `/insights` — "what is it right now", used by
+  `fetch-status.js`). `LEVEL_FIELDS` includes `'account'`.
+- **`lib/nocobase.js`** — `upsert`/`upsertMany` (`:updateOrCreate?filterKeys[]=`),
+  `getOne` (`:list?filter=`), `uploadAttachment`.
+- Run scripts from the project root. `pickConv`/`pickRevenue`: CPAS arrays first,
+  pixel fallback. Backfill: `BACKFILL_SINCE=2024-01-01 node backfill.js`.
+- **`creatives.js` gotchas:** "reduce the amount of data" errors aren't
+  transient — `lib/creatives.js` halves `limit` in place (50→floor 5) rather
+  than retrying blind, and paginates manually via cursor so the shrunk size
+  sticks. Code 17 (account throttle) is a sliding window, not a blip — fails
+  fast + moves to the next account rather than backing off. `dotenv` v17's
+  self-promo log line is legitimate (confirmed against its changelog), silenced
+  via `{quiet:true}`.
+- **Known open issue:** `ASKALABEL_WEB` was still hitting code-17 on the last
+  test even with the fail-fast fix deployed — needs the account to cool down;
+  if recurring across sessions, check for another concurrent caller of that
+  account's API (quota is account-wide).
+- **`lib/nocobase.js` write path unverified end-to-end** — every test run failed
+  during the fetch step before reaching writes. Don't assume `ads_creative`'s
+  schema or `getOne`'s filter shorthand (`{ad_id: value}` vs `{ad_id:{$eq:
+  value}}`) are correct until a run actually gets past fetch.
 
-### Graph API gotchas found in `creatives.js` (session 2026-07-04)
+### FB Ads objective classification (real data, not name-guessing)
 
-- **"Please reduce the amount of data you're asking for"** is not transient —
-  retrying with the same `limit` just fails forever. `lib/creatives.js` detects
-  this specific message and halves `params.limit` in place (starts at 50, floor
-  of 5), without burning a retry attempt, and the shrunk size persists for the
-  rest of that account's pages. (Pagination is done manually via the `after`
-  cursor rather than following `paging.next`, specifically so the shrunk limit
-  sticks instead of resetting on the next page.)
-- **Code 17 ("too many calls to this ad-account")** is an account-level
-  sliding-window throttle, not a one-off blip — can take well over a few
-  seconds to clear. Short exponential backoff just wastes calls before failing
-  anyway. `lib/creatives.js` now fails fast on this (no retry) and logs it; the
-  per-account loop in `creatives.js` moves on to the next account instead of
-  stalling the whole run.
-- `dotenv` v17+ prints a self-promotional "tip" line every run (`◇ injected env
-  (N) from .env -- tip: ...`, pointing at the maintainer's own `vestauth`
-  project). This is legitimate — confirmed against dotenv's own changelog, not
-  a compromised/typosquatted package. Silenced via
-  `require('dotenv').config({ quiet: true })` (already applied in
-  `creatives.js`).
+Replaced `classifyObjective`/`CLASSIFY_SQL`-style name guessing (fragile —
+broke silently on any campaign not following a naming convention) with real
+Facebook data. `fetch-status.js` (fixed this session for the multi-account
+crash — it called `fetchEntityStatus(level)` with no account param after the
+`AD_ACCOUNTS` migration, and `fetchEntityStatus` itself had to be added to
+`lib/facebook.js`) now writes `fb_ads_status.objective_key` on campaign rows:
 
-### Known open issue
+```
+objective:optimization_goal:custom_event_type
+```
+`objective` = raw `campaign.objective`. `optimization_goal`/`custom_event_type`
+= distinct values across the campaign's **adsets**, comma-joined if they
+disagree (`objective` alone can't distinguish ATC-optimized from full-funnel
+purchase — both are typically `OUTCOME_SALES`; the split only shows at the
+adset).
 
-- `ASKALABEL_WEB` (`act_570477093100428`) was still hitting the code-17
-  ad-account throttle on the last test run this session, even with the
-  fail-fast fix correctly deployed (verified via `git log`/`git status`, not
-  just assumed — HEAD `95871be` has the fix). This needs the account to cool
-  down on its own. If it keeps recurring across *separate* sessions (not just
-  retries within one run), check whether something else — Ads Manager, another
-  script, a dashboard — is also calling this account's Marketing API
-  concurrently, since the quota is shared account-wide.
+Read side: `fn_fbads_data.resolveObjective(objectiveKey, campaignName)`, used by
+`view_fb_report_details`/`view_fb_report_creatives` (Overview doesn't need it —
+see below):
+- `REACH_OBJECTIVES = ['OUTCOME_AWARENESS','REACH','BRAND_AWARENESS',
+  'OUTCOME_TRAFFIC','LINK_CLICKS']` → `'reach'`. Traffic merged into Reach
+  deliberately (both top-of-funnel, no purchase intent).
+- `SALES_OBJECTIVES = ['OUTCOME_SALES','CONVERSIONS','PRODUCT_CATALOG_SALES']` →
+  adsets' `custom_event_type`: all `ADD_TO_CART`→`'atc'`, all `PURCHASE`→
+  `'purchase'`, mixed→best-effort (prefers `PURCHASE`, then `ADD_TO_CART`, else
+  `'other'` — real data had `COMPLETE_REGISTRATION`+`LEAD` mixes that must NOT
+  become `'atc'`), no event data→name-guess fallback.
+- Anything else → `'other'`. Confirmed against real data: after the traffic
+  merge, only `OUTCOME_ENGAGEMENT`/legacy `POST_ENGAGEMENT` land here. New
+  strings (`OUTCOME_LEADS` etc.) would too — safe default, not an error.
+- Legacy pre-ODAX strings (`REACH`, `CONVERSIONS`, `LINK_CLICKS`,
+  `POST_ENGAGEMENT`, `PRODUCT_CATALOG_SALES`) confirmed still occur on older
+  campaigns — both current and legacy forms are handled.
+- CPAS/`PRODUCT_CATALOG_SALES` campaigns confirmed to carry `custom_event_type`
+  normally — no special-casing needed (§4).
+- `isGuessed`/`isConsistent` flags surface as small non-blocking badges
+  (`ui_fbads_controls.objectiveMetaBadge`) — never block rendering.
 
-### NocoBase write path — unverified this session
+### Live targets (`fb_ads_target`)
 
-Every test run this session failed during the Facebook fetch step (page-too-large,
-then rate-limited) *before* reaching the ad-processing loop. `getOne` / `upsert` /
-`uploadAttachment` in `lib/nocobase.js`, and the `ads_creative` collection they
-write to, were **never actually exercised** end-to-end. Don't assume the write
-path works just because the FB-side retry logic is solid — watch the first run
-that gets past the fetch step closely.
+Shared across all 3 reports: `cost_atc` (<1200, guards `atc` count),
+`cost_reach` (<16, guards `reach`), `roas` (>15, guards `spend`), `cost_purchase`
+(<20000, guards `purchase` — used by the Purchase views' Cost/Purchase row).
+`countField` stops a 0-from-no-data value reading as if it "beat" a `<` target
+(e.g. `spend/0 atc = 0`) — not itself overridable, only `target`/`direction` are.
 
-### Open questions for next session (answer if known, otherwise investigate — don't re-ask)
+### `view_fb_report_overview` redesign
 
-1. Does the single `ACCESS_TOKEN` have Ads-read permission across *every*
-   account in `AD_ACCOUNTS`? Not confirmed for all of them — `ASKALABEL_WEB`
-   got rate-limited rather than auth-rejected, which implies the token is at
-   least valid for that one account; the rest are untested.
-2. Does the `ads_creative` NocoBase collection actually have the fields
-   `creatives.js` writes (`ad_id`, `ad_name`, `creative_id`, `source_url`,
-   `image` as an attachment relation)? Not checked against the live schema.
-3. Does `getOne`'s bare `{ ad_id: value }` filter shorthand match NocoBase's
-   expected filter syntax, or does it need `{ ad_id: { $eq: value } }`?
-   Untested this session.
-4. Should a code-17 rate limit trigger an automatic longer wait-and-retry
-   *within* the same run (e.g. sleep 5–10 min) instead of skipping to the next
-   account and requiring a manual re-run? Currently it just skips.
-5. Has the Facebook access token that was accidentally pasted into a raw error
-   dump earlier this session been rotated? Flagged at the time, not confirmed.
-6. `sync.js`/`lib/facebook.js` still support only a single `AD_ACCOUNT_ID` —
-   worth wiring to `lib/accounts.js` too if multi-account insights are needed,
-   same as `creatives.js` got this session.
+Was 4 tabs (Overview/Reach/ATC/Purchase) bucketed via `CLASSIFY_SQL`. Rebuilt as
+**one single account-total view, no tabs, no objective classification** —
+because a "bucket" isn't a real Facebook entity, so its reach could never be
+more than a sum of per-campaign numbers, never truly deduplicated, no matter the
+query (§4). Objective-level drill-down with real per-entity numbers already
+exists in the other two reports.
+- Spend/Link Clicks/ATC/Purchase/Revenue: exact `SUM(...)` across all campaigns
+  under the (single, required) account — genuinely additive, no approximation.
+- Reach/Impressions/Frequency: only from `fb_ads_period_data`
+  (`entity_type='account'`), Weekly/Monthly only. Missing period → "—" + warning
+  banner, never derived (§5). Adset/ad-level approximation elsewhere in the
+  other 2 reports was deliberately left as-is (real numbers do backfill there).
+- **Daily removed entirely** (§4 — no daily account-level real reach source
+  exists for any entity). Add back if one ever does (§9).
+- Also fixed: old Overview derived impressions via `SUM(reach*frequency)` —
+  unneeded, `campaigns_insights.impressions` is already real and additive.
 
-## 11. Working style / how Claude should operate on this project
+### Shared code + account filtering
 
-- Deliver code in modular structure: shared helpers → data-fetching layer → small
-  presentational sub-components (called via `createElement`, not plain functions)
-  → thin composition root.
-- On iteration, provide a **complete drop-in replacement of the specific named
-  component**, not a full-file rewrite of unrelated things.
-- One concrete step at a time, with confirmation before moving to the next —
-  don't jump ahead of unconfirmed prerequisites.
-- Always remind Andre, at the end of a session, to (a) paste the finalized code into
-  the matching NocoBase row and (b) commit the same change to this GitHub mirror, so
-  the canonical source stays in sync with the live runtime.
-- Before writing SQL or a `belongsTo` payload against a table you haven't touched
-  recently, fetch the schema file (§7) — don't assume field/relation names match
-  the collection name (§4.1).
-- **Claude cannot execute this code against the live NocoBase instance** — there's
-  no test environment reachable from chat. All code is written from documented
-  patterns and prior working examples, not verified by actually running it. Flag
-  assumptions and untested edges explicitly in the response rather than presenting
-  code as guaranteed-correct — the paste-by-Andre → report-errors-back loop *is*
-  the verification step, by design, not a sign something went wrong.
-- **Before stating "I read file X" or describing its contents, confirm the fetch
-  actually returned real content, not just the URL text back.** *(Learned
-  2026-07-02, the hard way — see the note at the top of this doc.)* A tool call
-  that returns without error is not the same as a tool call that returned the
-  thing you asked for. This applies doubly to any claim about a file made without
-  a fetch in the same turn — don't extend an earlier real read into an assumption
-  about a *different*, unread file just because they live in the same repo.
+`fn_fbads_data`/`ui_fbads_controls` extracted on 3rd shared use (§5, §8). All 3
+FB Ads reports are single-select Account now (previously 2 of 3 were
+multi-select) — empty selection = all accounts combined.
+
+---
+
+## 11. Working style
+
+- Modular delivery: shared helpers → data-fetching → small presentational
+  sub-components (`createElement`) → thin composition root.
+- Complete drop-in replacement of the **specific named component** on iteration —
+  not a full-file rewrite of unrelated things.
+- One concrete step at a time, confirm before moving on — don't assume
+  unconfirmed prerequisites.
+- End-of-session: remind Andre to (a) paste finalized code into the matching
+  NocoBase row, (b) commit here, (c) update this README if anything changed.
+- Fetch the schema file (§7) before SQL/`belongsTo` against an unfamiliar table —
+  don't assume field/relation names match the collection name (§4.1).
+- **Claude cannot execute this code against live NocoBase** — no reachable test
+  environment. Code is written from documented patterns, not verified by
+  running it. Flag assumptions/untested edges explicitly — the paste→report-
+  errors-back loop *is* the verification step, not a sign something's wrong.
+- **Confirm a fetch actually returned real content before describing a file** —
+  a tool call returning without error isn't the same as it returning what you
+  asked for (§ intro callout).
+- **For multi-file/multi-decision work, confirm scope and architectural
+  decisions before writing code** whenever there's more than one reasonable
+  interpretation — worth a direct question rather than a guess.
 
 ---
 
 ## 12. Footer
 
-Public repo: `github.com/ricardoandre/kanoerp`. Structure: `source_code/`, `jblock/`,
-`jsaction/` folders, mirroring the NocoBase row types above. Schema lives in a
-separate file — see §7.
+Public repo: `github.com/ricardoandre/kanoerp`. `source_code/`, `jblock/`,
+`jsaction/` folders mirror the NocoBase row types above. Schema in a separate
+file — see §7.
