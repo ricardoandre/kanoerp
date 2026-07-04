@@ -556,150 +556,95 @@ reintroduces the exact problem it's meant to solve.
 
 ## 10. Facebook Ads → NocoBase pipeline
 
-Separate Node.js project, mirrored in this repo at `fb-ads-sync/` (see §8.1 for
-direct file URLs) and run from `~/fb-ads-sync` on the Unix host. Not NocoBase
-code — no `loadCode`/`jblock`/`JSAction` conventions apply here, it's plain
-Node.js run via cron/manually.
+Node.js project at `~/fb-ads-sync`. Two scripts currently exist, run independently,
+sharing account config and a NocoBase client:
 
-Files (as of last check — this list can drift, prefer cloning if it matters):
-`sync.js`, `backfill.js`, `creatives.js`, `lib/facebook.js`, `lib/transform.js`,
-`lib/nocobase.js`, `lib/creatives.js`, plus the new §10.1 files.
-
+- **`sync.js`** — daily ad performance/insights sync via `lib/facebook.js`
+  (`fetchInsights`). **Still single-account only** via `AD_ACCOUNT_ID` — not
+  updated to multi-account this session (scope was `creatives.js` only).
+- **`creatives.js`** — occasional creative/image sync (run weekly, or manually
+  after launching new ads). Pulls `id,name,creative{...}` per ad, stores the
+  creative image as a NocoBase attachment. **Multi-account aware.**
+- **`lib/accounts.js`** — shared account resolver (pre-existing, also used by
+  `backfill.js`/`backfill-periodic.js`). `AD_ACCOUNTS` env format:
+  `Label1:act_xxx,Label2:act_yyy` (a bare `act_xxx` with no label also works —
+  its label becomes the id itself). Falls back to legacy single `AD_ACCOUNT_ID`
+  if `AD_ACCOUNTS` isn't set. `--account=Label1,Label2` on the CLI narrows to a
+  subset, case-insensitive, matches label or id.
+- **`lib/creatives.js`** — Graph API calls for `creatives.js`, with retry/backoff
+  and paging built around the gotchas below.
+- **`lib/nocobase.js`** — thin REST client: `upsert` (`POST
+  /<collection>:updateOrCreate?filterKeys[]=...`), `getOne` (`GET
+  /<collection>:list?filter=...`), `uploadAttachment` (`POST
+  /attachments:create?attachmentField=<collection>.<field>`).
 - Always run scripts from the `~/fb-ads-sync` project root, not from inside `lib/`.
-- NocoBase upsert uses the `:updateOrCreate` endpoint with `filterKeys[]` for
-  idempotent upserts keyed on `(ad_id, date)` for the daily tables, and on
-  `(entity_type, entity_id, period_type, period_start)` for `fb_ads_period_data`
-  (§10.1).
-- Use the `pickConv` / `pickRevenue` fallback pattern: try CPAS arrays first, fall
-  back to pixel arrays.
+- Use the `pickConv` / `pickRevenue` fallback pattern: try CPAS arrays first,
+  fall back to pixel arrays.
 - Backfill: `BACKFILL_SINCE=2024-01-01 node backfill.js` run from the project root.
-- See §4 above for the CPAS/Shopee conversion-data gotcha, and §4 above for the
-  reach/frequency non-additivity gotcha.
+- See §4 above for the CPAS/Shopee conversion-data gotcha.
 
-**Secrets: `.env` is gitignored, not committed.** This repo is public. Real
-credentials (`ACCESS_TOKEN`, `NOCOBASE_API_KEY`, etc.) must never be committed —
-if `.env` was ever accidentally committed, the fix is rotating the credentials
-immediately, not just deleting the file (git history keeps old commits
-retrievable regardless of later deletions). `node_modules/` and `*.log` are also
-gitignored — regenerate with `npm install`, don't commit dependencies.
+### Graph API gotchas found in `creatives.js` (session 2026-07-04)
 
-### 10.1 Weekly/monthly reach & frequency (started 2026-07-02, code confirmed committed 2026-07-02, NOT yet confirmed run against real data)
+- **"Please reduce the amount of data you're asking for"** is not transient —
+  retrying with the same `limit` just fails forever. `lib/creatives.js` detects
+  this specific message and halves `params.limit` in place (starts at 50, floor
+  of 5), without burning a retry attempt, and the shrunk size persists for the
+  rest of that account's pages. (Pagination is done manually via the `after`
+  cursor rather than following `paging.next`, specifically so the shrunk limit
+  sticks instead of resetting on the next page.)
+- **Code 17 ("too many calls to this ad-account")** is an account-level
+  sliding-window throttle, not a one-off blip — can take well over a few
+  seconds to clear. Short exponential backoff just wastes calls before failing
+  anyway. `lib/creatives.js` now fails fast on this (no retry) and logs it; the
+  per-account loop in `creatives.js` moves on to the next account instead of
+  stalling the whole run.
+- `dotenv` v17+ prints a self-promotional "tip" line every run (`◇ injected env
+  (N) from .env -- tip: ...`, pointing at the maintainer's own `vestauth`
+  project). This is legitimate — confirmed against dotenv's own changelog, not
+  a compromised/typosquatted package. Silenced via
+  `require('dotenv').config({ quiet: true })` (already applied in
+  `creatives.js`).
 
-**Problem:** `sync.js`/`backfill.js` fetch daily rows (`time_increment: 1`) via
-`lib/facebook.js`'s `fetchInsights`. Daily `reach`/`frequency` values are correct
-*per day*, but summing/averaging them into a week or month is wrong — see the
-reach/frequency non-additivity note in §4. Every other metric synced daily
-(spend, impressions, clicks, conversions) is additive and fine as-is.
+### Known open issue
 
-**Approach:** a separate sync path that asks the Marketing API for the whole
-period in one request per entity (`time_range` = the period, no
-`time_increment`), rather than deriving it from daily rows. Only ever syncs
-*closed* periods — an in-progress week/month's reach is still changing, so
-writing it early just means it needs overwriting later.
+- `ASKALABEL_WEB` (`act_570477093100428`) was still hitting the code-17
+  ad-account throttle on the last test run this session, even with the
+  fail-fast fix correctly deployed (verified via `git log`/`git status`, not
+  just assumed — HEAD `95871be` has the fix). This needs the account to cool
+  down on its own. If it keeps recurring across *separate* sessions (not just
+  retries within one run), check whether something else — Ads Manager, another
+  script, a dashboard — is also calling this account's Marketing API
+  concurrently, since the quota is shared account-wide.
 
-**New NocoBase table `fb_ads_period_data`** (already created by Andre before this
-work started):
+### NocoBase write path — unverified this session
 
-| field | type | notes |
-|---|---|---|
-| `id` | snowflakeId | primary key |
-| `entity_type` | string | `ad` \| `adset` \| `campaign` \| `account` |
-| `entity_id` | string | FB id at that level |
-| `period_type` | string | `week` \| `month` |
-| `period_start` | string | `YYYY-MM-DD`; Monday for weeks, 1st-of-month for months |
-| `reach` | bigInt | from FB directly, not derived |
-| `frequency` | double | from FB directly, not derived |
-| `impression` | bigInt | stored alongside for sanity-check / debugging drift |
-| `synced_at` | datetime | |
+Every test run this session failed during the Facebook fetch step (page-too-large,
+then rate-limited) *before* reaching the ad-processing loop. `getOne` / `upsert` /
+`uploadAttachment` in `lib/nocobase.js`, and the `ads_creative` collection they
+write to, were **never actually exercised** end-to-end. Don't assume the write
+path works just because the FB-side retry logic is solid — watch the first run
+that gets past the fetch step closely.
 
-No `period_end` column — derive it from `period_type` + `period_start` at read
-time if a reporting view needs it.
+### Open questions for next session (answer if known, otherwise investigate — don't re-ask)
 
-**Levels: ad, adset, campaign, and account** (adset added 2026-07-02 — see
-"Follow-up" below; originally shipped without it).
-
-**Files changed/added (original session):**
-- `lib/facebook.js` — **modified.** `fetchInsights` gained an optional
-  `timeIncrement` param (default `1`, so `sync.js`/`backfill.js` are unaffected),
-  and `LEVEL_FIELDS` gained `account: ['account_id']` (previously only
-  ad/adset/campaign existed, no account-level support at all).
-- `lib/transform-period.js` — **new.** `transformPeriodRow(level, periodType,
-  periodStart, row)`, separate from `transform.js`'s `TRANSFORMERS` because this
-  table's shape (entity_type/entity_id/period_type/period_start, no conversions/
-  revenue) doesn't match the ad/adset/campaign-keyed daily tables.
-- `sync-periodic.js` — **new.** `node sync-periodic.js --period=week|month`.
-  Computes the most recently *closed* period, calls `fetchInsights` with
-  `timeIncrement: null` per level, upserts into `fb_ads_period_data` via
-  `upsertMany`.
-- `backfill-periodic.js` — **new.** `BACKFILL_SINCE=... node backfill-periodic.js
-  --period=week|month`. Same idea as `backfill.js` but chunks by whole periods
-  (a week or a month), since each chunk IS the row being stored, not something
-  aggregated afterward from daily data.
-
-**Confirmed committed 2026-07-02** — verified by `curl`-ing all three raw URLs
-directly (HTTP 200, real file-sized content, not the URL-echo problem noted at
-the top of this doc) rather than trusting a possibly-stale README claim. `curl`
-from a sandboxed bash tool has been more reliable for this kind of check than
-`web_fetch`-style tools in this project so far — prefer it when available.
-
-**Follow-up: adset level added (2026-07-02).** The original version deliberately
-left adset out ("trivial to add later," per the previous version of this note) —
-turned out not quite trivial, there were two spots, not one:
-- `LEVELS` array in both `sync-periodic.js` and `backfill-periodic.js` — added
-  `'adset'` (was `['ad', 'campaign', 'account']`, now
-  `['ad', 'adset', 'campaign', 'account']`).
-- `entityIdFor(level, r)` in `lib/transform-period.js` — this **explicitly
-  throws** for any level not in its if/else chain, and `adset` wasn't in it
-  (only `ad`/`campaign`/`account` were, despite `LEVEL_FIELDS.adset` already
-  existing in `lib/facebook.js`). Added `if (level === 'adset') return
-  r.adset_id;`. Without this fix, adding `'adset'` to `LEVELS` alone would have
-  made every adset-level row throw at transform time.
-
-No changes needed to `lib/facebook.js` — `LEVEL_FIELDS.adset` was already
-correct (`['adset_id', 'adset_name', 'campaign_id']`).
-
-**Not yet done:** none of this — original or adset follow-up — has been
-confirmed actually *run* against real data. Code is committed; execution is
-still unverified. Verify at the start of the next session rather than assuming.
-
-**Suggested (not installed) cron, assuming plain crontab on the host — not
-confirmed, the host might use something else (pm2, systemd timer):**
-```cron
-0 6 * * 1 cd ~/fb-ads-sync && node sync-periodic.js --period=week >> logs/sync-periodic.log 2>&1
-0 6 2 * * cd ~/fb-ads-sync && node sync-periodic.js --period=month >> logs/sync-periodic.log 2>&1
-```
-
-**Open questions for next session (don't re-ask Andre these from scratch — check
-first, and only ask if genuinely still unresolved):**
-1. Does `fb_ads_period_data` actually have a composite-unique index/constraint on
-   `(entity_type, entity_id, period_type, period_start)`? `upsertMany`'s
-   `:updateOrCreate` needs one to reliably match the right existing row on re-run
-   — unconfirmed whether Andre set this up when creating the table.
-2. Was the edited `lib/facebook.js` actually pasted in, and do `sync.js`/
-   `backfill.js` still run correctly afterward (regression check on the
-   `timeIncrement` default-`1` path)? Still unconfirmed — not part of what was
-   verified in the 2026-07-02 follow-up (that only touched the two periodic
-   scripts and `transform-period.js`).
-3. ~~Were `sync-periodic.js`, `backfill-periodic.js`, `lib/transform-period.js`
-   actually added to `~/fb-ads-sync` and committed to this repo?~~ **Resolved
-   2026-07-02: yes, confirmed via direct HTTP check, not just trusting the repo
-   listing.**
-4. Has `sync-periodic.js` or `backfill-periodic.js` actually been run once,
-   successfully, against real data? Still no, as of the adset follow-up —
-   this is now the most important open item.
-5. ~~Is adset-level reach/frequency wanted too, alongside ad/campaign/account?~~
-   **Resolved 2026-07-02: yes, wanted, and added — see "Follow-up" above.**
-6. What does the host actually use for scheduling — plain crontab, pm2,
-   something else? The cron block above is a guess based on `backfill.js`'s
-   `BACKFILL_SINCE` env-var convention, not a confirmed mechanism.
-7. `sync.js`, `backfill.js`, and `lib/transform.js` were re-verified as
-   fetchable (HTTP 200) during the 2026-07-02 link-audit, but their *content*
-   wasn't re-read line-by-line in that pass — everything said about them here
-   (e.g. `TRANSFORMERS`, `pickConv`/`pickRevenue`, the daily `(ad_id, date)`
-   upsert key) is still carried over from earlier sessions' summaries, not
-   freshly re-confirmed by reading.
-
----
+1. Does the single `ACCESS_TOKEN` have Ads-read permission across *every*
+   account in `AD_ACCOUNTS`? Not confirmed for all of them — `ASKALABEL_WEB`
+   got rate-limited rather than auth-rejected, which implies the token is at
+   least valid for that one account; the rest are untested.
+2. Does the `ads_creative` NocoBase collection actually have the fields
+   `creatives.js` writes (`ad_id`, `ad_name`, `creative_id`, `source_url`,
+   `image` as an attachment relation)? Not checked against the live schema.
+3. Does `getOne`'s bare `{ ad_id: value }` filter shorthand match NocoBase's
+   expected filter syntax, or does it need `{ ad_id: { $eq: value } }`?
+   Untested this session.
+4. Should a code-17 rate limit trigger an automatic longer wait-and-retry
+   *within* the same run (e.g. sleep 5–10 min) instead of skipping to the next
+   account and requiring a manual re-run? Currently it just skips.
+5. Has the Facebook access token that was accidentally pasted into a raw error
+   dump earlier this session been rotated? Flagged at the time, not confirmed.
+6. `sync.js`/`lib/facebook.js` still support only a single `AD_ACCOUNT_ID` —
+   worth wiring to `lib/accounts.js` too if multi-account insights are needed,
+   same as `creatives.js` got this session.
 
 ## 11. Working style / how Claude should operate on this project
 
