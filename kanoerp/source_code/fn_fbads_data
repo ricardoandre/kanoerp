@@ -1,0 +1,262 @@
+// =====================================================
+// source_code — fn_fbads_data
+//
+// Contract: shared data/logic layer for the 3 FB Ads jblocks
+// (view_fb_ads_structure, view_fb_ads_report, view_fb_ads_details).
+// Compiled via `new Function('React','antd','dayjs','ctx', src)` and loaded
+// through each caller's own loadCode(name) helper — see README §3/§8.
+// Pure functions here don't touch ctx; SQL-touching ones take ctx as an
+// explicit parameter (never captured at compile time — same cached module
+// instance may be invoked by callers with different ctx).
+//
+// Downward-only: this is an fn_ module, does not depend on any other
+// source_code row. ui_fbads_controls (the sibling ui_ module) does not
+// depend on this one either — both are loaded independently by each jblock.
+// =====================================================
+
+// ── pure format/number helpers ──
+function num(v) { return Number(v == null ? 0 : v); }
+function fmtMoney(v) { return 'Rp' + Math.round(num(v)).toLocaleString('id-ID'); }
+function fmtNum(v) { return Math.round(num(v)).toLocaleString('id-ID'); }
+function fmtPct(v) { return (num(v)).toFixed(2) + '%'; }
+function fmtRatio(v) { return (num(v)).toFixed(2); }
+function safeDiv(a, b) { return (num(b) > 0 ? num(a) / num(b) : 0); }
+
+// ── sql helpers ──
+function sqlDate(d) { return d.format('YYYY-MM-DD'); }
+function sqlStr(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+function sqlInList(values) { return values.map(sqlStr).join(','); }
+function uniqueUid(prefix) { return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+// ctx explicit — see contract note above.
+function runSql(ctx, prefix, sql) {
+  const uid = uniqueUid(prefix);
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []);
+}
+
+const DEFAULT_ACCOUNT = 'ASKALABEL_SHOPEE';
+
+// Single-select account filter — all 3 reports now use single-select
+// Account (see Structure report's Account field). Empty/null means "no
+// filter" — every account — not "match nothing".
+function accountFilterSql(selectedAccount, columnExpr) {
+  if (!selectedAccount) return '';
+  return ' AND ' + (columnExpr || 'account') + ' = ' + sqlStr(selectedAccount) + ' ';
+}
+
+function fetchAccountList(ctx) {
+  return runSql(ctx, 'fbads_account_list',
+    "SELECT DISTINCT account FROM campaigns_insights WHERE account IS NOT NULL AND account != '' ORDER BY account"
+  );
+}
+
+// =====================================================
+// ── period generation — Monday-aligned weeks, matching fb_ads_period_data's
+// period_start convention (README §10.1). Supports an optional `lastDate`
+// anchor (the Structure report's "Last date" picker) — when it's genuinely
+// today, a leading speculative "today" column is added (dropped by the
+// caller if sync-today.js hasn't produced a row for it yet); when it's a
+// past date, that date IS the most recent (already-closed) column.
+// `dayjs` is closed over from this module's own compile-time parameter —
+// stable library reference, not a per-host ctx, so no threading needed.
+// =====================================================
+function buildPeriods(granularity, count, lastDate) {
+  const now = dayjs();
+  const anchor = (lastDate || now).startOf('day');
+  if (granularity === 'daily') {
+    const isRealToday = anchor.isSame(now, 'day');
+    const periods = [];
+    if (isRealToday) {
+      periods.push({ key: anchor.format('YYYY-MM-DD'), label: anchor.format('D MMM YYYY'), start: anchor, end: anchor.endOf('day'), partial: true });
+      const yesterday = anchor.subtract(1, 'day');
+      for (let i = 0; i < count; i++) {
+        const d = yesterday.subtract(i, 'day');
+        periods.push({ key: d.format('YYYY-MM-DD'), label: d.format('D MMM YYYY'), start: d, end: d.endOf('day') });
+      }
+    } else {
+      for (let i = 0; i < count; i++) {
+        const d = anchor.subtract(i, 'day');
+        periods.push({ key: d.format('YYYY-MM-DD'), label: d.format('D MMM YYYY'), start: d, end: d.endOf('day') });
+      }
+    }
+    return periods;
+  }
+  if (granularity === 'weekly') {
+    const dow = anchor.day(); // locale-independent (0=Sun..6=Sat)
+    const thisMonday = anchor.subtract((dow + 6) % 7, 'day');
+    const lastCompletedMonday = thisMonday.subtract(1, 'week');
+    const periods = [];
+    for (let i = 0; i < count; i++) {
+      const start = lastCompletedMonday.subtract(i, 'week');
+      const weekEnd = start.add(6, 'day');
+      periods.push({ key: start.format('YYYY-MM-DD'), label: start.format('D') + '-' + weekEnd.format('D MMM YYYY'), start: start, end: weekEnd.endOf('day') });
+    }
+    return periods;
+  }
+  const lastCompleted = anchor.startOf('month').subtract(1, 'month');
+  const periods = [];
+  for (let i = 0; i < count; i++) {
+    const start = lastCompleted.subtract(i, 'month');
+    periods.push({ key: start.format('YYYY-MM-DD'), label: '1-' + start.endOf('month').format('D MMM YYYY'), start: start, end: start.endOf('month') });
+  }
+  return periods;
+}
+function periodKeyExpr(granularity) {
+  if (granularity === 'monthly') return "DATE_FORMAT(date, '%Y-%m-01')";
+  if (granularity === 'daily') return "DATE_FORMAT(date, '%Y-%m-%d')";
+  return "DATE_SUB(date, INTERVAL WEEKDAY(date) DAY)"; // WEEKDAY(): 0=Mon..6=Sun, not locale-dependent
+}
+
+// =====================================================
+// ── real objective classification (fb_ads_status.objective_key) ──
+// See fetch-status.js in ~/fb-ads-sync for how objective_key gets written:
+// "objective:optimization_goal:custom_event_type", comma-joined segments
+// when a campaign's adsets disagree.
+// =====================================================
+
+// LAST-RESORT FALLBACK ONLY — used when a campaign hasn't been synced by
+// fetch-status.js yet, or a sales campaign has no adset event data.
+function classifyObjective(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.indexOf('remarketing') !== -1 || n.indexOf('retargeting') !== -1) return 'purchase';
+  if (n.indexOf('atc') !== -1) return 'atc';
+  return 'reach';
+}
+
+// Includes both current (OUTCOME_*) and legacy pre-ODAX objective enum
+// values — confirmed against real fb_ads_status data (REACH, CONVERSIONS,
+// PRODUCT_CATALOG_SALES all show up as legacy objective strings).
+// Traffic objectives (OUTCOME_TRAFFIC, legacy LINK_CLICKS) are treated as
+// the same business goal as Reach — both are top-of-funnel, no purchase
+// intent signal. Confirmed against real data: after this merge, the only
+// objectives still landing in 'other' are OUTCOME_ENGAGEMENT and legacy
+// POST_ENGAGEMENT (video/post-engagement campaigns) — nothing else observed.
+const REACH_OBJECTIVES = ['OUTCOME_AWARENESS', 'REACH', 'BRAND_AWARENESS', 'OUTCOME_TRAFFIC', 'LINK_CLICKS'];
+const SALES_OBJECTIVES = ['OUTCOME_SALES', 'CONVERSIONS', 'PRODUCT_CATALOG_SALES'];
+
+// Returns { objective, isConsistent, isGuessed }. See fn_fbads_data usage
+// sites for the full reasoning — kept identical across all 3 reports so
+// "Purchase" means the same thing everywhere.
+function resolveObjective(objectiveKey, campaignName) {
+  if (!objectiveKey) {
+    return { objective: classifyObjective(campaignName), isConsistent: true, isGuessed: true };
+  }
+  const parts = objectiveKey.split(':');
+  const fbObjective = parts[0] || '';
+  const eventTypes = (parts[2] || '').split(',').filter(Boolean);
+
+  if (REACH_OBJECTIVES.indexOf(fbObjective) !== -1) {
+    return { objective: 'reach', isConsistent: true, isGuessed: false };
+  }
+  if (SALES_OBJECTIVES.indexOf(fbObjective) === -1) {
+    return { objective: 'other', isConsistent: true, isGuessed: false };
+  }
+  if (eventTypes.length === 0) {
+    return { objective: classifyObjective(campaignName), isConsistent: false, isGuessed: true };
+  }
+  if (eventTypes.length > 1) {
+    // Only default to atc/purchase if one of those is actually IN the mix —
+    // real data turned up non-atc/purchase mixes too (e.g. COMPLETE_
+    // REGISTRATION + LEAD), which must NOT get forced into 'atc'.
+    const hasPurchase = eventTypes.indexOf('PURCHASE') !== -1;
+    const hasAtc = eventTypes.indexOf('ADD_TO_CART') !== -1;
+    const fallback = hasPurchase ? 'purchase' : (hasAtc ? 'atc' : 'other');
+    return { objective: fallback, isConsistent: false, isGuessed: false };
+  }
+  if (eventTypes[0] === 'ADD_TO_CART') return { objective: 'atc', isConsistent: true, isGuessed: false };
+  if (eventTypes[0] === 'PURCHASE') return { objective: 'purchase', isConsistent: true, isGuessed: false };
+  return { objective: 'other', isConsistent: true, isGuessed: false };
+}
+
+// Campaign-level only. Missing ids (not synced yet) are just absent from
+// the returned map — resolveObjective treats that the same as a
+// not-yet-existing column, falls back to the name guess, no error.
+function fetchObjectiveMap(ctx, campaignIds) {
+  if (!campaignIds.length) return Promise.resolve({});
+  return runSql(ctx, 'fbads_objkey',
+    "SELECT entity_id, objective_key FROM fb_ads_status " +
+    "WHERE entity_type = 'campaign' AND CAST(entity_id AS CHAR) IN (" + sqlInList(campaignIds) + ")"
+  ).then(function (rows) {
+    const map = {};
+    rows.forEach(function (r) { map[r.entity_id] = r.objective_key; });
+    return map;
+  }).catch(function () { return {}; }); // column/table may not exist yet — degrade gracefully
+}
+
+// Facebook's own effective_status, any level. Missing ids just mean
+// fetch-status.js hasn't synced them yet — callers render nothing for
+// those rather than guessing.
+function fetchStatusMap(ctx, level, ids) {
+  if (!ids.length) return Promise.resolve({});
+  return runSql(ctx, 'fbads_status_' + level,
+    "SELECT entity_id, status FROM fb_ads_status " +
+    "WHERE entity_type = " + sqlStr(level) + " AND CAST(entity_id AS CHAR) IN (" + sqlInList(ids) + ")"
+  ).then(function (rows) {
+    const map = {};
+    rows.forEach(function (r) { map[r.entity_id] = r.status; });
+    return map;
+  }).catch(function () { return {}; });
+}
+
+// =====================================================
+// ── live targets (fb_ads_target) — shared 3-key schema across all 3
+// reports now: cost_atc / cost_reach / roas. (Overview previously also had
+// purchaseCostMax and a separate looser overviewRoasGood; both folded into
+// this one shared roas target for consistency — see session notes.)
+// =====================================================
+const COLOR_GOOD = '#16a34a';
+const COLOR_BAD = '#dc2626';
+const DEFAULT_TARGET_RULES = {
+  cost_atc:      { target: 1200,  direction: 'lt', countField: 'atc' },
+  cost_reach:    { target: 16,    direction: 'lt', countField: 'reach' },
+  roas:          { target: 15,    direction: 'gt', countField: 'spend' },
+  cost_purchase: { target: 20000, direction: 'lt', countField: 'purchase' }, // used by Overview's Purchase table only
+};
+function fetchTargetRules(ctx) {
+  return runSql(ctx, 'fbads_targets', "SELECT metric_key, target_value, direction FROM fb_ads_target")
+    .then(function (rows) {
+      const merged = {};
+      Object.keys(DEFAULT_TARGET_RULES).forEach(function (k) { merged[k] = Object.assign({}, DEFAULT_TARGET_RULES[k]); });
+      rows.forEach(function (r) {
+        const key = r.metric_key;
+        if (!merged[key]) return;
+        const val = Number(r.target_value);
+        if (!isNaN(val)) merged[key].target = val;
+        if (r.direction === 'lt' || r.direction === 'gt') merged[key].direction = r.direction;
+        // countField intentionally NOT overridable from fb_ads_target — it's
+        // a fixed wiring detail (which raw count guards the metric), not a
+        // tunable business target.
+      });
+      return merged;
+    })
+    .catch(function () { return Object.assign({}, DEFAULT_TARGET_RULES); });
+}
+
+// value: the already-computed metric (e.g. cost_atc for this row).
+// countValue: row[rule.countField] — e.g. atc count for cost_atc — guards
+// against a 0-from-no-data value reading as if it "beat" the target.
+function targetColorFromValue(value, countValue, rule) {
+  if (!rule || countValue == null || num(countValue) <= 0) return null;
+  const achieved = rule.direction === 'lt' ? value < rule.target : value > rule.target;
+  return achieved ? COLOR_GOOD : COLOR_BAD;
+}
+// Period-over-period coloring — same generic-value shape as above.
+function growthColorFromValues(curVal, prevVal) {
+  if (curVal == null || prevVal == null) return null;
+  if (curVal > prevVal) return COLOR_GOOD;
+  if (curVal < prevVal) return COLOR_BAD;
+  return null;
+}
+
+return {
+  num, fmtMoney, fmtNum, fmtPct, fmtRatio, safeDiv,
+  sqlDate, sqlStr, sqlInList, uniqueUid, runSql,
+  DEFAULT_ACCOUNT, accountFilterSql, fetchAccountList,
+  buildPeriods, periodKeyExpr,
+  classifyObjective, REACH_OBJECTIVES, SALES_OBJECTIVES, resolveObjective,
+  fetchObjectiveMap, fetchStatusMap,
+  COLOR_GOOD, COLOR_BAD, DEFAULT_TARGET_RULES, fetchTargetRules,
+  targetColorFromValue, growthColorFromValues,
+};
