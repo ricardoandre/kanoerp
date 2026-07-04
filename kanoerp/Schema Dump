@@ -1,4 +1,4 @@
-SCHEMA DUMP — generated 2026-07-04T06:55:11.826Z
+SCHEMA DUMP — generated 2026-07-04T07:38:52.095Z
 Collections found: 36 (all collections)
 
 ### roles  ("Roles")  — 9 rows
@@ -369,7 +369,7 @@ Collections found: 36 (all collections)
   - sample: belongsTo (obo)  [target=sample, foreignKey=fk_sample_variant_id]
   - sewing_date: dateOnly (date)
 
-### sample_comment  ("Sample Comment")  — 70 rows
+### sample_comment  ("Sample Comment")  — 73 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_sample_id: bigInt (integer)
@@ -408,7 +408,7 @@ Collections found: 36 (all collections)
   - archive: boolean (checkbox)
   - createdById: context
 
-### history  ("History")  — 553 rows
+### history  ("History")  — 571 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_user_id: bigInt (integer)
@@ -527,6 +527,7 @@ Collections found: 36 (all collections)
   - status: string (input)
   - synced_at: date (datetime)
   - account: string (input)
+  - objective_key: string (input)
 
 ### fb_ads_target  ("FB Ads Target")  — 4 rows
   primaryKey: metric_key, template: general
