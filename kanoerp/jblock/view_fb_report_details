@@ -1,0 +1,687 @@
+// =====================================================
+// jblock — FACEBOOK ADS DETAILS REPORT
+//
+// Evaluate ads by structure: Campaign → Adset → Ad drilldown. Filter by
+// account (single-select) + objective + Time window (Group by / Periods
+// back / Last date, popover + local Apply) + sort. Daily granularity adds
+// today as a leading column when sync-today.js has produced a row for it.
+// Each row shows all periods side by side; Details panel shows the full
+// metric breakdown for the LATEST period only.
+//
+// Shared logic/UI now lives in source_code rows (fn_fbads_data,
+// ui_fbads_controls) — loaded via loadCode below, same pattern as
+// view_production.js. Everything here is Structure-specific: the
+// campaign/adset/ad drilldown, PeriodTable rendering, sort-by-metric combo.
+//
+// STATUS: fb_ads_status.status (Facebook's own effective_status).
+// OBJECTIVE: fb_ads_status.objective_key, resolved via fn.resolveObjective
+// — real Facebook data, falls back to name-guessing only when a campaign
+// hasn't been synced yet (see ui.objectiveMetaBadge for the "guessed"/
+// "mixed" indicators).
+// =====================================================
+
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Spin, Segmented, Button, Select, InputNumber } = antd;
+const ce = React.createElement;
+
+const DEFAULT_PERIOD_COUNT = 7;
+const DEFAULT_GRANULARITY = 'daily';
+
+// ── shared code loader (README §3: jblocks cannot import each other) ──
+let fn = null, ui = null;
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const uid = 'code_' + name;
+  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+  const src = (rows && rows[0] && rows[0].code) || '';
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// =====================================================
+// ── Structure-specific data layer (SQL fetchers, period-table shape) ──
+// Account-filtered only at campaign level — adset/ad drill-downs are scoped
+// by a specific campaign_id/adset_id already, so nothing downstream needs
+// its own account filter.
+// =====================================================
+const METRICS_SELECT =
+  "COALESCE(SUM(spend),0) AS spend, " +
+  "COALESCE(SUM(reach),0) AS reach, " +
+  "COALESCE(SUM(impressions),0) AS impressions, " +
+  "COALESCE(SUM(clicks),0) AS clicks, " +
+  "COALESCE(SUM(link_clicks),0) AS link_clicks, " +
+  "COALESCE(SUM(landing_page_views),0) AS lpv, " +
+  "COALESCE(SUM(registration),0) AS registration, " +
+  "COALESCE(SUM(atc),0) AS atc, " +
+  "COALESCE(SUM(checkout),0) AS checkout, " +
+  "COALESCE(SUM(purchase),0) AS purchase, " +
+  "COALESCE(SUM(revenue),0) AS revenue";
+
+function computeMetrics(r) {
+  const s = fn.num(r.spend), reach = fn.num(r.reach), imp = fn.num(r.impressions);
+  const clk = fn.num(r.clicks), lc = fn.num(r.link_clicks), lpv = fn.num(r.lpv);
+  const reg = fn.num(r.registration), atc = fn.num(r.atc), co = fn.num(r.checkout);
+  const pur = fn.num(r.purchase), rev = fn.num(r.revenue);
+  return {
+    spend: s, reach: reach, impressions: imp, clicks: clk,
+    link_clicks: lc, lpv: lpv, registration: reg, atc: atc,
+    checkout: co, purchase: pur, revenue: rev,
+    cost_reach: fn.safeDiv(s, reach),
+    cpm: fn.safeDiv(s * 1000, imp),
+    ctr: fn.safeDiv(lc * 100, imp),
+    cost_click: fn.safeDiv(s, clk),
+    cost_link_click: fn.safeDiv(s, lc),
+    cost_lpv: fn.safeDiv(s, lpv),
+    cost_registration: fn.safeDiv(s, reg),
+    cost_atc: fn.safeDiv(s, atc),
+    cost_checkout: fn.safeDiv(s, co),
+    cost_purchase: fn.safeDiv(s, pur),
+    roas: fn.safeDiv(rev, s),
+    frequency: fn.safeDiv(imp, reach),
+  };
+}
+
+function fetchCampaignsPeriodic(granularity, periods, selectedAccount) {
+  const since = periods[periods.length - 1].start, until = periods[0].end;
+  const keyExpr = fn.periodKeyExpr(granularity);
+  return fn.runSql(ctx, 'fbstr_campaigns_p',
+    "SELECT campaign_id, MAX(campaign_name) AS campaign_name, " + keyExpr + " AS period_key, " + METRICS_SELECT + " " +
+    "FROM campaigns_insights " +
+    "WHERE date BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    fn.accountFilterSql(selectedAccount) +
+    "GROUP BY campaign_id, period_key"
+  );
+}
+function fetchAdsetsPeriodic(campaignId, granularity, periods) {
+  const since = periods[periods.length - 1].start, until = periods[0].end;
+  const keyExpr = fn.periodKeyExpr(granularity);
+  return fn.runSql(ctx, 'fbstr_adsets_p_' + campaignId,
+    "SELECT adset_id, MAX(adset_name) AS adset_name, " + keyExpr + " AS period_key, " + METRICS_SELECT + " " +
+    "FROM adsets_insights " +
+    "WHERE campaign_id = " + fn.sqlStr(campaignId) + " " +
+    "AND date BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    "GROUP BY adset_id, period_key"
+  );
+}
+function fetchAdsPeriodic(adsetId, granularity, periods) {
+  const since = periods[periods.length - 1].start, until = periods[0].end;
+  const keyExpr = fn.periodKeyExpr(granularity);
+  return fn.runSql(ctx, 'fbstr_ads_p_' + adsetId,
+    "SELECT ad_id, MAX(ad_name) AS ad_name, " + keyExpr + " AS period_key, " + METRICS_SELECT + " " +
+    "FROM ads_insights " +
+    "WHERE adset_id = " + fn.sqlStr(adsetId) + " " +
+    "AND date BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    "GROUP BY ad_id, period_key"
+  );
+}
+function fetchAdImages() {
+  return fn.runSql(ctx, 'fbstr_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='ads_creative' AND name='image'")
+    .then(function (rows) {
+      if (!rows.length) return {};
+      let opt = {};
+      try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return {}; }
+      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'ad_id';
+      if (!through || !fk || !ok) return {};
+      return fn.runSql(ctx, 'fbstr_imgjoin',
+        "SELECT ads_creative.ad_id AS ad_id, attachments.url AS url, attachments.filename AS filename " +
+        "FROM ads_creative " +
+        "JOIN " + through + " ON " + through + "." + fk + " = ads_creative." + sk + " " +
+        "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
+        "ORDER BY attachments.id ASC"
+      ).then(function (irows) {
+        const map = {};
+        irows.forEach(function (r) { if (!map[r.ad_id]) map[r.ad_id] = r.url || (r.filename ? '/storage/uploads/' + r.filename : ''); });
+        return map;
+      });
+    }).catch(function () { return {}; });
+}
+
+function fetchCampaignPeriodReach(periodType, periods, campaignIds) {
+  if (!campaignIds.length) return Promise.resolve([]);
+  const since = periods[periods.length - 1].start, until = periods[0].start;
+  return fn.runSql(ctx, 'fbstr_camp_reach',
+    "SELECT entity_id, period_start AS period_key, COALESCE(SUM(reach),0) AS reach, COALESCE(SUM(impression),0) AS impressions " +
+    "FROM fb_ads_period_data " +
+    "WHERE entity_type = 'campaign' AND period_type = '" + periodType + "' " +
+    "AND period_start BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    "AND CAST(entity_id AS CHAR) IN (" + fn.sqlInList(campaignIds) + ") " +
+    "GROUP BY entity_id, period_start"
+  );
+}
+function fetchAdPeriodReach(periodType, periods, adIds) {
+  if (!adIds.length) return Promise.resolve([]);
+  const since = periods[periods.length - 1].start, until = periods[0].start;
+  return fn.runSql(ctx, 'fbstr_ad_reach',
+    "SELECT entity_id, period_start AS period_key, COALESCE(SUM(reach),0) AS reach, COALESCE(SUM(impression),0) AS impressions " +
+    "FROM fb_ads_period_data " +
+    "WHERE entity_type = 'ad' AND period_type = '" + periodType + "' " +
+    "AND period_start BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    "AND CAST(entity_id AS CHAR) IN (" + fn.sqlInList(adIds) + ") " +
+    "GROUP BY entity_id, period_start"
+  );
+}
+function fetchAdsetPeriodReach(periodType, periods, adsetIds) {
+  if (!adsetIds.length) return Promise.resolve([]);
+  const since = periods[periods.length - 1].start, until = periods[0].start;
+  return fn.runSql(ctx, 'fbstr_adset_reach',
+    "SELECT entity_id, period_start AS period_key, COALESCE(SUM(reach),0) AS reach, COALESCE(SUM(impression),0) AS impressions " +
+    "FROM fb_ads_period_data " +
+    "WHERE entity_type = 'adset' AND period_type = '" + periodType + "' " +
+    "AND period_start BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
+    "AND CAST(entity_id AS CHAR) IN (" + fn.sqlInList(adsetIds) + ") " +
+    "GROUP BY entity_id, period_start"
+  );
+}
+function applyReachOverrides(byEntity, reachRows) {
+  const map = {};
+  reachRows.forEach(function (r) { map[r.entity_id + '|' + r.period_key] = r; });
+  Object.keys(byEntity).forEach(function (id) {
+    const pm = byEntity[id];
+    Object.keys(pm).forEach(function (pk) {
+      const hit = map[id + '|' + pk];
+      if (hit) { pm[pk].reach = hit.reach; pm[pk].impressions = hit.impressions; pm[pk].reachSource = 'real'; }
+      else { pm[pk].reachSource = 'approx'; }
+    });
+  });
+}
+function buildEntityRows(periodicRows, idField, nameField) {
+  const byEntity = {}, nameMap = {};
+  periodicRows.forEach(function (r) {
+    const id = r[idField];
+    if (!byEntity[id]) byEntity[id] = {};
+    byEntity[id][r.period_key] = r;
+    if (r[nameField]) nameMap[id] = r[nameField];
+  });
+  return { byEntity: byEntity, nameMap: nameMap };
+}
+function sumSpend(periodMap) {
+  return Object.keys(periodMap).reduce(function (s, pk) { return s + fn.num(periodMap[pk].spend); }, 0);
+}
+function findLatestDataKey(periodicRows, fallback) {
+  return periodicRows.reduce(function (best, r) { return (!best || r.period_key > best) ? r.period_key : best; }, null) || fallback;
+}
+function hasActivity(row) { return !!row; }
+
+// =====================================================
+// ── metric definitions ──
+// =====================================================
+const ALL_METRICS = [
+  { key: 'spend',             label: 'Total Spend' },
+  { key: 'reach',             label: 'Reach' },
+  { key: 'cost_reach',        label: 'Cost/Reach' },
+  { key: 'impressions',       label: 'Impressions' },
+  { key: 'cpm',               label: 'CPM' },
+  { key: 'ctr',               label: 'CTR' },
+  { key: 'clicks',            label: 'Clicks' },
+  { key: 'cost_click',        label: 'Cost/Click' },
+  { key: 'link_clicks',       label: 'Link Clicks' },
+  { key: 'cost_link_click',   label: 'Cost/Link Click' },
+  { key: 'lpv',               label: 'Landing Page Views' },
+  { key: 'cost_lpv',          label: 'Cost/LPV' },
+  { key: 'registration',      label: 'Registration' },
+  { key: 'cost_registration', label: 'Cost/Registration' },
+  { key: 'atc',               label: 'ATC' },
+  { key: 'cost_atc',          label: 'Cost/ATC' },
+  { key: 'checkout',          label: 'Checkout' },
+  { key: 'cost_checkout',     label: 'Cost/Checkout' },
+  { key: 'purchase',          label: 'Purchase' },
+  { key: 'cost_purchase',     label: 'Cost/Purchase' },
+  { key: 'revenue',           label: 'Purchase Amt' },
+  { key: 'roas',              label: 'ROAS' },
+  { key: 'frequency',         label: 'Frequency' },
+];
+function metricFmt(key, v) {
+  if (['spend', 'cpm', 'cost_click', 'cost_link_click', 'cost_lpv', 'cost_registration', 'cost_atc', 'cost_checkout', 'cost_purchase', 'revenue'].indexOf(key) !== -1) return fn.fmtMoney(v);
+  if (key === 'ctr') return fn.fmtPct(v);
+  if (['cost_reach', 'roas', 'frequency'].indexOf(key) !== -1) return fn.fmtRatio(v);
+  return fn.fmtNum(v);
+}
+function getObjCols(objKey) {
+  if (objKey === 'purchase') return ['revenue', 'roas', 'frequency'].map(function (k) { return ALL_METRICS.find(function (m) { return m.key === k; }); });
+  if (objKey === 'atc') return ['atc', 'cost_atc', 'frequency'].map(function (k) { return ALL_METRICS.find(function (m) { return m.key === k; }); });
+  return ['reach', 'cost_reach', 'frequency'].map(function (k) { return ALL_METRICS.find(function (m) { return m.key === k; }); });
+}
+
+const GROWTH_METRICS = ['spend', 'atc', 'reach', 'revenue'];
+
+const SORT_OPTIONS = [
+  { label: 'Spend (High → Low)', value: 'spend_desc' },
+  { label: 'Spend (Low → High)', value: 'spend_asc' },
+  { label: 'Reach (High → Low)', value: 'reach_desc' },
+  { label: 'Reach (Low → High)', value: 'reach_asc' },
+  { label: 'ATC (High → Low)', value: 'atc_desc' },
+  { label: 'ATC (Low → High)', value: 'atc_asc' },
+  { label: 'Revenue Amount (High → Low)', value: 'revenue_desc' },
+  { label: 'Revenue Amount (Low → High)', value: 'revenue_asc' },
+];
+const DEFAULT_SORT_COMBO = 'spend_desc';
+function parseSortCombo(combo) {
+  if (combo.slice(-4) === '_asc') return { key: combo.slice(0, -4), dir: 'asc' };
+  return { key: combo.slice(0, -5), dir: 'desc' };
+}
+function latestMetricValue(row, periods, key) {
+  if (!periods || !periods.length) return 0;
+  const pr = row.periodMap[periods[0].key];
+  if (!pr) return 0;
+  return fn.num(computeMetrics(pr)[key]);
+}
+function sortComparator(periods, sortKey, sortDir) {
+  return function (a, b) {
+    const av = latestMetricValue(a, periods, sortKey), bv = latestMetricValue(b, periods, sortKey);
+    return sortDir === 'asc' ? av - bv : bv - av;
+  };
+}
+
+// =====================================================
+// ── scoped styles ──
+// =====================================================
+const SCOPED_CSS = `
+.fbstr-root { padding: 16px; max-width: 1400px; }
+.fbstr-filterbar { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; padding: 14px 20px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; }
+.fbstr-row { display: flex; align-items: flex-start; gap: 8px; border-bottom: 1px solid #f3f4f6; padding: 8px 0; }
+.fbstr-row-content { flex: 1; min-width: 0; }
+.fbstr-row-actions { flex-shrink: 0; padding-top: 2px; display: flex; gap: 6px; }
+.fbstr-indent-1 { margin-left: 24px; }
+.fbstr-indent-2 { margin-left: 48px; }
+.fbstr-table-wrap { overflow-x: auto; margin-top: 6px; -webkit-overflow-scrolling: touch; }
+.fbstr-table th, .fbstr-table td { white-space: nowrap; }
+.fbstr-sticky-col { position: sticky; left: 0; z-index: 2; box-shadow: 2px 0 4px -2px rgba(0,0,0,0.25); }
+.fbstr-thumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; display: block; }
+.fbstr-thumb-placeholder { width: 44px; height: 44px; background: #f3f4f6; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #d1d5db; }
+.fbstr-name { font-weight: 700; font-size: 13px; color: #111827; margin-bottom: 2px; }
+.fbstr-expand-btn { background: none; border: 1px solid #6366f1; border-radius: 5px; padding: 2px 8px; font-size: 11px; cursor: pointer; color: #6366f1; }
+.fbstr-metrics-panel { display: flex; flex-wrap: wrap; gap: 12px; padding: 10px 12px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; margin-top: 4px; margin-bottom: 8px; }
+.fbstr-metrics-panel > div { min-width: 130px; padding-right: 8px; }
+@media (max-width: 640px) {
+  .fbstr-root { padding: 10px; }
+  .fbstr-filterbar { padding: 10px 12px; gap: 12px; }
+  .fbstr-row { flex-direction: column; align-items: stretch; }
+  .fbstr-row-content { width: 100%; }
+  .fbstr-row-actions { padding-top: 6px; margin-left: 0; }
+  .fbstr-indent-1 { margin-left: 10px; }
+  .fbstr-indent-2 { margin-left: 20px; }
+  .fbstr-table th, .fbstr-table td { padding: 4px 6px !important; font-size: 11px !important; }
+  .fbstr-name { font-size: 12px; }
+  .fbstr-thumb, .fbstr-thumb-placeholder { width: 34px; height: 34px; }
+  .fbstr-metrics-panel > div { min-width: 45%; }
+  .fbstr-header-title { font-size: 16px !important; }
+}
+`;
+function ScopedStyle() { return ce('style', null, SCOPED_CSS); }
+
+function MetricCell(col, val) {
+  return ce('div', { key: col.key },
+    ce('div', { style: { fontSize: 10, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: 0.3 } }, col.label),
+    ce('div', { style: { fontSize: 13, fontWeight: 600, color: '#111827' } }, metricFmt(col.key, val)));
+}
+function AllMetricsPanel(metrics) {
+  return ce('div', { className: 'fbstr-metrics-panel' }, ALL_METRICS.map(function (m) {
+    return ce('div', { key: m.key },
+      ce('div', { style: { fontSize: 10, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: 0.3 } }, m.label),
+      ce('div', { style: { fontSize: 12, fontWeight: 600, color: '#374151' } }, metricFmt(m.key, metrics[m.key])));
+  }));
+}
+function thStyle(left) {
+  return { textAlign: left ? 'left' : 'right', padding: '6px 10px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb', fontWeight: 700, fontSize: 10, color: '#6b7280', textTransform: 'uppercase', letterSpacing: 0.3 };
+}
+function tdStyle(left, extra) {
+  const base = { textAlign: left ? 'left' : 'right', padding: '5px 10px', borderBottom: '1px solid #f3f4f6', fontWeight: left ? 600 : 400, color: left ? '#111827' : '#374151', fontSize: 12 };
+  return Object.assign(base, extra || {});
+}
+
+function PeriodTable(periodMap, periods, objKey, targetRules) {
+  const cols = getObjCols(objKey);
+  const rows = [{ key: 'spend', label: 'Spend' }].concat(cols);
+
+  return ce('div', { className: 'fbstr-table-wrap' },
+    ce('table', { className: 'fbstr-table', style: { borderCollapse: 'separate', borderSpacing: 0, tableLayout: 'fixed' } },
+      ce('colgroup', null,
+        ce('col', { style: { width: 100 } }),
+        periods.map(function (p) { return ce('col', { key: p.key, style: { width: 105 } }); })),
+      ce('thead', null, ce('tr', null,
+        ce('th', { className: 'fbstr-sticky-col', style: Object.assign(thStyle(true), { zIndex: 3 }) }, ''),
+        periods.map(function (p) {
+          const row = periodMap[p.key];
+          const approx = row && row.reachSource === 'approx';
+          return ce('th', { key: p.key, style: thStyle(false) },
+            approx && ce('span', { style: { display: 'inline-block', width: 6, height: 6, borderRadius: 3, background: '#3b82f6', marginRight: 4 }, title: 'Approximated reach/frequency — not yet backfilled' }),
+            p.label);
+        }))),
+      ce('tbody', null, rows.map(function (m, ri) {
+        const rowBg = ri % 2 ? '#fafafa' : '#fff';
+        return ce('tr', { key: m.key, style: { background: rowBg } },
+          ce('td', { className: 'fbstr-sticky-col', style: Object.assign(tdStyle(true, { background: rowBg }), { zIndex: 2 }) }, m.label),
+          periods.map(function (p, pi) {
+            const row = periodMap[p.key];
+            if (!row) return ce('td', { key: p.key, style: tdStyle(false) }, '—');
+            const val = computeMetrics(row)[m.key];
+            let color = null;
+            if (GROWTH_METRICS.indexOf(m.key) !== -1) {
+              const prevRow = periods[pi + 1] && periodMap[periods[pi + 1].key];
+              color = prevRow ? fn.growthColorFromValues(val, computeMetrics(prevRow)[m.key]) : null;
+            } else {
+              const rule = targetRules[m.key];
+              if (rule) color = fn.targetColorFromValue(val, row[rule.countField], rule);
+            }
+            return ce('td', { key: p.key, style: tdStyle(false, color ? { color: color, fontWeight: 700 } : null) }, metricFmt(m.key, val));
+          }));
+      }))));
+}
+
+// =====================================================
+// ── AD ROW (leaf) ──
+// =====================================================
+function AdRow(props) {
+  const ad = props.ad, objKey = props.objKey, image = props.image, periods = props.periods, targetRules = props.targetRules;
+  const sDetail = useState(false); const showDetail = sDetail[0]; const setShowDetail = sDetail[1];
+  const latestRow = ad.periodMap[periods[0].key] || {};
+  const latestMetrics = computeMetrics(latestRow);
+
+  return ce('div', { className: 'fbstr-indent-2' },
+    ce('div', { className: 'fbstr-row' },
+      ce('div', { style: { flexShrink: 0, marginRight: 10, marginTop: 2 } },
+        image
+          ? ce('img', { src: image, className: 'fbstr-thumb' })
+          : ce('div', { className: 'fbstr-thumb-placeholder' }, '🎨')),
+      ce('div', { className: 'fbstr-row-content' },
+        ce('div', null, ui.statusBadge(ad.fbStatus), ce('span', { className: 'fbstr-name' }, ad.ad_name || ad.ad_id)),
+        PeriodTable(ad.periodMap, periods, objKey, targetRules)),
+      ce('div', { className: 'fbstr-row-actions' },
+        ce('button', { className: 'fbstr-expand-btn', onClick: function () { setShowDetail(!showDetail); } }, showDetail ? 'Details ▲' : 'Details ▼'))),
+    showDetail ? AllMetricsPanel(latestMetrics) : null);
+}
+
+// =====================================================
+// ── ADSET ROW ──
+// =====================================================
+function AdsetRow(props) {
+  const adset = props.adset, objKey = props.objKey;
+  const periods = props.periods, granularity = props.granularity, periodType = props.periodType;
+  const sortKey = props.sortKey, sortDir = props.sortDir, targetRules = props.targetRules;
+  const sDetail = useState(false); const showDetail = sDetail[0]; const setShowDetail = sDetail[1];
+  const sExpand = useState(false); const expand = sExpand[0]; const setExpand = sExpand[1];
+  const sAds = useState(null); const ads = sAds[0]; const setAds = sAds[1];
+  const sImages = useState({}); const adImages = sImages[0]; const setAdImages = sImages[1];
+  const sLoading = useState(false); const loading = sLoading[0]; const setLoading = sLoading[1];
+  const latestRow = adset.periodMap[periods[0].key] || {};
+  const latestMetrics = computeMetrics(latestRow);
+
+  function toggleAds() {
+    if (!expand && !ads) {
+      setLoading(true);
+      Promise.all([fetchAdsPeriodic(adset.adset_id, granularity, periods), fetchAdImages()])
+        .then(function (res) {
+          const adPeriodicRows = res[0], images = res[1];
+          const built = buildEntityRows(adPeriodicRows, 'ad_id', 'ad_name');
+          const latestKey = findLatestDataKey(adPeriodicRows, periods[0].key);
+          const adIds = Object.keys(built.byEntity);
+          const needsPeriodReach = granularity !== 'daily';
+          const reachPromise = needsPeriodReach ? fetchAdPeriodReach(periodType, periods, adIds) : Promise.resolve([]);
+          return reachPromise.then(function (reachRows) {
+            if (needsPeriodReach) applyReachOverrides(built.byEntity, reachRows);
+            return fn.fetchStatusMap(ctx, 'ad', adIds).then(function (statusMap) {
+              const adRows = adIds.map(function (id) {
+                const pm = built.byEntity[id];
+                return { ad_id: id, ad_name: built.nameMap[id], periodMap: pm, isActive: hasActivity(pm[latestKey]), fbStatus: statusMap[id] || null };
+              });
+              setAds(adRows);
+              setAdImages(images);
+              setLoading(false);
+              setExpand(true);
+            });
+          });
+        })
+        .catch(function () { setLoading(false); setExpand(true); });
+    } else {
+      setExpand(!expand);
+    }
+  }
+
+  const visibleAds = ads ? ads.slice().sort(sortComparator(periods, sortKey, sortDir)) : null;
+
+  return ce('div', { className: 'fbstr-indent-1' },
+    ce('div', { className: 'fbstr-row' },
+      ce('div', { className: 'fbstr-row-content' },
+        ce('div', null, ui.statusBadge(adset.fbStatus), ce('span', { className: 'fbstr-name' }, '📁 ' + (adset.adset_name || adset.adset_id))),
+        PeriodTable(adset.periodMap, periods, objKey, targetRules)),
+      ce('div', { className: 'fbstr-row-actions' },
+        ce('button', { className: 'fbstr-expand-btn', onClick: function () { setShowDetail(!showDetail); } }, showDetail ? 'Details ▲' : 'Details ▼'),
+        ce('button', { className: 'fbstr-expand-btn', onClick: toggleAds },
+          loading ? '…' : (expand ? 'Ads ▲' : 'Ads ▼')))),
+    showDetail ? AllMetricsPanel(latestMetrics) : null,
+    expand && visibleAds && visibleAds.map(function (ad) {
+      return ce(AdRow, { key: ad.ad_id, ad: ad, objKey: objKey, image: adImages[ad.ad_id] || '', periods: periods, targetRules: targetRules });
+    }),
+    expand && ads && visibleAds.length === 0 ? ce('div', { className: 'fbstr-indent-2', style: { padding: '8px 0', color: '#9ca3af', fontSize: 12 } }, 'No ad data found.') : null,
+    expand && loading ? ce('div', { className: 'fbstr-indent-2', style: { padding: '8px 0', color: '#9ca3af', fontSize: 12 } }, 'Loading ads…') : null);
+}
+
+// =====================================================
+// ── CAMPAIGN ROW ──
+// =====================================================
+function CampaignRow(props) {
+  const camp = props.camp;
+  const periods = props.periods, granularity = props.granularity, periodType = props.periodType;
+  const sortKey = props.sortKey, sortDir = props.sortDir, targetRules = props.targetRules;
+  const objKey = camp.objective;
+  const sDetail = useState(false); const showDetail = sDetail[0]; const setShowDetail = sDetail[1];
+  const sExpand = useState(false); const expand = sExpand[0]; const setExpand = sExpand[1];
+  const sAdsets = useState(null); const adsets = sAdsets[0]; const setAdsets = sAdsets[1];
+  const sLoading = useState(false); const loading = sLoading[0]; const setLoading = sLoading[1];
+  const latestRow = camp.periodMap[periods[0].key] || {};
+  const latestMetrics = computeMetrics(latestRow);
+
+  function toggleAdsets() {
+    if (!expand && !adsets) {
+      setLoading(true);
+      fetchAdsetsPeriodic(camp.campaign_id, granularity, periods)
+        .then(function (rows) {
+          const built = buildEntityRows(rows, 'adset_id', 'adset_name');
+          const latestKey = findLatestDataKey(rows, periods[0].key);
+          const adsetIds = Object.keys(built.byEntity);
+          const needsPeriodReach = granularity !== 'daily';
+          const reachPromise = needsPeriodReach ? fetchAdsetPeriodReach(periodType, periods, adsetIds) : Promise.resolve([]);
+
+          return reachPromise.then(function (reachRows) {
+            if (needsPeriodReach) applyReachOverrides(built.byEntity, reachRows);
+            return fn.fetchStatusMap(ctx, 'adset', adsetIds).then(function (statusMap) {
+              const adsetRows = adsetIds.map(function (id) {
+                return { adset_id: id, adset_name: built.nameMap[id], periodMap: built.byEntity[id], isActive: hasActivity(built.byEntity[id][latestKey]), fbStatus: statusMap[id] || null };
+              });
+              setAdsets(adsetRows);
+              setLoading(false);
+              setExpand(true);
+            });
+          });
+        })
+        .catch(function () { setLoading(false); setExpand(true); });
+    } else {
+      setExpand(!expand);
+    }
+  }
+
+  const visibleAdsets = adsets ? adsets.slice().sort(sortComparator(periods, sortKey, sortDir)) : null;
+
+  return ce('div', { style: { borderBottom: '1px solid #e5e7eb' } },
+    ce('div', { className: 'fbstr-row', style: { borderBottom: 'none', padding: '10px 0' } },
+      ce('div', { className: 'fbstr-row-content' },
+        ce('div', null,
+          ui.badge(objKey), ui.objectiveMetaBadge(camp.objectiveInfo), ui.statusBadge(camp.fbStatus),
+          ce('span', { className: 'fbstr-name' }, camp.campaign_name || camp.campaign_id)),
+        PeriodTable(camp.periodMap, periods, objKey, targetRules)),
+      ce('div', { className: 'fbstr-row-actions' },
+        ce('button', { className: 'fbstr-expand-btn', onClick: function () { setShowDetail(!showDetail); } }, showDetail ? 'Details ▲' : 'Details ▼'),
+        ce('button', { className: 'fbstr-expand-btn', onClick: toggleAdsets },
+          loading ? '…' : (expand ? 'Adsets ▲' : 'Adsets ▼')))),
+    showDetail ? AllMetricsPanel(latestMetrics) : null,
+    expand && visibleAdsets && visibleAdsets.map(function (adset) {
+      return ce(AdsetRow, { key: adset.adset_id, adset: adset, objKey: objKey, periods: periods, granularity: granularity, periodType: periodType, sortKey: sortKey, sortDir: sortDir, targetRules: targetRules });
+    }),
+    expand && adsets && visibleAdsets.length === 0 ? ce('div', { className: 'fbstr-indent-1', style: { padding: '8px 0', color: '#9ca3af', fontSize: 12 } }, 'No adset data found.') : null,
+    expand && loading ? ce('div', { className: 'fbstr-indent-1', style: { padding: '8px 0', color: '#9ca3af', fontSize: 12 } }, 'Loading adsets…') : null);
+}
+
+// =====================================================
+// ── ROOT ──
+// =====================================================
+const Root = function () {
+  const sReady = useState(false); const ready = sReady[0]; const setReady = sReady[1];
+  const sLoadErr = useState(null); const loadErr = sLoadErr[0]; const setLoadErr = sLoadErr[1];
+
+  const sGranularity = useState(DEFAULT_GRANULARITY); const granularity = sGranularity[0]; const setGranularity = sGranularity[1];
+  const sFilterObj = useState('all'); const filterObj = sFilterObj[0]; const setFilterObj = sFilterObj[1];
+  const sSortCombo = useState(DEFAULT_SORT_COMBO); const sortCombo = sSortCombo[0]; const setSortCombo = sSortCombo[1];
+  const sCampaigns = useState(null); const campaigns = sCampaigns[0]; const setCampaigns = sCampaigns[1];
+  const sPeriods = useState(null); const periods = sPeriods[0]; const setPeriods = sPeriods[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+  const sLoading = useState(false); const loading = sLoading[0]; const setLoading = sLoading[1];
+  const sDataQuality = useState(null); const dataQuality = sDataQuality[0]; const setDataQuality = sDataQuality[1];
+  const sTargetRules = useState(null); const targetRules = sTargetRules[0]; const setTargetRules = sTargetRules[1];
+
+  const sAvailableAccounts = useState([]); const availableAccounts = sAvailableAccounts[0]; const setAvailableAccounts = sAvailableAccounts[1];
+  const sSelectedAccount = useState(null); const selectedAccount = sSelectedAccount[0]; const setSelectedAccount = sSelectedAccount[1];
+
+  const sPeriodCount = useState(DEFAULT_PERIOD_COUNT); const periodCount = sPeriodCount[0]; const setPeriodCount = sPeriodCount[1];
+  const sLastDate = useState(dayjs().startOf('day')); const lastDate = sLastDate[0]; const setLastDate = sLastDate[1];
+
+  function generate(gran, account, count, lastDateParam) {
+    setLoading(true); setErr(null);
+    const p = fn.buildPeriods(gran, count, lastDateParam);
+    const needsPeriodReach = gran !== 'daily';
+    const periodType = gran === 'monthly' ? 'month' : 'week';
+
+    fetchCampaignsPeriodic(gran, p, account).then(function (rows) {
+      let finalPeriods = p;
+      if (gran === 'daily' && p.length && p[0].partial) {
+        const hasToday = rows.some(function (r) { return r.period_key === p[0].key; });
+        if (!hasToday) finalPeriods = p.slice(1);
+      }
+      setPeriods(finalPeriods);
+
+      const built = buildEntityRows(rows, 'campaign_id', 'campaign_name');
+      const latestKey = findLatestDataKey(rows, finalPeriods[0].key);
+      const campaignIds = Object.keys(built.byEntity);
+      const reachPromise = needsPeriodReach ? fetchCampaignPeriodReach(periodType, p, campaignIds) : Promise.resolve([]);
+
+      return reachPromise.then(function (reachRows) {
+        if (needsPeriodReach) applyReachOverrides(built.byEntity, reachRows);
+        return Promise.all([fn.fetchStatusMap(ctx, 'campaign', campaignIds), fn.fetchObjectiveMap(ctx, campaignIds)]).then(function (results) {
+          const statusMap = results[0], objectiveMap = results[1];
+          const campaignRows = campaignIds.map(function (id) {
+            const pm = built.byEntity[id];
+            const name = built.nameMap[id];
+            const objectiveInfo = fn.resolveObjective(objectiveMap[id], name);
+            return { campaign_id: id, campaign_name: name, objective: objectiveInfo.objective, objectiveInfo: objectiveInfo, periodMap: pm, isActive: hasActivity(pm[latestKey]), fbStatus: statusMap[id] || null, spend: sumSpend(pm) };
+          });
+          setCampaigns(campaignRows);
+          setLoading(false);
+
+          if (needsPeriodReach) {
+            let approx = 0, total = 0;
+            campaignRows.forEach(function (c) {
+              Object.keys(c.periodMap).forEach(function (pk) { total++; if (c.periodMap[pk].reachSource !== 'real') approx++; });
+            });
+            setDataQuality({ campaignApprox: approx, campaignTotal: total });
+          } else {
+            setDataQuality(null);
+          }
+        });
+      });
+    }).catch(function (e) { setErr((e && e.message) || String(e)); setLoading(false); });
+  }
+
+  function handleAccountChange(account) { setSelectedAccount(account); generate(granularity, account, periodCount, lastDate); }
+  function handleReload() { generate(granularity, selectedAccount, periodCount, lastDate); }
+  function handleApplyTimeWindow(gran, count, ld) {
+    setGranularity(gran); setPeriodCount(count); setLastDate(ld);
+    generate(gran, selectedAccount, count, ld);
+  }
+
+  useEffect(function () {
+    Promise.all([loadCode('fn_fbads_data'), loadCode('ui_fbads_controls')])
+      .then(function (mods) {
+        fn = mods[0]; ui = mods[1];
+        setSelectedAccount(fn.DEFAULT_ACCOUNT);
+        setReady(true);
+      })
+      .catch(function (e) { setLoadErr((e && e.message) || String(e)); });
+  }, []);
+
+  useEffect(function () {
+    if (!ready) return;
+    generate(granularity, selectedAccount, periodCount, lastDate);
+    fn.fetchAccountList(ctx).then(function (rows) {
+      setAvailableAccounts(rows.map(function (r) { return r.account; }));
+    }).catch(function () {});
+    fn.fetchTargetRules(ctx).then(function (rules) { setTargetRules(rules); });
+  }, [ready]);
+
+  if (loadErr) return ce('div', { style: { color: '#dc2626', padding: 16 } }, 'Failed to load shared FB Ads modules: ' + loadErr);
+  if (!ready || !targetRules) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading…'));
+
+  const sortDef = parseSortCombo(sortCombo);
+  const sortKey = sortDef.key, sortDir = sortDef.dir;
+  const filteredCampaigns = campaigns
+    ? campaigns
+        .filter(function (c) { return filterObj === 'all' || c.objective === filterObj; })
+        .slice()
+        .sort(sortComparator(periods, sortKey, sortDir))
+    : null;
+  const periodType = granularity === 'monthly' ? 'month' : 'week';
+
+  let campaignListContent;
+  if (loading) {
+    campaignListContent = ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading campaigns…'));
+  } else if (filteredCampaigns) {
+    campaignListContent = filteredCampaigns.length === 0
+      ? ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'No campaigns found for this filter.')
+      : ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 8, padding: '0 16px' } },
+          ce('div', { style: { display: 'flex', gap: 0, padding: '8px 0 4px', borderBottom: '2px solid #e5e7eb', marginBottom: 4 } },
+            ce('div', { style: { flex: 1, fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase' } }, filteredCampaigns.length + ' campaign(s)')),
+          filteredCampaigns.map(function (camp) {
+            return ce(CampaignRow, {
+              key: camp.campaign_id, camp: camp,
+              periods: periods, granularity: granularity, periodType: periodType,
+              sortKey: sortKey, sortDir: sortDir, targetRules: targetRules,
+            });
+          }));
+  } else {
+    campaignListContent = ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…');
+  }
+
+  return ce('div', { className: 'fbstr-root' },
+    ScopedStyle(),
+    ce('div', { className: 'fbstr-header-title', style: { fontSize: 18, fontWeight: 700, marginBottom: 4 } }, 'Facebook Ads — Details Report'),
+    ce('div', { style: { fontSize: 13, color: '#6b7280', marginBottom: 4 } },
+      'Each row shows the last ' + (periods ? periods.length : periodCount) + ' ' + granularity + ' periods side by side, last date ' + lastDate.format('D MMM YYYY') + '.'),
+    ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 16 } },
+      'Targets — Cost/ATC < ' + fn.fmtMoney(targetRules.cost_atc.target) + ', Cost/Reach < ' + fn.fmtRatio(targetRules.cost_reach.target) + ', ROAS > ' + fn.fmtRatio(targetRules.roas.target) + ' (edit in fb_ads_target)'),
+
+    ce('div', { className: 'fbstr-filterbar' },
+      ui.Field('Account', ce(Select, {
+        value: selectedAccount, onChange: handleAccountChange,
+        style: { width: 200 }, placeholder: 'All accounts', allowClear: true,
+        options: availableAccounts.map(function (a) { return { label: a, value: a }; }),
+      })),
+      ui.Field('Objective', ce(Segmented, { value: filterObj, onChange: setFilterObj, options: ui.OBJ_OPTIONS })),
+      ui.Field('Time window', ce(ui.TimeWindowPopover, { granularity: granularity, periodCount: periodCount, lastDate: lastDate, loading: loading, onApply: handleApplyTimeWindow })),
+      ui.Field('Sort by', ce(Select, { value: sortCombo, onChange: setSortCombo, style: { width: 220 }, options: SORT_OPTIONS })),
+      ui.Field('', ce(Button, { onClick: handleReload, title: 'Reload with current filters', style: { borderColor: '#0891b2', color: '#0891b2' } }, loading ? 'Refreshing…' : '↻ Refresh'))),
+
+    err ? ce('div', { style: { color: '#dc2626', marginBottom: 16, fontSize: 13 } }, err) : null,
+
+    dataQuality && dataQuality.campaignApprox > 0 && !loading && ce('div', {
+      style: { display: 'flex', flexDirection: 'column', gap: 4, padding: '8px 14px', marginTop: 16, marginBottom: 16, background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 12, color: '#1e3a8a' },
+    },
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        ce('span', { style: { width: 8, height: 8, borderRadius: 4, background: '#3b82f6', flexShrink: 0 } }),
+        'Campaign-level: ' + dataQuality.campaignApprox + ' of ' + dataQuality.campaignTotal + ' period cells are approximated (fb_ads_period_data not yet backfilled for those).'),
+      ce('div', { style: { paddingLeft: 16 } }, 'Ad-level and adset-level cells are marked "~ approx reach/freq" individually once you expand.')),
+
+    ce('div', { style: { marginTop: 16 } }, campaignListContent));
+};
+
+ctx.render(ce(Root));
