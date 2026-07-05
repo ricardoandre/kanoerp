@@ -1,5 +1,5 @@
-SCHEMA DUMP — generated 2026-07-04T07:38:52.095Z
-Collections found: 36 (all collections)
+SCHEMA DUMP — generated 2026-07-05T09:37:55.143Z
+Collections found: 42 (all collections)
 
 ### roles  ("Roles")  — 9 rows
   primaryKey: name
@@ -44,14 +44,14 @@ Collections found: 36 (all collections)
   - updatedById: context
   - createdById: context
 
-### source_code  ("Source Code")  — 11 rows
+### source_code  ("Source Code")  — 13 rows
   primaryKey: name, template: general
   - name: string (input)
   - code: text (textarea)
   - createdAt: date (createdAt)
   - updatedAt: datetimeTz (updatedAt)
 
-### task  ("Task")  — 1044 rows
+### task  ("Task")  — 1074 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_owner: string (input)
@@ -408,7 +408,7 @@ Collections found: 36 (all collections)
   - archive: boolean (checkbox)
   - createdById: context
 
-### history  ("History")  — 571 rows
+### history  ("History")  — 572 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_user_id: bigInt (integer)
@@ -420,7 +420,7 @@ Collections found: 36 (all collections)
   - category: string (input)
   - create_date: date (datetime)
 
-### ads_insights  ("Ads Insights")  — 63030 rows
+### ads_insights  ("Ads Insights")  — 63100 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - ad_id: string (input)
@@ -447,7 +447,7 @@ Collections found: 36 (all collections)
   - spend: decimal (number)
   - account: string (input)
 
-### adsets_insights  ("Adsets Insights")  — 12750 rows
+### adsets_insights  ("Adsets Insights")  — 12768 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -472,7 +472,7 @@ Collections found: 36 (all collections)
   - spend: decimal (number)
   - account: string (input)
 
-### campaigns_insights  ("Campaigns Insights")  — 5250 rows
+### campaigns_insights  ("Campaigns Insights")  — 5263 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -506,7 +506,7 @@ Collections found: 36 (all collections)
   - source_url: text (textarea)
   - account: string (input)
 
-### fb_ads_period_data  ("FB Ads Period Data")  — 18953 rows
+### fb_ads_period_data  ("FB Ads Period Data")  — 21436 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - entity_type: string (input)
@@ -519,7 +519,7 @@ Collections found: 36 (all collections)
   - synced_at: date (datetime)
   - account: string (input)
 
-### fb_ads_status  ("FB Ads Status")  — 1233 rows
+### fb_ads_status  ("FB Ads Status")  — 8498 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - entity_type: string (input)
@@ -535,3 +535,89 @@ Collections found: 36 (all collections)
   - target_value: double (number)
   - label: string (input)
   - direction: string (select)
+
+### ig_daily_insights  ("IG Daily Insights")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - ig_account_id: string (input)
+  - insight_date: dateOnly (date)
+  - interactions: bigInt (integer)
+  - likes: bigInt (integer)
+  - comments: bigInt (integer)
+  - shares: bigInt (integer)
+  - saves: bigInt (integer)
+  - replies: bigInt (integer)
+  - follows: bigInt (integer)
+  - unfollows: bigInt (integer)
+  - profile_link_taps: bigInt (integer)
+  - views: bigInt (integer)
+
+### ig_period_insights  ("IG Period Insights")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - ig_account_id: string (input)
+  - period_type: string (input)
+  - period_start: date (datetime)
+  - period_end: date (datetime)
+  - reach: bigInt (integer)
+  - accounts_engaged: bigInt (integer)
+
+### ig_media  ("IG Media")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - ig_account_id: string (input)
+  - media_id: string (input)
+  - media_type: string (input)
+  - media_product_type: string (input)
+  - caption: text (textarea)
+  - permalink: text (textarea)
+  - thumbnail_url: text (textarea)
+  - published_at: date (datetime)
+  - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_bjeu08nohqw, sourceKey=id, through=t_wz3o856of9n, otherKey=f_xez2ixf2vp1]
+
+### ig_media_insights_snapshot  ("IG Media Insights Snapshot")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_media_id: bigInt (integer)
+  - media: belongsTo (obo)  [target=ig_media, foreignKey=fk_media_id]
+  - checkpoint: string (input)
+  - captured_at: date (datetime)
+  - reach: bigInt (integer)
+  - views: bigInt (integer)
+  - likes: bigInt (integer)
+  - comments: bigInt (integer)
+  - shares: bigInt (integer)
+  - saves: bigInt (integer)
+  - interactions: bigInt (integer)
+  - profile_visits: bigInt (integer)
+  - profile_activity: bigInt (integer)
+  - follows: bigInt (integer)
+  - reel_avg_watch_time: bigInt (integer)
+  - reel_total_watch_time: bigInt (integer)
+
+### ig_story_insights  ("IG Story Insights")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_media_id: bigInt (integer)
+  - media: belongsTo (obo)  [target=ig_media, foreignKey=fk_media_id]
+  - checkpoint: string (input)
+  - captured_at: date (datetime)
+  - reach: bigInt (integer)
+  - views: bigInt (integer)
+  - replies: bigInt (integer)
+  - navigation_forward: bigInt (integer)
+  - navigation_back: bigInt (integer)
+  - exits: bigInt (integer)
+  - taps_forward: bigInt (integer)
+  - taps_back: bigInt (integer)
+  - profile_visits: bigInt (integer)
+  - profile_activity: bigInt (integer)
+
+### ig_audience_demographic_snapshot  ("IG Audience Demographic Snapshot")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - ig_account_id: string (input)
+  - captured_month: dateOnly (date)
+  - breakdown_type: string (input)
+  - breakdown_key: string (input)
+  - value: bigInt (integer)
