@@ -117,16 +117,32 @@ field names aren't predictable from the collection name (§4.1).
   used"`). Fix: one combined query (e.g. `UNION ALL`) under a fixed uid, or
   serialize instead of `Promise.all`-ing several dynamic uids. Multiple *fixed*,
   *different* uids run concurrently is fine.
-
+- **`document` is not freely available in all contexts** — only use it where already
+  proven to work. The one proven pattern: CSV/PDF download via
+  `document.createElement('a')` + `Blob` + `.click()` (used in the working CSV export
+  and in `ui_prepare_fabric`'s PDF download).
+  - **`document.body` (and DOM insertion generally) is blocked** — do NOT add
+    `document.body.appendChild(link)` / `.removeChild(link)` around the pattern
+    above. `link.click()` works standalone, without ever inserting the element
+    into the DOM. (Confirmed broken 2026-07: "Access to document property 'body'
+    is not allowed.")
 ---
 
 ## 4. NocoBase API patterns
 
 - **MySQL.** Backtick reserved words, `LIMIT n`, no `information_schema` for
   relations (see below).
-- **SQL:** `ctx.sql.save({uid,sql,dataSourceKey})` (awaited) → `ctx.sql.
-  runById(uid,...)`. Fixed `uid` in column/list contexts; dynamic per-row uid in
-  multi-row column code — but don't fire many dynamic uids in parallel (§3).
+- **SQL:** `ctx.sql.save({ uid, sql, dataSourceKey: 'main' })` (awaited) →
+  `ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })`.
+  - Both calls take an **object**, not positional args. `dataSourceKey: 'main'`
+    is required on both — omitting it fails or errors.
+  - `uid` must be a **fixed string** in column/list contexts.
+  - In **multi-row column code**, `uid` must be **dynamic per row**
+    (`"prefix_" + record_id`) to prevent concurrent collisions between rows rendering
+    at the same time.
+  - Canonical wrapper: see `fn_fbads_data.runSql(ctx, prefix, sql)` — generates a
+    unique uid per call (`uniqueUid()`) and chains `.save().then(() => .runById())`.
+    Reuse this wrapper shape for any new SQL-touching code rather than re-deriving it.
 - **Writes:** `ctx.api.resource('collection').create({values:{...}})` — reliable,
   avoids raw-SQL-`INSERT` snowflake-ID issues.
 - **`belongsTo` needs nested payloads:** `{ [relFieldName]: { [targetKey]: value } }`
