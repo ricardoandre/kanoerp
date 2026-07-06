@@ -452,6 +452,14 @@ deliberately deferred (§9).
 - **FB Ads daily account-level reach** — if a real per-day, per-account
   deduplicated reach source is ever added, Daily granularity can return to
   `view_fb_report_overview` (deliberately removed, not approximated — §10).
+- **Audit remaining `ctx.sql`-dependent files for the admin-gating bug (§3):**
+  `ui_production_edit.js`, `ui_prepare_fabric.js`, `ui_list_engine.js`,
+  `ui_record_nav.js`, all 3 importers, `view_production_result`,
+  `fn_fbads_data` + the 3 FB Ads jblocks. Test with the two-session diagnostic
+  in §3 for any of these a non-admin role actually uses.
+- Fix the stale `loadCode` snippet inside §3's own code block (still shows the
+  old `ctx.sql`-based version) — replace with the `ctx.api.resource
+  ('source_code')` version now live in `act_material_out.js`.
 
 ---
 
