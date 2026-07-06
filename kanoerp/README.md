@@ -117,6 +117,79 @@ field names aren't predictable from the collection name (§4.1).
   used"`). Fix: one combined query (e.g. `UNION ALL`) under a fixed uid, or
   serialize instead of `Promise.all`-ing several dynamic uids. Multiple *fixed*,
   *different* uids run concurrently is fine.
+- **`ctx.sql.save()` is gated to admin/root — non-admin roles get a silent,
+  record-by-record failure, not a clean permission error.** Discovered 2026-07
+  across `ui_production_material_detail.js` (Details/Quantity/Track tabs) and
+  `ui_material_out.js`.
+
+  **Mechanism:** `ctx.sql.save({uid, sql, ...})` *registers* a query under a
+  `uid`; `ctx.sql.runById(uid, ...)` *executes* whatever's currently registered
+  there. `save()` silently fails for non-admin roles (matches NocoBase's own
+  stance that raw SQL execution is admin-only). Once *any* admin/root session
+  opens a given record and its `save()` succeeds, that `uid` is registered
+  server-side permanently — after that, `runById(uid)` succeeds for *any* role,
+  because the query already exists.
+
+  **Symptom pattern that makes this hard to diagnose:** it does NOT look like a
+  permission wall. It looks like a flaky, record-specific bug:
+  - Fails inconsistently — works on some production records, not others.
+  - The dividing line is invisible: it's simply "has an admin opened this exact
+    record before" — nothing about the record itself differs.
+  - Admin/root testing alone will **never** reproduce it — you need a second,
+    non-admin session on a record admin has never touched.
+  - `runSql`'s standard `.catch(() => {})` / `.catch(() => [])` (§4.2) makes it
+    worse — the real error is swallowed, so it surfaces later as a generic
+    `Cannot read properties of null (reading 'sql')` or an empty-result fallback
+    ("No production record found") with no indication of *why*.
+
+  **Diagnostic test, if this resurfaces:** two browser sessions, one admin, one
+  target role, both incognito/separate profiles. Non-admin opens a *record
+  admin has never opened* → reproduce failure. Admin opens the same record once
+  → non-admin retries the same record → now succeeds. If that pattern holds,
+  this is the bug, not a race condition or a collection-permission gap (both of
+  which were incorrectly suspected first — see below).
+
+  **False leads to rule out first, in order, before landing on this:**
+  1. Collection-level CRUD permissions (Roles & Permissions → collection →
+     Configure permissions) — governs `ctx.api.resource()`, not `ctx.sql`.
+     Granting "All records" here does nothing for this bug.
+  2. `Promise.all`-ing multiple `runSql` calls — a real, separate bug (§3's
+     existing "concurrent dynamic-uid" bullet), but produces a *different*
+     symptom: intermittent failure regardless of role, not "always admin,
+     record-dependent for everyone else." Fixed independently by serializing
+     the loop — worth keeping fixed, but doesn't resolve this issue.
+  3. Session/uid collision between concurrent users on the same record — ruled
+     out because the fix (per-session uid tagging) wouldn't explain "works
+     forever once *any* admin has opened it."
+
+  **The only real fix: stop depending on `ctx.sql` for anything a non-admin
+  role needs to run.** Convert the query to `ctx.api.resource(collection).
+  get({filterByTk})` / `.list({filter, fields, sort, pageSize})`, which is
+  gated by ordinary collection View permissions (§ pattern above), not the
+  admin-only SQL execution path. For joins/aggregates the raw SQL used to do
+  (JOIN, GROUP BY, SUM), fetch each base collection's rows via a plain
+  `.list()` call, batch-fetch referenced-id lookups with `{$in: [...]}` (never
+  loop `.get()` per row — that's an N+1 anti-pattern), and do the join/
+  aggregation in JS. This is more verbose than one SQL statement but keeps the
+  feature usable by every role with the right collection permissions, with no
+  admin "warm-up" step required.
+
+  **Converted so far (2026-07):** `ui_production_material_detail.js` (all three
+  tabs — Details, Quantity, Track), `ui_material_out.js`. `loadCode`'s own
+  internal `source_code` lookup (in every `act_*.js` shell, per §3's `loadCode`
+  snippet above) was also converted to `ctx.api.resource('source_code')` —
+  **that snippet in this README is now stale**; see the fixed version in
+  `act_material_out.js` and mirror it in any other `act_*.js`/jblock that still
+  has the old raw-SQL `loadCode` body.
+
+  **NOT yet audited/converted — assume broken for non-admin roles until
+  checked:** `ui_production_edit.js`, `ui_prepare_fabric.js`,
+  `ui_list_engine.js`, `ui_record_nav.js`, all three importers
+  (`ui_import_material_details`, `ui_import_product_main_material`,
+  `ui_import_product_material`), `view_production_result`, `fn_fbads_data`
+  (and everything built on it — all 3 FB Ads jblocks). Any of these used by a
+  non-admin role should be tested with the diagnostic above before trusting
+  them in production.
 - **`document` is not freely available in all contexts** — only use it where already
   proven to work. The one proven pattern: CSV/PDF download via
   `document.createElement('a')` + `Blob` + `.click()` (used in the working CSV export
