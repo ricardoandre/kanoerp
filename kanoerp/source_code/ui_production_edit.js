@@ -6,23 +6,31 @@
 //   new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
 //
 // EXPORTS (contract):
-//   ProductionNewDrawer({ open, onClose, onCreated })
+//   ProductionNewDrawer({ open, onClose, onCreated, initialValues? })
 //       — self-contained "New Production" drawer. Self-fetches options.
 //         onCreated(newId) fires after a successful insert (production + variants;
 //         BOM/sample are written by the NocoBase workflow on insert).
+//         initialValues (optional): { product, konveksi, is_new, rol, variants }
+//         — pre-fills the form (used by openDuplicateDrawer). Omit for a blank form.
 //
 //   ProductionEditDrawer({ open, productionId, onClose, onSaved })
 //       — self-contained "Edit Production" drawer. Self-fetches options + the
 //         record for productionId (details, variants, materials). onSaved() fires
 //         after a successful update. zIndex 1100 so it sits above a detail drawer.
 //
-// Both resolve required belongsTo relations (product, konveksi, sku, production)
-// at runtime from the `fields` config and send nested associations, with raw-FK
-// fallback — fixes "X is required" 400s.
+//   openDuplicateDrawer(ctx, sourceId)
+//       — fetches source production's fields + variant ratios, then opens
+//         ProductionNewDrawer pre-filled so the user can edit before saving.
+//         Nothing is written until the user clicks Create. Used by
+//         act_duplicate_production.
+//
+// Both drawers resolve required belongsTo relations (product, konveksi, sku,
+// production) at runtime from the `fields` config and send nested
+// associations, with raw-FK fallback — fixes "X is required" 400s.
 //
 // Depends on: none.
 // =====================================================
-const { Drawer, Select, DatePicker, InputNumber, Switch, Spin, message } = antd;
+const { Drawer, Select, DatePicker, InputNumber, Switch, Spin, Modal, message } = antd;
 const ce = React.createElement;
 const { useState, useEffect, useRef } = React;
 
@@ -204,7 +212,23 @@ const ProductionNewDrawer = function(props) {
   const fb = useState(false); const busy = fb[0];      const setBusy = fb[1];
   const fe = useState({});    const errs = fe[0];      const setErrs = fe[1];
 
-  useEffect(function() { if (props.open) fetchOptions().then(setOpts).catch(() => {}); }, [props.open]);
+  // On open: fetch dropdown options, then apply initialValues (duplicate flow)
+  // if given, else leave whatever is currently in state (reset() handles the
+  // normal Add-button blank-slate case on close/submit, as before).
+  useEffect(function() {
+    if (!props.open) return;
+    fetchOptions().then(function(o) {
+      setOpts(o);
+      const iv = props.initialValues;
+      if (iv) {
+        setProduct(iv.product || null);
+        setIsNew(!!iv.is_new);
+        setKonveksi(iv.konveksi || null);
+        setRol(iv.rol != null ? iv.rol : null);
+        setVariants((iv.variants && iv.variants.length) ? iv.variants.map(function(v) { return { sku: v.sku, ratio: v.ratio }; }) : [{ sku: null, ratio: null }]);
+      }
+    }).catch(() => {});
+  }, [props.open]);
 
   function reset() { setProduct(null); setIsNew(false); setKonveksi(null); setRol(null); setVariants([{ sku: null, ratio: null }]); setErrs({}); }
   function setVar(i, key, val) { setVariants(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { [key]: val }) : r)); }
@@ -230,31 +254,38 @@ const ProductionNewDrawer = function(props) {
     }
   }
 
+  const formFields = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+    ce(EditStyles, null),
+    ce('div', null, fieldLabel('Product'),
+      ce(Select, { showSearch: true, status: errs.product ? 'error' : '', value: product, onChange: v => { setProduct(v); setErrs(p => Object.assign({}, p, { product: false })); }, style: { width: '100%' }, placeholder: 'Search code or name…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: (opts.prods || []).map(p => ({ value: p.code, label: (p.code || '') + ' — ' + (p.name || '') })) })),
+    ce('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, ce(Switch, { checked: isNew, onChange: setIsNew }), ce('span', { style: { fontSize: 13, color: '#374151' } }, 'Is new product')),
+    ce('div', null, fieldLabel('Konveksi'),
+      ce(Select, { showSearch: true, status: errs.konveksi ? 'error' : '', value: konveksi, onChange: v => { setKonveksi(v); setErrs(p => Object.assign({}, p, { konveksi: false })); }, style: { width: '100%' }, placeholder: 'Select konveksi…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: (opts.konvs || []).map(k => ({ value: k.code, label: k.name })) })),
+    ce('div', null, fieldLabel('Planning ROL'), ce(InputNumber, { status: errs.rol ? 'error' : '', value: rol, onChange: v => { setRol(v); setErrs(p => Object.assign({}, p, { rol: false })); }, style: { width: '100%' }, min: 0, placeholder: '0' })),
+    ce('div', null, ce('div', { style: { fontSize: 11, fontWeight: 600, color: errs.variants ? '#ef4444' : '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, 'Variants (sku + ratio)'),
+      ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+        variants.map((v, i) =>
+          ce('div', { key: i, style: { display: 'flex', gap: 8, alignItems: 'center' } },
+            ce(Select, { showSearch: true, value: v.sku, onChange: val => setVar(i, 'sku', val), style: { flex: 1 }, placeholder: 'SKU', filterOption: (inp, o) => String(o.label).toLowerCase().includes(inp.toLowerCase()), options: (opts.skus || []).map(s => ({ value: s.id, label: s.display })) }),
+            ce(InputNumber, { value: v.ratio, onChange: val => setVar(i, 'ratio', val), placeholder: 'ratio', min: 0, style: { width: 90 } }),
+            ce('button', { onClick: () => setVariants(prev => prev.filter((_, j) => j !== i)), style: { border: 'none', background: '#fef2f2', color: '#ef4444', borderRadius: 8, width: 30, height: 30, cursor: 'pointer', fontSize: 14 } }, '×'))),
+        ce('button', { onClick: () => setVariants(prev => prev.concat([{ sku: null, ratio: null }])), style: { border: '1px dashed #cbd5e1', background: '#f8fafc', color: '#475569', borderRadius: 8, padding: '6px 0', cursor: 'pointer', fontSize: 12, fontWeight: 600 } }, '+ Add variant'))));
+
+  const footerButtons = ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+    ce('button', { onClick: () => { reset(); props.onClose(); }, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
+    ce('button', { onClick: submit, disabled: busy, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 18px', fontSize: 13, fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 } }, busy ? 'Creating…' : 'Create'));
+
+  // inline=true → bare content for hosting inside Modal.confirm (duplicate flow).
+  // Same fields, same submit() — just no antd Drawer wrapper.
+  if (props.inline) {
+    return ce('div', { style: { padding: 4 } }, formFields, ce('div', { style: { marginTop: 16 } }, footerButtons));
+  }
+
   return ce(Drawer, {
     open: props.open, title: 'New Production', width: 480, placement: 'right', rootClassName: 'pe-new-drawer',
     onClose: () => { reset(); props.onClose(); },
-    footer: ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-      ce('button', { onClick: () => { reset(); props.onClose(); }, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
-      ce('button', { onClick: submit, disabled: busy, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 18px', fontSize: 13, fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 } }, busy ? 'Creating…' : 'Create')),
-  },
-    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
-      ce(EditStyles, null),
-      ce('div', null, fieldLabel('Product'),
-        ce(Select, { showSearch: true, status: errs.product ? 'error' : '', value: product, onChange: v => { setProduct(v); setErrs(p => Object.assign({}, p, { product: false })); }, style: { width: '100%' }, placeholder: 'Search code or name…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: (opts.prods || []).map(p => ({ value: p.code, label: (p.code || '') + ' — ' + (p.name || '') })) })),
-      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, ce(Switch, { checked: isNew, onChange: setIsNew }), ce('span', { style: { fontSize: 13, color: '#374151' } }, 'Is new product')),
-      ce('div', null, fieldLabel('Konveksi'),
-        ce(Select, { showSearch: true, status: errs.konveksi ? 'error' : '', value: konveksi, onChange: v => { setKonveksi(v); setErrs(p => Object.assign({}, p, { konveksi: false })); }, style: { width: '100%' }, placeholder: 'Select konveksi…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: (opts.konvs || []).map(k => ({ value: k.code, label: k.name })) })),
-      ce('div', null, fieldLabel('Planning ROL'), ce(InputNumber, { status: errs.rol ? 'error' : '', value: rol, onChange: v => { setRol(v); setErrs(p => Object.assign({}, p, { rol: false })); }, style: { width: '100%' }, min: 0, placeholder: '0' })),
-      ce('div', null, ce('div', { style: { fontSize: 11, fontWeight: 600, color: errs.variants ? '#ef4444' : '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, 'Variants (sku + ratio)'),
-        ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-          variants.map((v, i) =>
-            ce('div', { key: i, style: { display: 'flex', gap: 8, alignItems: 'center' } },
-              ce(Select, { showSearch: true, value: v.sku, onChange: val => setVar(i, 'sku', val), style: { flex: 1 }, placeholder: 'SKU', filterOption: (inp, o) => String(o.label).toLowerCase().includes(inp.toLowerCase()), options: (opts.skus || []).map(s => ({ value: s.id, label: s.display })) }),
-              ce(InputNumber, { value: v.ratio, onChange: val => setVar(i, 'ratio', val), placeholder: 'ratio', min: 0, style: { width: 90 } }),
-              ce('button', { onClick: () => setVariants(prev => prev.filter((_, j) => j !== i)), style: { border: 'none', background: '#fef2f2', color: '#ef4444', borderRadius: 8, width: 30, height: 30, cursor: 'pointer', fontSize: 14 } }, '×'))),
-          ce('button', { onClick: () => setVariants(prev => prev.concat([{ sku: null, ratio: null }])), style: { border: '1px dashed #cbd5e1', background: '#f8fafc', color: '#475569', borderRadius: 8, padding: '6px 0', cursor: 'pointer', fontSize: 12, fontWeight: 600 } }, '+ Add variant')))
-    )
-  );
+    footer: footerButtons,
+  }, formFields);
 };
 
 // =====================================================
@@ -376,4 +407,59 @@ const ProductionEditDrawer = function(props) {
   );
 };
 
-return { ProductionNewDrawer, ProductionEditDrawer };
+// =====================================================
+// DUPLICATE — fetch a source production's template fields (product,
+// konveksi, is_new, planning ROL, variant ratios) and open the New
+// Production form pre-filled, so the user edits before saving. Nothing is
+// written until Create is clicked — reuses createProduction, same as a
+// normal Add. NOT copied: remarks, marker, quantity/cut_quantity (actual run
+// figures), production_material (BOM), production_sample — BOM/sample are
+// regenerated fresh by the on-insert workflow, same as any new production.
+//
+// Hosted via Modal.confirm content — the same proven pattern already used
+// for the Material Out entry form (MaterialOutContent): a stateful React
+// element passed as `content`, own Cancel/Create buttons, closed with
+// Modal.destroyAll(). No portal/CSS tricks needed.
+// =====================================================
+function fetchDuplicateSource(sourceId) {
+  return Promise.all([
+    runSql('pe_dupsrc_' + sourceId, "SELECT fk_product_code, fk_konveksi_code, is_new, planning_rol FROM production WHERE id = '" + sourceId + "'"),
+    runSql('pe_dupqd_' + sourceId, "SELECT fk_sku_option_id AS sku_id, ratio FROM production_quantity_details WHERE fk_production_id = '" + sourceId + "' ORDER BY id ASC"),
+  ]).then(function(r) {
+    const rec = r[0][0];
+    if (!rec) throw new Error('Source production not found.');
+    return {
+      product: rec.fk_product_code,
+      konveksi: rec.fk_konveksi_code,
+      is_new: rec.is_new === true || String(rec.is_new) === 'true' || rec.is_new === 1,
+      rol: rec.planning_rol != null ? Number(rec.planning_rol) : null,
+      variants: (r[1] || []).map(function(q) { return { sku: q.sku_id, ratio: q.ratio }; }),
+    };
+  });
+}
+
+async function openDuplicateDrawer(hostCtx, sourceId) {
+  const initialValues = await fetchDuplicateSource(sourceId);
+  Modal.confirm({
+    title: 'Duplicate Production',
+    width: 480,
+    icon: null,
+    content: ce(ProductionNewDrawer, {
+      inline: true,
+      open: true,
+      initialValues: initialValues,
+      onClose: function() { Modal.destroyAll(); },
+      onCreated: function(newId) {
+        Modal.destroyAll();
+        hostCtx.message.success('Production duplicated — new id ' + newId + '.');
+        if (hostCtx.resource && hostCtx.resource.refresh) hostCtx.resource.refresh();
+      },
+    }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: false,
+    onCancel() {},
+  });
+}
+
+return { ProductionNewDrawer, ProductionEditDrawer, openDuplicateDrawer };
