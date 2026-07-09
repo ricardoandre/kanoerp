@@ -12,6 +12,20 @@
 // Downward-only: this is an fn_ module, does not depend on any other
 // source_code row. ui_fbads_controls (the sibling ui_ module) does not
 // depend on this one either — both are loaded independently by each jblock.
+//
+// NOTE (2026-07): all raw ctx.sql usage (fetchAccountList, fetchObjectiveMap,
+// fetchStatusMap, fetchTargetRules) converted to ctx.api.resource() —
+// ctx.sql.save() is admin/root-gated and silently fails for non-admin roles
+// (see README §3). This means every one of the 3 FB Ads jblocks that
+// consumes this module was broken for non-admin roles until now. Do not
+// revert to raw SQL.
+//
+// fetchAccountList's original SQL used SELECT DISTINCT, which the resource
+// API can't express directly — it now paginates the full `account` column
+// of campaigns_insights and dedupes in JS. If that table is large, this is
+// meaningfully more expensive than the original DISTINCT query; a
+// NocoBase-side distinct-accounts view/lookup table would be a better
+// long-term fix if this becomes a real cost — flagged, not yet built.
 // =====================================================
 
 // ── pure format/number helpers ──
@@ -22,18 +36,38 @@ function fmtPct(v) { return (num(v)).toFixed(2) + '%'; }
 function fmtRatio(v) { return (num(v)).toFixed(2); }
 function safeDiv(a, b) { return (num(b) > 0 ? num(a) / num(b) : 0); }
 
-// ── sql helpers ──
+// ── sql helpers (kept for callers that still build their own raw SQL — not
+// removed here since this module doesn't own those call sites) ──
 function sqlDate(d) { return d.format('YYYY-MM-DD'); }
 function sqlStr(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
 function sqlInList(values) { return values.map(sqlStr).join(','); }
 function uniqueUid(prefix) { return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
-// ctx explicit — see contract note above.
+// ctx explicit — see contract note above. Kept for backward compatibility
+// with any caller still using it directly, but no longer used internally
+// by this module's own fetch* functions below.
 function runSql(ctx, prefix, sql) {
   const uid = uniqueUid(prefix);
   return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
     .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
     .then(r => r || []);
+}
+
+// Paginates a ctx.api.resource(collection).list() call until a short page
+// comes back — used for full/near-full table scans that have no cheap
+// resource-API equivalent (e.g. DISTINCT).
+async function fetchAllRows(ctx, collection, opts) {
+  const pageSize = 500;
+  let page = 1;
+  let out = [];
+  while (true) {
+    const res = await ctx.api.resource(collection).list(Object.assign({}, opts, { page: page, pageSize: pageSize })).catch(() => null);
+    const rows = (res && res.data && res.data.data) || [];
+    out = out.concat(rows);
+    if (rows.length < pageSize) break;
+    page++;
+  }
+  return out;
 }
 
 const DEFAULT_ACCOUNT = 'ASKALABEL_SHOPEE';
@@ -46,10 +80,18 @@ function accountFilterSql(selectedAccount, columnExpr) {
   return ' AND ' + (columnExpr || 'account') + ' = ' + sqlStr(selectedAccount) + ' ';
 }
 
+// Converted from raw SELECT DISTINCT — see file header note on cost.
 function fetchAccountList(ctx) {
-  return runSql(ctx, 'fbads_account_list',
-    "SELECT DISTINCT account FROM campaigns_insights WHERE account IS NOT NULL AND account != '' ORDER BY account"
-  );
+  return fetchAllRows(ctx, 'campaigns_insights', { fields: ['account'] })
+    .then(function (rows) {
+      const set = {};
+      rows.forEach(function (r) {
+        const a = r.account;
+        if (a != null && a !== '') set[a] = true;
+      });
+      return Object.keys(set).sort().map(function (a) { return { account: a }; });
+    })
+    .catch(function () { return []; });
 }
 
 // =====================================================
@@ -175,10 +217,12 @@ function resolveObjective(objectiveKey, campaignName) {
 // not-yet-existing column, falls back to the name guess, no error.
 function fetchObjectiveMap(ctx, campaignIds) {
   if (!campaignIds.length) return Promise.resolve({});
-  return runSql(ctx, 'fbads_objkey',
-    "SELECT entity_id, objective_key FROM fb_ads_status " +
-    "WHERE entity_type = 'campaign' AND CAST(entity_id AS CHAR) IN (" + sqlInList(campaignIds) + ")"
-  ).then(function (rows) {
+  return ctx.api.resource('fb_ads_status').list({
+    filter: { entity_type: 'campaign', entity_id: { $in: campaignIds.map(String) } },
+    fields: ['entity_id', 'objective_key'],
+    pageSize: 500,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
     const map = {};
     rows.forEach(function (r) { map[r.entity_id] = r.objective_key; });
     return map;
@@ -190,10 +234,12 @@ function fetchObjectiveMap(ctx, campaignIds) {
 // those rather than guessing.
 function fetchStatusMap(ctx, level, ids) {
   if (!ids.length) return Promise.resolve({});
-  return runSql(ctx, 'fbads_status_' + level,
-    "SELECT entity_id, status FROM fb_ads_status " +
-    "WHERE entity_type = " + sqlStr(level) + " AND CAST(entity_id AS CHAR) IN (" + sqlInList(ids) + ")"
-  ).then(function (rows) {
+  return ctx.api.resource('fb_ads_status').list({
+    filter: { entity_type: level, entity_id: { $in: ids.map(String) } },
+    fields: ['entity_id', 'status'],
+    pageSize: 500,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
     const map = {};
     rows.forEach(function (r) { map[r.entity_id] = r.status; });
     return map;
@@ -215,23 +261,25 @@ const DEFAULT_TARGET_RULES = {
   cost_purchase: { target: 20000, direction: 'lt', countField: 'purchase' }, // used by Overview's Purchase table only
 };
 function fetchTargetRules(ctx) {
-  return runSql(ctx, 'fbads_targets', "SELECT metric_key, target_value, direction FROM fb_ads_target")
-    .then(function (rows) {
-      const merged = {};
-      Object.keys(DEFAULT_TARGET_RULES).forEach(function (k) { merged[k] = Object.assign({}, DEFAULT_TARGET_RULES[k]); });
-      rows.forEach(function (r) {
-        const key = r.metric_key;
-        if (!merged[key]) return;
-        const val = Number(r.target_value);
-        if (!isNaN(val)) merged[key].target = val;
-        if (r.direction === 'lt' || r.direction === 'gt') merged[key].direction = r.direction;
-        // countField intentionally NOT overridable from fb_ads_target — it's
-        // a fixed wiring detail (which raw count guards the metric), not a
-        // tunable business target.
-      });
-      return merged;
-    })
-    .catch(function () { return Object.assign({}, DEFAULT_TARGET_RULES); });
+  return ctx.api.resource('fb_ads_target').list({
+    fields: ['metric_key', 'target_value', 'direction'],
+    pageSize: 100,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
+    const merged = {};
+    Object.keys(DEFAULT_TARGET_RULES).forEach(function (k) { merged[k] = Object.assign({}, DEFAULT_TARGET_RULES[k]); });
+    rows.forEach(function (r) {
+      const key = r.metric_key;
+      if (!merged[key]) return;
+      const val = Number(r.target_value);
+      if (!isNaN(val)) merged[key].target = val;
+      if (r.direction === 'lt' || r.direction === 'gt') merged[key].direction = r.direction;
+      // countField intentionally NOT overridable from fb_ads_target — it's
+      // a fixed wiring detail (which raw count guards the metric), not a
+      // tunable business target.
+    });
+    return merged;
+  }).catch(function () { return Object.assign({}, DEFAULT_TARGET_RULES); });
 }
 
 // value: the already-computed metric (e.g. cost_atc for this row).
