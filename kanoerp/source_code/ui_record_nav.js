@@ -14,6 +14,10 @@
 //
 // Depends on: ui_production_detail, ui_production_material_detail, ui_production_edit.
 // (No cycles: the detail rows bubble cross-links via callbacks, never load this.)
+//
+// NOTE (2026-07): loadCode converted from raw ctx.sql to ctx.api.resource() —
+// ctx.sql.save() is admin/root-gated and silently fails per-record for other
+// roles (see README §3). Do not revert to raw SQL.
 // =====================================================
 const ce = React.createElement;
 const { useState, useEffect } = React;
@@ -22,14 +26,16 @@ const { Modal } = antd;
 const _codeCache = {};
 function loadCode(name) {
   if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
-  const uid = 'code_' + name;
-  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(rows => {
-      const src = (rows && rows[0] && rows[0].code) || '';
-      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
-      return _codeCache[name];
-    });
+  return ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
+    const src = (rows[0] && rows[0].code) || '';
+    _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+    return _codeCache[name];
+  });
 }
 
 const RecordNav = function(props) {
