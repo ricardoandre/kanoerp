@@ -40,16 +40,34 @@
 //   - (product_code, material_code) pair already exists
 //     in product_material                              -> skipped as duplicate
 //   - otherwise                                        -> created
+//
+// NOTE (2026-07): lookup queries (products/materials/existing pairs) converted
+// from raw ctx.sql to ctx.api.resource().list() — ctx.sql.save() is admin/root-
+// gated and silently fails for non-admin roles (see README §3). These lookups
+// pull whole tables with no WHERE clause, so a paginating fetchAllRows helper
+// was added to avoid silently truncating results past one page — a single
+// .list() call alone would cap at pageSize and could miss codes/pairs on
+// larger tables, breaking duplicate/existence detection. Do not revert to raw
+// SQL or drop the pagination loop.
 // =====================================================
-
 const { useState } = React;
 const { Modal, Upload, Button, Table, Alert, Progress } = antd;
 const ce = React.createElement;
 
-function runSql(ctx, uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []).catch(() => []);
+// Paginates through ctx.api.resource(collection).list() until a short page
+// comes back, so full-table lookups (no WHERE) don't silently truncate.
+async function fetchAllRows(ctx, collection, fields) {
+  const pageSize = 500;
+  let page = 1;
+  let out = [];
+  while (true) {
+    const res = await ctx.api.resource(collection).list({ fields: fields, page: page, pageSize: pageSize }).catch(() => null);
+    const rows = (res && res.data && res.data.data) || [];
+    out = out.concat(rows);
+    if (rows.length < pageSize) break;
+    page++;
+  }
+  return out;
 }
 
 // Reads the File object antd's Upload already handed us. Deliberately NOT
@@ -61,7 +79,6 @@ function readFileAsText(file) {
   if (file && typeof file.text === 'function') return file.text();
   return Promise.reject(new Error('Cannot read this file in this sandbox.'));
 }
-
 function splitDelimitedLine(line, delim) {
   const out = []; let cur = ''; let inQuotes = false;
   for (let i = 0; i < line.length; i++) {
@@ -76,7 +93,6 @@ function splitDelimitedLine(line, delim) {
   out.push(cur);
   return out;
 }
-
 function detectDelimiter(firstLine) {
   const cands = [',', ';', '\t'];
   let best = ',', bestCount = -1;
@@ -86,7 +102,6 @@ function detectDelimiter(firstLine) {
   });
   return best;
 }
-
 // Shared normalizer: raw = array of row-arrays (cells: product_code,
 // material_code, quantity). Skips a header row heuristically. Rows where
 // ALL THREE cells are blank are dropped silently (true blank rows); rows
@@ -110,16 +125,13 @@ function rowsFromCells(raw) {
   }
   return out;
 }
-
 function csvToCells(text) {
   const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '');
   if (!lines.length) return [];
   const delim = detectDelimiter(lines[0]);
   return lines.map(function (l) { return splitDelimitedLine(l, delim); });
 }
-
 function parseCsvRows(text) { return rowsFromCells(csvToCells(text)); }
-
 function ImportContent(props) {
   const ctx = props.ctx;
   const onSaved = props.onSaved;
@@ -136,13 +148,11 @@ function ImportContent(props) {
   const sRes = useState({ created: 0, errors: [] }); const results = sRes[0]; const setResults = sRes[1];
   const sBusy = useState(false); const busy = sBusy[0]; const setBusy = sBusy[1];
   const savedAnyRef = React.useRef(false);
-
   function reset() {
     setPhase('pick'); setErr(''); setRows([]);
     setToCreate([]); setDup([]); setNoProduct([]); setNoMaterial([]); setInvalid([]); setBlankSkipped(0);
     setProg({ done: 0, total: 0 }); setResults({ created: 0, errors: [] });
   }
-
   function handleFile(file) {
     setErr(''); setPhase('parsing'); setBusy(true);
     let parsed = [];
@@ -153,9 +163,9 @@ function ImportContent(props) {
         if (!parsed.length) throw new Error('No data rows found in the file.');
         setRows(parsed);
         return Promise.all([
-          runSql(ctx, 'ipm_products', 'SELECT code FROM product'),
-          runSql(ctx, 'ipm_materials', 'SELECT code FROM material_details'),
-          runSql(ctx, 'ipm_existing', 'SELECT fk_product_code, fk_material_details_code FROM product_material'),
+          fetchAllRows(ctx, 'product', ['code']),
+          fetchAllRows(ctx, 'material_details', ['code']),
+          fetchAllRows(ctx, 'product_material', ['fk_product_code', 'fk_material_details_code']),
         ]);
       })
       .then(function (results3) {
@@ -169,7 +179,6 @@ function ImportContent(props) {
           const key = String(e.fk_product_code).trim() + '||' + String(e.fk_material_details_code).trim();
           existingSet[key] = true;
         });
-
         const create = [], du = [], noProd = [], noMat = [], inv = [];
         let blanks = 0;
         parsed.forEach(function (row) {
@@ -200,7 +209,6 @@ function ImportContent(props) {
         setPhase('pick'); setBusy(false);
       });
   }
-
   async function runCreates() {
     setPhase('running'); setBusy(true);
     const total = toCreate.length;
@@ -223,13 +231,11 @@ function ImportContent(props) {
     setBusy(false); setPhase('done');
     if (created > 0) savedAnyRef.current = true;
   }
-
   function close() {
     if (busy) return;
     Modal.destroyAll();
     if (savedAnyRef.current) onSaved();
   }
-
   const createCols = [
     { title: 'Product Code', dataIndex: 'product_code', key: 'product_code' },
     { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
@@ -247,7 +253,6 @@ function ImportContent(props) {
     { title: 'Quantity', dataIndex: 'quantity_raw', key: 'quantity_raw' },
     { title: 'Reason', dataIndex: 'reason', key: 'reason' },
   ];
-
   if (phase === 'pick' || phase === 'parsing') {
     return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
       ce(Upload.Dragger, {
@@ -263,7 +268,6 @@ function ImportContent(props) {
       ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
         ce(Button, { onClick: close, disabled: phase === 'parsing' }, 'Cancel')));
   }
-
   if (phase === 'preview') {
     const summaryBits = [];
     summaryBits.push(toCreate.length + ' will be created');
@@ -272,7 +276,6 @@ function ImportContent(props) {
     if (noMaterial.length) summaryBits.push(noMaterial.length + ' material code(s) not found (skipped)');
     if (invalid.length) summaryBits.push(invalid.length + ' invalid row(s) (skipped)');
     if (blankSkipped) summaryBits.push(blankSkipped + ' blank row(s) ignored');
-
     return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
       ce(Alert, {
         type: (dup.length || noProduct.length || noMaterial.length || invalid.length) ? 'warning' : 'info', showIcon: true,
@@ -301,20 +304,17 @@ function ImportContent(props) {
           ce(Button, { type: 'primary', disabled: !toCreate.length, onClick: runCreates },
             'Run import — ' + toCreate.length + ' row(s)'))));
   }
-
   if (phase === 'running') {
     return ce('div', { style: { padding: '20px 0', textAlign: 'center' } },
       ce(Progress, { percent: prog.total ? Math.round((prog.done / prog.total) * 100) : 0 }),
       ce('div', { style: { marginTop: 8, color: '#6b7280', fontSize: 13 } }, 'Creating ' + prog.done + ' / ' + prog.total + '…'));
   }
-
   // done
   function statRow(label, value, color) {
     return ce('div', { style: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
       ce('span', { style: { color: '#475569' } }, label),
       ce('span', { style: { fontWeight: 600, color: color || '#111827' } }, value));
   }
-
   return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
     ce(Alert, {
       type: results.errors.length ? 'warning' : 'success', showIcon: true,
@@ -351,7 +351,6 @@ function ImportContent(props) {
     ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
       ce(Button, { type: 'primary', onClick: close }, 'Close')));
 }
-
 // ===== entry point: mirrors ui_material_out's openModal shell exactly =====
 function openModal(args) {
   const ctx = args.ctx;
@@ -368,5 +367,4 @@ function openModal(args) {
     onCancel() {},
   });
 }
-
 return { openModal };
