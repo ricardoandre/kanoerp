@@ -6,6 +6,14 @@
 // (ui_production_edit). Cross-record navigation (production → material and back)
 // is handled by the shared ui_record_nav host mounted at the view root: every
 // cross-link CLOSES the current drawer and opens the target (replace, no stack).
+//
+// NOTE (2026-07): all raw ctx.sql usage (loadCode, runSql, fetchList,
+// fetchListSummaries, fetchProductImages) converted to ctx.api.resource() —
+// ctx.sql.save() is admin/root-gated and silently fails for non-admin roles
+// (see README §3). This means the entire Production list — the main list
+// view, not just detail popups — was broken for non-admin roles until now.
+// Do not revert to raw SQL. fetchProductImages uses appends:['image'] in a
+// bulk .list() call instead of introspecting the `fields` metadata table.
 // =====================================================
 const { React, antd, dayjs } = ctx.libs;
 const { useState, useEffect } = React;
@@ -16,10 +24,13 @@ const ce = React.createElement;
 const _codeCache = {};
 async function loadCode(name) {
   if (_codeCache[name]) return _codeCache[name];
-  const uid = 'code_' + name;
-  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
-  const src = (rows && rows[0] && rows[0].code) || '';
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
   _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
   return _codeCache[name];
 }
@@ -42,11 +53,6 @@ const sBg    = v => (STATUS[String(v || '').toLowerCase()] || {}).bg    || '#f3f
 const sLabel = v => (STATUS[String(v || '').toLowerCase()] || {}).label || (v || '-');
 
 // ── helpers ──
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
-}
 const num = v => Number(v == null ? 0 : v);
 const doneColor = (val, ref) => (ref > 0 && val === ref) ? '#22c55e' : '#f97316';
 function fmtDate(d) { if (!d) return '—'; const p = dayjs(d); return p.isValid() ? p.format('DD MMM YYYY') : '—'; }
@@ -54,72 +60,167 @@ function daysLeft(d) { if (!d) return null; return Math.ceil((new Date(d) - new 
 
 // ── data layer ──
 function fetchList() {
-  return runSql('pjb_list_v1',
-    "SELECT production.id AS id, production.production_ref, production.status, " +
-    "  production.is_new, production.est_production_start, production.est_production_finish, production.created_at AS created_at, " +
-    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
-    "FROM production " +
-    "JOIN product  ON production.fk_product_code  = product.code " +
-    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
-    "ORDER BY production.created_at DESC"
-  );
+  return ctx.api.resource('production').list({
+    fields: ['id', 'production_ref', 'status', 'is_new', 'est_production_start', 'est_production_finish', 'created_at', 'fk_product_code', 'fk_konveksi_code'],
+    sort: ['-created_at'],
+    pageSize: 2000,
+  }).then(function (prodRes) {
+    const prodRows = (prodRes && prodRes.data && prodRes.data.data) || [];
+
+    const productCodes = [...new Set(prodRows.map(r => r.fk_product_code).filter(Boolean))];
+    const konveksiCodes = [...new Set(prodRows.map(r => r.fk_konveksi_code).filter(Boolean))];
+
+    const productP = productCodes.length
+      ? ctx.api.resource('product').list({ filter: { code: { $in: productCodes } }, fields: ['code', 'name'], pageSize: 2000 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+    const konveksiP = konveksiCodes.length
+      ? ctx.api.resource('konveksi').list({ filter: { code: { $in: konveksiCodes } }, fields: ['code', 'name'], pageSize: 2000 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+
+    return Promise.all([productP, konveksiP]).then(function (r) {
+      const productByCode = {}; r[0].forEach(p => { productByCode[p.code] = p; });
+      const konveksiByCode = {}; r[1].forEach(k => { konveksiByCode[k.code] = k; });
+
+      return prodRows.map(function (p) {
+        const product = productByCode[p.fk_product_code] || {};
+        const konveksi = konveksiByCode[p.fk_konveksi_code] || {};
+        return {
+          id: p.id,
+          production_ref: p.production_ref,
+          status: p.status,
+          is_new: p.is_new,
+          est_production_start: p.est_production_start,
+          est_production_finish: p.est_production_finish,
+          created_at: p.created_at,
+          product_code: product.code,
+          product_name: product.name,
+          konveksi_name: konveksi.name,
+        };
+      });
+    });
+  });
 }
+
 function fetchListSummaries(rows) {
   const ids = (rows || []).map(r => r.id);
   if (!ids.length) return Promise.resolve({});
-  const inList = ids.map(x => "'" + x + "'").join(',');
-  return Promise.all([
-    runSql('pjb_sum_doc',  "SELECT fk_production_id AS pid, COALESCE(SUM(quantity),0) AS do_q, COALESCE(SUM(cut_quantity),0) AS cut_q FROM production_quantity_details WHERE fk_production_id IN (" + inList + ") GROUP BY pid"),
-    runSql('pjb_sum_sent', "SELECT fk_production_id AS pid, COALESCE(SUM(quantity),0) AS sent_q FROM production_result WHERE fk_production_id IN (" + inList + ") GROUP BY pid"),
-    runSql('pjb_sum_qc',   "SELECT fk_production_id AS pid, COALESCE(SUM(quantity),0) AS qc_q FROM qc_result WHERE fk_production_id IN (" + inList + ") GROUP BY pid"),
-    runSql('pjb_sum_mat',
-      "SELECT pm.fk_production_id AS pid, pm.status AS status, raw_material.type AS mtype " +
-      "FROM production_material pm " +
-      "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
-      "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
-      "WHERE pm.fk_production_id IN (" + inList + ")"),
-    runSql('pjb_sum_samp', "SELECT fk_production_id AS pid, status FROM production_sample WHERE fk_production_id IN (" + inList + ")"),
-  ]).then(function(r) {
-    const map = {};
-    function grp() { return { total: 0, done: 0, rank: 99, status: null }; }
-    function ensure(pid) { pid = String(pid); if (!map[pid]) map[pid] = { do: 0, cut: 0, sent: 0, qc: 0, fabric: grp(), acc: grp(), sample: grp() }; return map[pid]; }
-    const rank = { planning: 0, po: 1, sent: 2, returned: 3, cancelled: 4 };
-    function applyStatus(g, status) {
-      g.total++;
-      const s = String(status || '').toLowerCase();
-      if (s === 'sent' || s === 'returned' || s === 'cancelled') g.done++;
-      const rk = rank[s] != null ? rank[s] : 0;
-      if (rk < g.rank) { g.rank = rk; g.status = s; }
-    }
-    (r[0] || []).forEach(x => { const m = ensure(x.pid); m.do = num(x.do_q); m.cut = num(x.cut_q); });
-    (r[1] || []).forEach(x => { const m = ensure(x.pid); m.sent = num(x.sent_q); });
-    (r[2] || []).forEach(x => { const m = ensure(x.pid); m.qc = num(x.qc_q); });
-    (r[3] || []).forEach(x => { const m = ensure(x.pid); applyStatus(String(x.mtype || '').toLowerCase() === 'fabric' ? m.fabric : m.acc, x.status); });
-    (r[4] || []).forEach(x => { const m = ensure(x.pid); applyStatus(m.sample, x.status); });
-    return map;
+
+  const doP = ctx.api.resource('production_quantity_details').list({
+    filter: { fk_production_id: { $in: ids } },
+    fields: ['fk_production_id', 'quantity', 'cut_quantity'],
+    pageSize: 5000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const sentP = ctx.api.resource('production_result').list({
+    filter: { fk_production_id: { $in: ids } },
+    fields: ['fk_production_id', 'quantity'],
+    pageSize: 5000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const qcP = ctx.api.resource('qc_result').list({
+    filter: { fk_production_id: { $in: ids } },
+    fields: ['fk_production_id', 'quantity'],
+    pageSize: 5000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const pmP = ctx.api.resource('production_material').list({
+    filter: { fk_production_id: { $in: ids } },
+    fields: ['id', 'fk_production_id', 'fk_material_details_code', 'status'],
+    pageSize: 5000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const sampleP = ctx.api.resource('production_sample').list({
+    filter: { fk_production_id: { $in: ids } },
+    fields: ['fk_production_id', 'status'],
+    pageSize: 5000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  return Promise.all([doP, sentP, qcP, pmP, sampleP]).then(function (r) {
+    const doRows = r[0], sentRows = r[1], qcRows = r[2], pmRows = r[3], sampleRows = r[4];
+
+    // batched material_details -> raw_material lookup for the pm rows'
+    // material types (fabric vs accessories), same pattern as other files
+    const materialCodes = [...new Set(pmRows.map(m => m.fk_material_details_code).filter(Boolean))];
+    const mdP = materialCodes.length
+      ? ctx.api.resource('material_details').list({ filter: { code: { $in: materialCodes } }, fields: ['code', 'fk_material_code'], pageSize: 2000 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+
+    return mdP.then(function (mdRows) {
+      const mdByCode = {}; mdRows.forEach(m => { mdByCode[m.code] = m; });
+      const rawCodes = [...new Set(mdRows.map(m => m.fk_material_code).filter(Boolean))];
+      const rmP = rawCodes.length
+        ? ctx.api.resource('raw_material').list({ filter: { code: { $in: rawCodes } }, fields: ['code', 'type'], pageSize: 2000 })
+            .then(res => (res && res.data && res.data.data) || [])
+        : Promise.resolve([]);
+
+      return rmP.then(function (rmRows) {
+        const rmByCode = {}; rmRows.forEach(rm => { rmByCode[rm.code] = rm; });
+
+        const map = {};
+        function grp() { return { total: 0, done: 0, rank: 99, status: null }; }
+        function ensure(pid) { pid = String(pid); if (!map[pid]) map[pid] = { do: 0, cut: 0, sent: 0, qc: 0, fabric: grp(), acc: grp(), sample: grp() }; return map[pid]; }
+        const rank = { planning: 0, po: 1, sent: 2, returned: 3, cancelled: 4 };
+        function applyStatus(g, status) {
+          g.total++;
+          const s = String(status || '').toLowerCase();
+          if (s === 'sent' || s === 'returned' || s === 'cancelled') g.done++;
+          const rk = rank[s] != null ? rank[s] : 0;
+          if (rk < g.rank) { g.rank = rk; g.status = s; }
+        }
+
+        const doSums = {}, cutSums = {};
+        doRows.forEach(function (x) {
+          const pid = String(x.fk_production_id);
+          doSums[pid] = (doSums[pid] || 0) + num(x.quantity);
+          cutSums[pid] = (cutSums[pid] || 0) + num(x.cut_quantity);
+        });
+        Object.keys(Object.assign({}, doSums, cutSums)).forEach(function (pid) {
+          const m = ensure(pid); m.do = doSums[pid] || 0; m.cut = cutSums[pid] || 0;
+        });
+
+        const sentSums = {};
+        sentRows.forEach(function (x) { const pid = String(x.fk_production_id); sentSums[pid] = (sentSums[pid] || 0) + num(x.quantity); });
+        Object.keys(sentSums).forEach(function (pid) { ensure(pid).sent = sentSums[pid]; });
+
+        const qcSums = {};
+        qcRows.forEach(function (x) { const pid = String(x.fk_production_id); qcSums[pid] = (qcSums[pid] || 0) + num(x.quantity); });
+        Object.keys(qcSums).forEach(function (pid) { ensure(pid).qc = qcSums[pid]; });
+
+        pmRows.forEach(function (x) {
+          const m = ensure(x.fk_production_id);
+          const md = mdByCode[x.fk_material_details_code];
+          const rm = md ? rmByCode[md.fk_material_code] : null;
+          const mtype = rm ? String(rm.type || '').toLowerCase() : '';
+          applyStatus(mtype === 'fabric' ? m.fabric : m.acc, x.status);
+        });
+
+        sampleRows.forEach(function (x) { applyStatus(ensure(x.fk_production_id).sample, x.status); });
+
+        return map;
+      });
+    });
   }).catch(() => ({}));
 }
+
 function fetchProductImages() {
-  return runSql('pjb_imgmeta',
-    "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'"
-  ).then(function(rows) {
-    if (!rows.length) return {};
-    let opt = {};
-    try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return {}; }
-    const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
-    if (!through || !fk || !ok) return {};
-    return runSql('pjb_imgjoin',
-      "SELECT product.code AS code, attachments.url AS url, attachments.filename AS filename " +
-      "FROM product " +
-      "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
-      "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
-      "ORDER BY attachments.id ASC"
-    ).then(function(irows) {
-      const map = {};
-      irows.forEach(function(r) { if (!map[r.code]) map[r.code] = r.url || (r.filename ? '/storage/uploads/' + r.filename : ''); });
-      return map;
+  return ctx.api.resource('product').list({
+    fields: ['code'],
+    appends: ['image'],
+    pageSize: 2000,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
+    const map = {};
+    rows.forEach(function (p) {
+      const img = p.image;
+      const imgRow = Array.isArray(img) ? img[0] : img;
+      if (!imgRow) return;
+      map[p.code] = imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
     });
-  }).catch(function() { return {}; });
+    return map;
+  }).catch(function () { return {}; });
 }
 
 // ── actions ──
@@ -338,6 +439,25 @@ const config = {
             return PF.openFabricModal(data, ids.length);
           });
         }).catch(function(e) { message.error('Failed: ' + ((e && e.message) || e)); });
+      } },
+    { label: '📋 Duplicate', bg: '#6366f1', color: '#fff', run: function(ids, helpers) {
+        if (ids.length !== 1) { message.warning('Select exactly one production to duplicate.'); return; }
+        const sourceId = ids[0];
+        Modal.confirm({
+          title: 'Duplicate this production?',
+          okText: 'Duplicate', cancelText: 'Cancel',
+          onOk: function() {
+            loadCode('ui_production_edit').then(function(PE) {
+              return PE.openDuplicateDrawer(sourceId, {
+                onCreated: function(newId) {
+                  helpers.exitSelect();
+                  if (helpers.reloadUntil) helpers.reloadUntil(newReadyPredicate(newId));
+                  else helpers.reload();
+                },
+              });
+            }).catch(function(e) { message.error('Duplicate failed: ' + ((e && e.message) || e)); });
+          },
+        });
       } },
     { label: '🗑 Delete', bg: '#ef4444', color: '#fff', run: function(ids, helpers) {
         Modal.confirm({ title: 'Delete ' + ids.length + ' production(s)?', content: 'This cannot be undone.', okText: 'Delete', okButtonProps: { danger: true },
