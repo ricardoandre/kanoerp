@@ -25,24 +25,18 @@
 //        selections: { [resultId]: productionId|null }.
 //
 // Depends on: none. (ctx is threaded as a param so the CALLER's ctx is always used.)
+//
+// NOTE (2026-07): all raw ctx.sql usage (fetchMatchData's runSql, applyMatches'
+// execSql) converted to ctx.api.resource() — ctx.sql.save() is admin/root-gated
+// and silently fails per-record for non-admin roles (see README §3). This
+// includes the write path: the original used raw UPDATE via ctx.sql exec, which
+// is now ctx.api.resource().update(), preserving the original's conditional
+// "only bump status if currently cutting/production" logic via a pre-check
+// fetch. Do not revert to raw SQL for either reads or writes.
 // =====================================================
 const { useState } = React;
 const { Modal } = antd;
 const ce = React.createElement;
-
-// ── SQL helpers (ctx threaded so import/bulk-add/native all share) ──
-async function runSql(ctx, uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }).then(r => r || []).catch(() => []);
-}
-async function execSql(ctx, uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'exec', dataSourceKey: 'main' }).catch(() => null);
-}
 
 function fmt(d) { return d ? String(d).substring(0, 10) : '-'; }
 
@@ -54,46 +48,112 @@ function fmt(d) { return d ? String(d).substring(0, 10) : '-'; }
 async function fetchMatchData(ctx, ids) {
   ids = (ids || []).filter(Boolean);
   if (!ids.length) return { resultRows: [], productionMap: {}, variantMap: {} };
-  const idList = ids.map(id => "'" + id + "'").join(',');
 
-  const resultRows = await runSql(ctx, 'pr_match_results',
-    "SELECT production_result.id, production_result.import_product_code, " +
-    "production_result.quantity, production_result.remarks, " +
-    "production_result.shipment_date, production_result.checking_pic, " +
-    "production_result.is_permakan, production_result.fk_production_id, " +
-    "production_result.fk_sku_option_id, " +
-    "sku_option.display AS sku_display, sku_option.sort AS sku_sort, " +
-    "product.name AS product_name " +
-    "FROM production_result " +
-    "LEFT JOIN sku_option ON production_result.fk_sku_option_id = sku_option.id " +
-    "LEFT JOIN product ON production_result.import_product_code = product.code " +
-    "WHERE production_result.id IN (" + idList + ") " +
-    "ORDER BY production_result.shipment_date, production_result.import_product_code, sku_option.sort"
-  );
+  // 1. base production_result rows
+  const prRes = await ctx.api.resource('production_result').list({
+    filter: { id: { $in: ids } },
+    fields: ['id', 'import_product_code', 'quantity', 'remarks', 'shipment_date', 'checking_pic', 'is_permakan', 'fk_production_id', 'fk_sku_option_id'],
+    pageSize: 500,
+  }).catch(() => null);
+  const rawRows = (prRes && prRes.data && prRes.data.data) || [];
 
-  const productCodes = [...new Set(resultRows.map(r => r.import_product_code).filter(Boolean))];
+  // 2. batched sku_option + product lookups (original LEFT JOINs)
+  const skuIds = [...new Set(rawRows.map(r => r.fk_sku_option_id).filter(x => x != null))];
+  const productCodes = [...new Set(rawRows.map(r => r.import_product_code).filter(Boolean))];
+
+  const skuP = skuIds.length
+    ? ctx.api.resource('sku_option').list({ filter: { id: { $in: skuIds } }, fields: ['id', 'display', 'sort'], pageSize: 500 })
+        .then(res => (res && res.data && res.data.data) || [])
+    : Promise.resolve([]);
+  const prodNameP = productCodes.length
+    ? ctx.api.resource('product').list({ filter: { code: { $in: productCodes } }, fields: ['code', 'name'], pageSize: 500 })
+        .then(res => (res && res.data && res.data.data) || [])
+    : Promise.resolve([]);
+
+  const lookups = await Promise.all([skuP, prodNameP]);
+  const skuById = {}; lookups[0].forEach(s => { skuById[s.id] = s; });
+  const productNameByCode = {}; lookups[1].forEach(p => { productNameByCode[p.code] = p.name; });
+
+  const resultRows = rawRows.map(function (r) {
+    const sku = skuById[r.fk_sku_option_id] || {};
+    return Object.assign({}, r, {
+      sku_display: sku.display,
+      sku_sort: sku.sort,
+      product_name: productNameByCode[r.import_product_code],
+    });
+  }).sort(function (a, b) {
+    const ds = String(a.shipment_date || '').localeCompare(String(b.shipment_date || ''));
+    if (ds !== 0) return ds;
+    const cs = String(a.import_product_code || '').localeCompare(String(b.import_product_code || ''));
+    if (cs !== 0) return cs;
+    return (a.sku_sort || 0) - (b.sku_sort || 0);
+  });
+
+  // 3. candidate productions per import_product_code — one batched query,
+  // grouped in JS instead of one query per code (avoids N+1 + the concurrent-
+  // ctx.sql-uid risk the original per-code loop would have had under §3).
   const productionMap = {};
-  for (const code of productCodes) {
-    productionMap[code] = await runSql(ctx, 'pr_match_prod_' + code,
-      "SELECT production.id, production.production_ref, production.status, " +
-      "production.est_production_start, production.est_production_finish, " +
-      "konveksi.name AS konveksi_name, konveksi.code AS konveksi_code, product.name AS product_name " +
-      "FROM production, konveksi, product " +
-      "WHERE production.fk_product_code = '" + code + "' " +
-      "AND production.status <> 'planning' AND production.status <> 'done' " +
-      "AND production.fk_konveksi_code = konveksi.code " +
-      "AND production.fk_product_code = product.code " +
-      "ORDER BY production.est_production_finish"
-    );
+  productCodes.forEach(function (code) { productionMap[code] = []; });
+
+  if (productCodes.length) {
+    const prodRes = await ctx.api.resource('production').list({
+      filter: {
+        fk_product_code: { $in: productCodes },
+        status: { $nin: ['planning', 'done'] },
+      },
+      fields: ['id', 'production_ref', 'status', 'est_production_start', 'est_production_finish', 'fk_product_code', 'fk_konveksi_code'],
+      sort: ['est_production_finish'],
+      pageSize: 1000,
+    }).catch(() => null);
+    const prodRows = (prodRes && prodRes.data && prodRes.data.data) || [];
+
+    const konveksiCodes = [...new Set(prodRows.map(p => p.fk_konveksi_code).filter(Boolean))];
+    const konveksiP = konveksiCodes.length
+      ? ctx.api.resource('konveksi').list({ filter: { code: { $in: konveksiCodes } }, fields: ['code', 'name'], pageSize: 500 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+    const prodNameP2 = ctx.api.resource('product').list({
+      filter: { code: { $in: [...new Set(prodRows.map(p => p.fk_product_code).filter(Boolean))] } },
+      fields: ['code', 'name'], pageSize: 500,
+    }).then(res => (res && res.data && res.data.data) || []).catch(() => []);
+
+    const r2 = await Promise.all([konveksiP, prodNameP2]);
+    const konveksiByCode = {}; r2[0].forEach(k => { konveksiByCode[k.code] = k; });
+    const prodNameByCode2 = {}; r2[1].forEach(p => { prodNameByCode2[p.code] = p.name; });
+
+    prodRows.forEach(function (p) {
+      const konv = konveksiByCode[p.fk_konveksi_code] || {};
+      const entry = {
+        id: p.id,
+        production_ref: p.production_ref,
+        status: p.status,
+        est_production_start: p.est_production_start,
+        est_production_finish: p.est_production_finish,
+        konveksi_name: konv.name,
+        konveksi_code: konv.code,
+        product_name: prodNameByCode2[p.fk_product_code],
+      };
+      if (!productionMap[p.fk_product_code]) productionMap[p.fk_product_code] = [];
+      productionMap[p.fk_product_code].push(entry);
+    });
   }
 
+  // 4. valid-variant sets per production id — batched, grouped in JS
   const allProductionIds = Object.values(productionMap).flat().map(p => p.id);
   const variantMap = {};
-  for (const prodId of allProductionIds) {
-    const rows = await runSql(ctx, 'pr_match_var_' + prodId,
-      "SELECT fk_sku_option_id FROM production_quantity_details WHERE fk_production_id = '" + prodId + "'"
-    );
-    variantMap[prodId] = new Set(rows.map(r => String(r.fk_sku_option_id)));
+  if (allProductionIds.length) {
+    const qdRes = await ctx.api.resource('production_quantity_details').list({
+      filter: { fk_production_id: { $in: allProductionIds } },
+      fields: ['fk_production_id', 'fk_sku_option_id'],
+      pageSize: 2000,
+    }).catch(() => null);
+    const qdRows = (qdRes && qdRes.data && qdRes.data.data) || [];
+    allProductionIds.forEach(function (pid) { variantMap[pid] = new Set(); });
+    qdRows.forEach(function (r) {
+      const key = r.fk_production_id;
+      if (!variantMap[key]) variantMap[key] = new Set();
+      variantMap[key].add(String(r.fk_sku_option_id));
+    });
   }
 
   return { resultRows, productionMap, variantMap };
@@ -101,21 +161,39 @@ async function fetchMatchData(ctx, ids) {
 
 // ─────────────────────────────────────────────────────
 // WRITE LAYER — link results + bump eligible productions to QC.
+// Uses ctx.api.resource().update() instead of raw UPDATE via ctx.sql exec.
+// The status bump preserves the original's conditional
+// "only if currently cutting/production" via a pre-check fetch, since the
+// resource API's update doesn't support a WHERE-on-current-value clause.
 // ─────────────────────────────────────────────────────
 async function applyMatches(ctx, selections) {
   const toUpdate = Object.entries(selections).filter(function (e) { return e[1] !== null && e[1] !== undefined; });
   let ok = 0;
   for (const pair of toUpdate) {
     const resultId = pair[0], prodId = pair[1];
-    const res = await execSql(ctx, 'pr_upd_' + resultId,
-      "UPDATE production_result SET fk_production_id = '" + prodId + "' WHERE id = '" + resultId + "'");
-    if (res !== null) ok++;
+    try {
+      await ctx.api.resource('production_result').update({
+        filterByTk: resultId,
+        values: { fk_production_id: prodId },
+      });
+      ok++;
+    } catch (e) { /* count as failed, matches original's null-on-failure behavior */ }
   }
+
   const uniqueProdIds = [...new Set(toUpdate.map(function (e) { return e[1]; }))];
   for (const prodId of uniqueProdIds) {
-    await execSql(ctx, 'pr_status_' + prodId,
-      "UPDATE production SET status = 'qc' WHERE id = '" + prodId + "' AND status IN ('cutting', 'production')");
+    try {
+      const curRes = await ctx.api.resource('production').get({ filterByTk: prodId, fields: ['status'] });
+      const curStatus = curRes && curRes.data && curRes.data.data && curRes.data.data.status;
+      if (curStatus === 'cutting' || curStatus === 'production') {
+        await ctx.api.resource('production').update({
+          filterByTk: prodId,
+          values: { status: 'qc' },
+        });
+      }
+    } catch (e) { /* leave status untouched on failure, same as original's silent no-op */ }
   }
+
   return { ok: ok, total: toUpdate.length };
 }
 
@@ -128,19 +206,15 @@ function MatcherContent(props) {
   const productionMap = props.productionMap || {};
   const variantMap = props.variantMap || {};
   const onDone = props.onDone;
-
   const initSelections = {};
   resultRows.forEach(function (r) {
     const options = productionMap[r.import_product_code] || [];
     initSelections[r.id] = options.length === 1 ? options[0].id : (r.fk_production_id || null);
   });
-
   const [selections, setSelections] = useState(initSelections);
   const [applying, setApplying] = useState(false);
   const [done, setDone] = useState(false);
-
   function handleClose() { Modal.destroyAll(); }
-
   function toggleSelection(resultId, productionId) {
     setSelections(function (prev) {
       const next = Object.assign({}, prev);
@@ -148,7 +222,6 @@ function MatcherContent(props) {
       return next;
     });
   }
-
   async function applyAll() {
     const hasAny = Object.values(selections).some(function (v) { return v !== null; });
     if (!hasAny) { ctx.message.warning('No matches selected.'); return; }
@@ -171,28 +244,23 @@ function MatcherContent(props) {
     }
     if (onDone) onDone();
   }
-
   const matchedCount = Object.values(selections).filter(function (v) { return v !== null; }).length;
   const unmatched = resultRows.length - matchedCount;
-
   const hasInvalidSelections = resultRows.some(function (row) {
     const selectedProdId = selections[row.id];
     if (!selectedProdId) return false;
     const validVariants = variantMap[selectedProdId] || new Set();
     return validVariants.size > 0 && !validVariants.has(String(row.fk_sku_option_id));
   });
-
   const th = { background: '#fafafa', borderBottom: '2px solid #e8e8e8', padding: '7px 8px', fontWeight: 600, textAlign: 'left', fontSize: 11, color: '#555' };
   const td = function (alt) { return { borderBottom: '1px solid #f0f0f0', padding: '8px', verticalAlign: 'top', fontSize: 12, background: alt ? '#fafafa' : '#fff' }; };
   const optBox = function (sel) { return { display: 'flex', alignItems: 'flex-start', gap: 6, padding: '5px 6px', borderRadius: 4, marginBottom: 4, border: sel ? '1px solid #86efac' : '1px solid #e8e8e8', cursor: 'pointer', background: sel ? '#f0fdf4' : '#fff' }; };
-
   if (!resultRows.length) {
     return ce('div', { style: { fontFamily: 'system-ui,sans-serif', padding: '12px 0' } },
       ce('div', { style: { color: '#f59e0b', marginBottom: 16, fontSize: 13 } }, '⚠ No production result records could be loaded for the selected rows.'),
       ce('div', { style: { display: 'flex', justifyContent: 'flex-end' } },
         ce('button', { onClick: handleClose, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Close')));
   }
-
   return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 12 } },
     ce('div', { style: { color: '#888', fontSize: 11, marginBottom: 12 } }, resultRows.length + ' result(s) · ' + matchedCount + ' matched · ' + unmatched + ' unmatched'),
     ce('div', { style: { overflowX: 'auto' } },
@@ -236,9 +304,9 @@ function MatcherContent(props) {
                           ce('div', { style: { fontSize: 10, color: '#888', marginTop: 1 } }, [opt.konveksi_name, opt.product_name, opt.status].filter(Boolean).join(' · ')),
                           (opt.est_production_start || opt.est_production_finish)
                             ? ce('div', { style: { fontSize: 10, color: '#aaa', marginTop: 1 } }, [opt.est_production_start ? 'start ' + fmt(opt.est_production_start) : null, opt.est_production_finish ? 'finish ' + fmt(opt.est_production_finish) : null].filter(Boolean).join(' → '))
-                            : null)));
+                            : null));
                     })));
-          }))),
+          })))),
     ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14, paddingTop: 10, borderTop: '1px solid #eee' } },
       ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
         ce('span', { style: { fontSize: 11, color: unmatched > 0 ? '#f59e0b' : '#22c55e' } }, unmatched > 0 ? ('⚠ ' + unmatched + ' not yet matched') : '✓ All matched'),
@@ -269,5 +337,4 @@ async function openMatchModal(args) {
     onCancel() {},
   });
 }
-
 return { openMatchModal, fetchMatchData, applyMatches };
