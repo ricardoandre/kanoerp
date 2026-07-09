@@ -1,5 +1,5 @@
 // =====================================================
-// kano_listview.js  —  config-driven list-view ENGINE
+// ui_list_engine.js  —  config-driven list-view ENGINE
 //
 // Store as a `source_code` row named 'kano_listview'.
 // Load + use from any view:
