@@ -22,14 +22,18 @@ const { Modal } = ctx.libs.antd;
 // Step 1: plain yes/no, no details.
 Modal.confirm({
   title: 'Duplicate this production?',
-  content: 'A pre-filled New Production form will open so you can review and edit before saving.',
   okText: 'Duplicate',
   cancelText: 'Cancel',
   onOk: function () {
     // don't return this promise — let the confirm dialog close immediately,
     // then open step 2 asynchronously.
     loadCode(ctx, 'ui_production_edit').then(function (PE) {
-      return PE.openDuplicateDrawer(ctx, sourceId);
+      return PE.openDuplicateDrawer(sourceId, {
+  onCreated: function(newId) {
+    ctx.message.success('Production duplicated — new id ' + newId + '.');
+    if (ctx.resource?.refresh) ctx.resource.refresh();
+  },
+});
     }).catch(function (e) {
       ctx.message.error('Duplicate failed: ' + ((e && e.message) || e));
     });
