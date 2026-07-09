@@ -42,16 +42,34 @@
 //     explicitly opts in per row before anything gets overwritten.
 //
 // Depends on: none.
+//
+// NOTE (2026-07): the product-table lookup converted from raw ctx.sql to
+// ctx.api.resource().list() via a paginating fetchAllRows helper — ctx.sql.
+// save() is admin/root-gated and silently fails for non-admin roles (see
+// README §3). The lookup pulls the whole `product` table with no WHERE, so
+// pagination matters here for the same reason as ui_import_product_material —
+// a single .list() call would cap at pageSize and could miss codes on larger
+// tables, silently breaking conflict/no-op detection. Do not revert to raw
+// SQL or drop the pagination loop.
 // =====================================================
-
 const { useState } = React;
 const { Modal, Upload, Button, Table, Alert, Progress } = antd;
 const ce = React.createElement;
 
-function runSql(ctx, uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []).catch(() => []);
+// Paginates through ctx.api.resource(collection).list() until a short page
+// comes back, so full-table lookups (no WHERE) don't silently truncate.
+async function fetchAllRows(ctx, collection, fields) {
+  const pageSize = 500;
+  let page = 1;
+  let out = [];
+  while (true) {
+    const res = await ctx.api.resource(collection).list({ fields: fields, page: page, pageSize: pageSize }).catch(() => null);
+    const rows = (res && res.data && res.data.data) || [];
+    out = out.concat(rows);
+    if (rows.length < pageSize) break;
+    page++;
+  }
+  return out;
 }
 
 // Reads the File object antd's Upload already handed us. Deliberately NOT
@@ -63,7 +81,6 @@ function readFileAsText(file) {
   if (file && typeof file.text === 'function') return file.text();
   return Promise.reject(new Error('Cannot read this file in this sandbox.'));
 }
-
 function splitDelimitedLine(line, delim) {
   const out = []; let cur = ''; let inQuotes = false;
   for (let i = 0; i < line.length; i++) {
@@ -78,7 +95,6 @@ function splitDelimitedLine(line, delim) {
   out.push(cur);
   return out;
 }
-
 function detectDelimiter(firstLine) {
   const cands = [',', ';', '\t'];
   let best = ',', bestCount = -1;
@@ -88,7 +104,6 @@ function detectDelimiter(firstLine) {
   });
   return best;
 }
-
 // Shared normalizer: raw = array of row-arrays (cells). Skips a header row
 // heuristically (col A === 'code' or col B looks like 'material_code'). Rows
 // where BOTH cells are blank are dropped; a row with code but blank
@@ -109,16 +124,13 @@ function rowsFromCells(raw) {
   }
   return out;
 }
-
 function csvToCells(text) {
   const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '');
   if (!lines.length) return [];
   const delim = detectDelimiter(lines[0]);
   return lines.map(function (l) { return splitDelimitedLine(l, delim); });
 }
-
 function parseCsvRows(text) { return rowsFromCells(csvToCells(text)); }
-
 function ImportContent(props) {
   const ctx = props.ctx;
   const onSaved = props.onSaved;
@@ -135,13 +147,11 @@ function ImportContent(props) {
   const sRes = useState({ updated: 0, created: 0, errors: [] }); const results = sRes[0]; const setResults = sRes[1];
   const sBusy = useState(false); const busy = sBusy[0]; const setBusy = sBusy[1];
   const savedAnyRef = React.useRef(false);
-
   function reset() {
     setPhase('pick'); setErr(''); setRows([]);
     setFresh([]); setConflicts([]); setSelectedConflicts([]); setNoop([]); setToCreateNew([]); setBlankSkipped(0);
     setProg({ done: 0, total: 0 }); setResults({ updated: 0, created: 0, errors: [] });
   }
-
   function handleFile(file) {
     setErr(''); setPhase('parsing'); setBusy(true);
     let parsed = [];
@@ -151,7 +161,7 @@ function ImportContent(props) {
         parsed = parseCsvRows(text);
         if (!parsed.length) throw new Error('No data rows found in the file.');
         setRows(parsed);
-        return runSql(ctx, 'imc_prod_codes', 'SELECT code, fk_main_fabric_code FROM product');
+        return fetchAllRows(ctx, 'product', ['code', 'fk_main_fabric_code']);
       })
       .then(function (prodRows) {
         const current = {};
@@ -176,7 +186,6 @@ function ImportContent(props) {
         setPhase('pick'); setBusy(false);
       });
   }
-
   async function runUpdates() {
     const selectedSet = {};
     selectedConflicts.forEach(function (k) { selectedSet[k] = true; });
@@ -216,13 +225,11 @@ function ImportContent(props) {
     setBusy(false); setPhase('done');
     if (updated > 0 || created > 0) savedAnyRef.current = true;
   }
-
   function close() {
     if (busy) return;
     Modal.destroyAll();
     if (savedAnyRef.current) onSaved();
   }
-
   const freshCols = [
     { title: 'Code', dataIndex: 'code', key: 'code' },
     { title: 'New Material Code', dataIndex: 'material_code', key: 'material_code' },
@@ -236,7 +243,6 @@ function ImportContent(props) {
     { title: 'Code (new product)', dataIndex: 'code', key: 'code' },
     { title: 'Material Code', dataIndex: 'material_code', key: 'material_code' },
   ];
-
   if (phase === 'pick' || phase === 'parsing') {
     return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
       ce(Upload.Dragger, {
@@ -252,7 +258,6 @@ function ImportContent(props) {
       ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
         ce(Button, { onClick: close, disabled: phase === 'parsing' }, 'Cancel')));
   }
-
   if (phase === 'preview') {
     const runCount = fresh.length + selectedConflicts.length + toCreateNew.length;
     const summaryBits = [];
@@ -261,7 +266,6 @@ function ImportContent(props) {
     if (noop.length) summaryBits.push(noop.length + ' already correct (skipped)');
     if (conflicts.length) summaryBits.push(conflicts.length + ' conflict(s) — pick which to overwrite below');
     if (blankSkipped) summaryBits.push(blankSkipped + ' blank row(s) ignored');
-
     return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
       ce(Alert, {
         type: conflicts.length ? 'warning' : 'info', showIcon: true,
@@ -290,23 +294,19 @@ function ImportContent(props) {
           ce(Button, { type: 'primary', disabled: !runCount, onClick: runUpdates },
             'Run import — ' + runCount + ' row(s)'))));
   }
-
   if (phase === 'running') {
     return ce('div', { style: { padding: '20px 0', textAlign: 'center' } },
       ce(Progress, { percent: prog.total ? Math.round((prog.done / prog.total) * 100) : 0 }),
       ce('div', { style: { marginTop: 8, color: '#6b7280', fontSize: 13 } }, 'Updating ' + prog.done + ' / ' + prog.total + '…'));
   }
-
   // done
   const totalAttempted = fresh.length + selectedConflicts.length + toCreateNew.length;
   const unresolvedConflicts = conflicts.filter(function (row) { return selectedConflicts.indexOf(row.row) === -1; });
-
   function statRow(label, value, color) {
     return ce('div', { style: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
       ce('span', { style: { color: '#475569' } }, label),
       ce('span', { style: { fontWeight: 600, color: color || '#111827' } }, value));
   }
-
   return ce('div', { style: { fontFamily: 'system-ui,sans-serif' } },
     ce(Alert, {
       type: results.errors.length ? 'warning' : 'success', showIcon: true,
@@ -337,7 +337,6 @@ function ImportContent(props) {
     ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 } },
       ce(Button, { type: 'primary', onClick: close }, 'Close')));
 }
-
 // ===== entry point: mirrors ui_material_out's openModal shell exactly =====
 function openModal(args) {
   const ctx = args.ctx;
@@ -354,5 +353,4 @@ function openModal(args) {
     onCancel() {},
   });
 }
-
 return { openModal };
