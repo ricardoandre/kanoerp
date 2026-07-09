@@ -24,6 +24,18 @@
 // NOTE: status colors live HERE (the detail is now self-contained); each list
 // view still keeps its own card status colors. Slight duplication is intended
 // per the "status stays in the view" philosophy — the detail simply owns its.
+//
+// NOTE (2026-07): all raw ctx.sql usage (loadCode + every fetch* function)
+// converted to ctx.api.resource() — ctx.sql.save() is admin/root-gated and
+// silently fails per-record for non-admin roles (see README §3). Do not
+// revert to raw SQL. fetchProductImage uses appends:['image'] instead of
+// introspecting the `fields` metadata table by hand. fetchMaterial's ledger
+// lookups are now batched via {$in:[...]} instead of a Promise.all-per-row
+// loop, which also removes a concurrent-ctx.sql-uid collision risk (§3) —
+// moot now since ctx.api.resource doesn't use that uid mechanism, but noted
+// in case this pattern gets copied elsewhere. fetchHistory assumes a
+// `history` collection with fk_user_id — verify against the schema dump
+// (§4.1) since this wasn't independently confirmed.
 // =====================================================
 const { Drawer, Dropdown, Spin } = antd;
 const ce = React.createElement;
@@ -47,21 +59,18 @@ const sLabel = v => (STATUS[String(v || '').toLowerCase()] || {}).label || (v ||
 const _codeCache = {};
 function loadCode(name) {
   if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
-  const uid = 'code_' + name;
-  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(rows => {
-      const src = (rows && rows[0] && rows[0].code) || '';
-      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
-      return _codeCache[name];
-    });
+  return ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  }).then(function (res) {
+    const rows = (res && res.data && res.data.data) || [];
+    const src = (rows[0] && rows[0].code) || '';
+    _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+    return _codeCache[name];
+  });
 }
 
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
-}
 const num = v => Number(v == null ? 0 : v);
 const diffColor = v => v < 0 ? '#ef4444' : v > 0 ? '#22c55e' : '#9ca3af';
 const diffLabel = v => v > 0 ? '+' + v : String(v);
@@ -146,118 +155,253 @@ const DetailStyles = () => ce('style', null, DETAIL_CSS);
 // DATA LAYER (all keyed by productionId)
 // =====================================================
 function fetchHeader(id) {
-  return runSql('pd_hdr_' + id,
-    "SELECT production.id AS id, production.production_ref, production.status, production.is_new, " +
-    "  production.est_production_start, production.est_production_finish, " +
-    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
-    "FROM production " +
-    "JOIN product  ON production.fk_product_code  = product.code " +
-    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
-    "WHERE production.id = '" + id + "'"
-  ).then(r => r[0] || {});
+  return ctx.api.resource('production').get({
+    filterByTk: id,
+    fields: ['id', 'production_ref', 'status', 'is_new', 'est_production_start', 'est_production_finish', 'fk_product_code', 'fk_konveksi_code'],
+  }).then(function (prodRes) {
+    const prod = prodRes && prodRes.data && prodRes.data.data;
+    if (!prod) return {};
+
+    return Promise.all([
+      prod.fk_product_code ? ctx.api.resource('product').get({ filterByTk: prod.fk_product_code, fields: ['code', 'name'] }).catch(() => null) : Promise.resolve(null),
+      prod.fk_konveksi_code ? ctx.api.resource('konveksi').get({ filterByTk: prod.fk_konveksi_code, fields: ['name'] }).catch(() => null) : Promise.resolve(null),
+    ]).then(function (r) {
+      const product = (r[0] && r[0].data && r[0].data.data) || {};
+      const konveksi = (r[1] && r[1].data && r[1].data.data) || {};
+      return {
+        id: prod.id,
+        production_ref: prod.production_ref,
+        status: prod.status,
+        is_new: prod.is_new,
+        est_production_start: prod.est_production_start,
+        est_production_finish: prod.est_production_finish,
+        product_code: product.code,
+        product_name: product.name,
+        konveksi_name: konveksi.name,
+      };
+    });
+  }).catch(() => ({}));
 }
 
-// image: attachment fields aren't SQL columns. Introspect product.image's
-// through-table + keys from `fields`, then join `attachments` for one product.
+// image: attachment fields aren't SQL columns. Uses appends (README §4's
+// documented path) instead of introspecting `fields` metadata by hand.
 function fetchProductImage(productCode) {
   if (!productCode) return Promise.resolve('');
-  return runSql('pd_imgmeta',
-    "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'"
-  ).then(function(rows) {
-    if (!rows.length) return '';
-    let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return ''; }
-    const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
-    if (!through || !fk || !ok) return '';
-    return runSql('pd_imgjoin_' + productCode,
-      "SELECT attachments.url AS url, attachments.filename AS filename FROM product " +
-      "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
-      "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
-      "WHERE product.code = '" + productCode + "' ORDER BY attachments.id ASC LIMIT 1"
-    ).then(function(irows) { const r = irows[0]; return r ? (r.url || (r.filename ? '/storage/uploads/' + r.filename : '')) : ''; });
+  return ctx.api.resource('product').get({
+    filterByTk: productCode,
+    appends: ['image'],
+  }).then(function (res) {
+    const product = res && res.data && res.data.data;
+    const img = product && product.image;
+    const imgRow = Array.isArray(img) ? img[0] : img;
+    if (!imgRow) return '';
+    return imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
   }).catch(() => '');
 }
 
 function fetchDetailMeta(id) {
-  return runSql('pd_dmeta_' + id, "SELECT remarks, marker, planning_rol, brand FROM production WHERE id = '" + id + "'").then(r => r[0] || {});
+  return ctx.api.resource('production').get({
+    filterByTk: id,
+    fields: ['remarks', 'marker', 'planning_rol', 'brand'],
+  }).then(res => (res && res.data && res.data.data) || {}).catch(() => ({}));
 }
 
 function fetchMaterial(id) {
-  return Promise.all([
-    runSql('pd_dmeta2_' + id, "SELECT planning_rol FROM production WHERE id = '" + id + "'"),
-    runSql('pd_dmat_' + id,
-      "SELECT pm.id AS id, pm.fk_material_details_code AS material_code, " +
-      "  pm.status AS status, pm.shipment_date AS shipment_date, pm.quantity_need AS quantity_need, " +
-      "  raw_material.type AS material_type, raw_material.default_content AS default_content " +
-      "FROM production_material pm " +
-      "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
-      "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
-      "WHERE pm.fk_production_id = '" + id + "'"),
-    runSql('pd_dsamp_' + id, "SELECT fk_sample_product_code, status, shipment_date, returned_date FROM production_sample WHERE fk_production_id = '" + id + "'"),
-    runSql('pd_ddo_' + id, "SELECT COALESCE(SUM(quantity),0) AS total_do FROM production_quantity_details WHERE fk_production_id = '" + id + "'"),
-  ]).then(function(meta) {
-    const planningRol = num(meta[0] && meta[0][0] && meta[0][0].planning_rol);
-    const materialRows = meta[1] || [];
-    const samples = meta[2] || [];
-    const totalDo = num(meta[3] && meta[3][0] && meta[3][0].total_do);
-    const fabrics = materialRows.filter(m => String(m.material_type || '').toLowerCase() === 'fabric');
-    const accs    = materialRows.filter(m => String(m.material_type || '').toLowerCase() !== 'fabric');
+  return ctx.api.resource('production').get({ filterByTk: id, fields: ['planning_rol'] })
+    .then(res => num(res && res.data && res.data.data && res.data.data.planning_rol))
+    .then(function (planningRol) {
 
-    function withDetails(rows) {
-      return Promise.all(rows.map(function(m) {
-        return runSql('pd_dlhdr_' + m.id, "SELECT id FROM material_ledger WHERE fk_production_material_id = '" + m.id + "'").then(function(hdr) {
-          const ids = hdr.map(h => h.id).filter(Boolean);
-          if (!ids.length) return Object.assign({}, m, { details: [] });
-          return runSql('pd_dldet_' + m.id, "SELECT details FROM material_ledger_details WHERE fk_material_ledger_id IN (" + ids.join(',') + ")")
-            .then(det => Object.assign({}, m, { details: det.map(d => d.details) }));
+      return ctx.api.resource('production_material').list({
+        filter: { fk_production_id: id },
+        fields: ['id', 'fk_material_details_code', 'status', 'shipment_date', 'quantity_need'],
+        pageSize: 500,
+      }).then(function (pmRes) {
+        const pmRows = (pmRes && pmRes.data && pmRes.data.data) || [];
+
+        const materialCodes = [...new Set(pmRows.map(m => m.fk_material_details_code).filter(Boolean))];
+        const mdP = materialCodes.length
+          ? ctx.api.resource('material_details').list({ filter: { code: { $in: materialCodes } }, fields: ['code', 'fk_material_code'], pageSize: 500 })
+              .then(res => (res && res.data && res.data.data) || [])
+          : Promise.resolve([]);
+
+        return mdP.then(function (mdRows) {
+          const mdByCode = {}; mdRows.forEach(m => { mdByCode[m.code] = m; });
+
+          const rawCodes = [...new Set(mdRows.map(m => m.fk_material_code).filter(Boolean))];
+          const rmP = rawCodes.length
+            ? ctx.api.resource('raw_material').list({ filter: { code: { $in: rawCodes } }, fields: ['code', 'type', 'default_content'], pageSize: 500 })
+                .then(res => (res && res.data && res.data.data) || [])
+            : Promise.resolve([]);
+
+          return rmP.then(function (rmRows) {
+            const rmByCode = {}; rmRows.forEach(r => { rmByCode[r.code] = r; });
+
+            // Original used INNER JOINs (material_details, raw_material) — a
+            // pm row that doesn't fully resolve is dropped, same behavior.
+            const materialRows = pmRows.map(function (m) {
+              const md = mdByCode[m.fk_material_details_code];
+              if (!md) return null;
+              const rm = rmByCode[md.fk_material_code];
+              if (!rm) return null;
+              return {
+                id: m.id,
+                material_code: m.fk_material_details_code,
+                status: m.status,
+                shipment_date: m.shipment_date,
+                quantity_need: m.quantity_need,
+                material_type: rm.type,
+                default_content: rm.default_content,
+              };
+            }).filter(Boolean);
+
+            const samplesP = ctx.api.resource('production_sample').list({
+              filter: { fk_production_id: id },
+              fields: ['fk_sample_product_code', 'status', 'shipment_date', 'returned_date'],
+              pageSize: 200,
+            }).then(res => (res && res.data && res.data.data) || []);
+
+            const totalDoP = ctx.api.resource('production_quantity_details').list({
+              filter: { fk_production_id: id },
+              fields: ['quantity'],
+              pageSize: 1000,
+            }).then(res => ((res && res.data && res.data.data) || []).reduce((s, r) => s + (Number(r.quantity) || 0), 0));
+
+            const allPmIds = materialRows.map(m => m.id);
+            const ledgerP = allPmIds.length
+              ? ctx.api.resource('material_ledger').list({
+                  filter: { fk_production_material_id: { $in: allPmIds } },
+                  fields: ['id', 'fk_production_material_id'],
+                  pageSize: 1000,
+                }).then(res => (res && res.data && res.data.data) || [])
+              : Promise.resolve([]);
+
+            return Promise.all([samplesP, totalDoP, ledgerP]).then(function (r2) {
+              const samples = r2[0], totalDo = r2[1], ledgerRows = r2[2];
+
+              const ledgerIdsByPm = {};
+              ledgerRows.forEach(function (l) {
+                const key = String(l.fk_production_material_id);
+                (ledgerIdsByPm[key] = ledgerIdsByPm[key] || []).push(l.id);
+              });
+
+              const allLedgerIds = ledgerRows.map(l => l.id).filter(Boolean);
+              const ledgerDetailP = allLedgerIds.length
+                ? ctx.api.resource('material_ledger_details').list({
+                    filter: { fk_material_ledger_id: { $in: allLedgerIds } },
+                    fields: ['details', 'fk_material_ledger_id'],
+                    pageSize: 2000,
+                  }).then(res => (res && res.data && res.data.data) || [])
+                : Promise.resolve([]);
+
+              return ledgerDetailP.then(function (ledgerDetailRows) {
+                const detailsByLedgerId = {};
+                ledgerDetailRows.forEach(function (d) {
+                  const key = String(d.fk_material_ledger_id);
+                  (detailsByLedgerId[key] = detailsByLedgerId[key] || []).push(d.details);
+                });
+
+                function detailsForPm(pmId) {
+                  const lIds = ledgerIdsByPm[String(pmId)] || [];
+                  let out = [];
+                  lIds.forEach(function (lid) { out = out.concat(detailsByLedgerId[String(lid)] || []); });
+                  return out;
+                }
+
+                const fabrics = materialRows.filter(m => String(m.material_type || '').toLowerCase() === 'fabric')
+                  .map(m => Object.assign({}, m, { details: detailsForPm(m.id) }));
+                const accessories = materialRows.filter(m => String(m.material_type || '').toLowerCase() !== 'fabric')
+                  .map(m => Object.assign({}, m, { details: detailsForPm(m.id) }));
+
+                return { fabrics: fabrics, accessories: accessories, samples: samples, totalDo: totalDo, planningRol: planningRol };
+              });
+            });
+          });
         });
-      }));
-    }
-
-    return Promise.all([withDetails(fabrics), withDetails(accs)]).then(function(r) {
-      return { fabrics: r[0], accessories: r[1], samples: samples, totalDo: totalDo, planningRol: planningRol };
+      });
     });
-  });
 }
 
 function fetchQuantity(id) {
-  const sqlBase =
-    "SELECT sku_option.id AS sku_id, sku_option.display AS variant, pqd.ratio AS ratio, pqd.quantity AS do_quantity, pqd.cut_quantity AS cut_quantity " +
-    "FROM production_quantity_details AS pqd, sku_option " +
-    "WHERE pqd.fk_production_id = '" + id + "' AND pqd.fk_sku_option_id = sku_option.id ORDER BY sku_option.sort ASC";
-  const sqlSent = "SELECT fk_sku_option_id, COALESCE(SUM(quantity),0) AS sent_qty FROM production_result WHERE fk_production_id = '" + id + "' GROUP BY fk_sku_option_id";
-  const sqlQc   = "SELECT fk_sku_option_id, COALESCE(SUM(quantity),0) AS qc_qty FROM qc_result WHERE fk_production_id = '" + id + "' GROUP BY fk_sku_option_id";
-  const sqlPerm = "SELECT SUM(CASE WHEN quantity<0 THEN quantity*-1 ELSE 0 END) AS sent_permakan, SUM(CASE WHEN quantity>0 THEN quantity ELSE 0 END) AS return_permakan FROM production_result WHERE fk_production_id = '" + id + "' AND is_permakan = TRUE";
-  const sqlHistDel =
-    "SELECT production_result.shipment_date AS event_date, production_result.checking_pic, production_result.quantity, production_result.is_permakan, production_result.remarks, production_result.fk_sku_option_id, sku_option.display AS variant " +
-    "FROM production_result, sku_option WHERE production_result.fk_production_id = '" + id + "' AND production_result.fk_sku_option_id = sku_option.id ORDER BY production_result.shipment_date ASC";
-  const sqlHistQc =
-    "SELECT qc_result.qc_date AS event_date, qc_result.qc_person, qc_result.is_defect, qc_result.quantity, qc_result.fk_sku_option_id, sku_option.display AS variant " +
-    "FROM qc_result, sku_option WHERE qc_result.fk_production_id = '" + id + "' AND qc_result.fk_sku_option_id = sku_option.id ORDER BY qc_result.qc_date ASC";
+  const pqdP = ctx.api.resource('production_quantity_details').list({
+    filter: { fk_production_id: id },
+    fields: ['id', 'ratio', 'quantity', 'cut_quantity', 'fk_sku_option_id'],
+    pageSize: 500,
+  }).then(res => (res && res.data && res.data.data) || []);
 
-  return Promise.all([
-    runSql('pd_qbase_' + id, sqlBase),
-    runSql('pd_qsent_' + id, sqlSent),
-    runSql('pd_qqc_'   + id, sqlQc),
-    runSql('pd_qperm_' + id, sqlPerm),
-    runSql('pd_qhd_'   + id, sqlHistDel),
-    runSql('pd_qhq_'   + id, sqlHistQc),
-  ]).then(function(r) {
-    const base = r[0], sentR = r[1], qcR = r[2], permR = r[3], histDel = r[4], histQc = r[5];
-    const sentMap = {}, qcMap = {};
-    sentR.forEach(x => { sentMap[String(x.fk_sku_option_id)] = num(x.sent_qty); });
-    qcR.forEach(x => { qcMap[String(x.fk_sku_option_id)] = num(x.qc_qty); });
-    const rows = base.map(function(b) {
-      const sid = String(b.sku_id);
-      return { sku_id: sid, variant: b.variant || '(none)', ratio: num(b.ratio), do: num(b.do_quantity), cut: num(b.cut_quantity), sent: sentMap[sid] || 0, qc: qcMap[sid] || 0 };
+  const prP = ctx.api.resource('production_result').list({
+    filter: { fk_production_id: id },
+    fields: ['id', 'shipment_date', 'quantity', 'is_permakan', 'checking_pic', 'remarks', 'fk_sku_option_id'],
+    pageSize: 2000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const qcP = ctx.api.resource('qc_result').list({
+    filter: { fk_production_id: id },
+    fields: ['id', 'qc_date', 'quantity', 'is_defect', 'qc_person', 'fk_sku_option_id'],
+    pageSize: 2000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  return Promise.all([pqdP, prP, qcP]).then(function (r) {
+    const pqdRows = r[0], prRows = r[1], qcRows = r[2];
+
+    const skuIds = [...new Set(
+      pqdRows.map(x => x.fk_sku_option_id)
+        .concat(prRows.map(x => x.fk_sku_option_id))
+        .concat(qcRows.map(x => x.fk_sku_option_id))
+        .filter(x => x != null)
+    )];
+
+    const skuP = skuIds.length
+      ? ctx.api.resource('sku_option').list({ filter: { id: { $in: skuIds } }, fields: ['id', 'display', 'sort'], pageSize: 500 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+
+    return skuP.then(function (skuRows) {
+      const skuById = {}; skuRows.forEach(s => { skuById[s.id] = s; });
+
+      const sentMap = {}, qcMap = {};
+      prRows.forEach(function (x) { const sid = String(x.fk_sku_option_id); sentMap[sid] = (sentMap[sid] || 0) + num(x.quantity); });
+      qcRows.forEach(function (x) { const sid = String(x.fk_sku_option_id); qcMap[sid] = (qcMap[sid] || 0) + num(x.quantity); });
+
+      const rows = pqdRows.map(function (b) {
+        const sid = String(b.fk_sku_option_id);
+        const sku = skuById[b.fk_sku_option_id] || {};
+        return { sku_id: sid, variant: sku.display || '(none)', ratio: num(b.ratio), do: num(b.quantity), cut: num(b.cut_quantity), sent: sentMap[sid] || 0, qc: qcMap[sid] || 0, _sort: sku.sort };
+      }).sort(function (a, b) { return num(a._sort) - num(b._sort); });
+
+      let sentPermakan = 0, returnPermakan = 0;
+      prRows.forEach(function (x) {
+        if (!x.is_permakan) return;
+        const q = num(x.quantity);
+        if (q < 0) sentPermakan += Math.abs(q);
+        else if (q > 0) returnPermakan += q;
+      });
+
+      const delMap = {}, qcHistMap = {};
+      prRows.forEach(function (x) {
+        const sid = String(x.fk_sku_option_id);
+        const sku = skuById[x.fk_sku_option_id] || {};
+        (delMap[sid] = delMap[sid] || []).push({
+          event_date: x.shipment_date, checking_pic: x.checking_pic, quantity: x.quantity,
+          is_permakan: x.is_permakan, remarks: x.remarks, fk_sku_option_id: x.fk_sku_option_id,
+          variant: sku.display, _type: 'delivery',
+        });
+      });
+      qcRows.forEach(function (x) {
+        const sid = String(x.fk_sku_option_id);
+        const sku = skuById[x.fk_sku_option_id] || {};
+        (qcHistMap[sid] = qcHistMap[sid] || []).push({
+          event_date: x.qc_date, qc_person: x.qc_person, is_defect: x.is_defect, quantity: x.quantity,
+          fk_sku_option_id: x.fk_sku_option_id, variant: sku.display, _type: 'qc',
+        });
+      });
+
+      return {
+        rows: rows, delMap: delMap, qcHistMap: qcHistMap,
+        perm: { sent_permakan: sentPermakan, return_permakan: returnPermakan },
+        totDo: rows.reduce((s, x) => s + x.do, 0), totCut: rows.reduce((s, x) => s + x.cut, 0),
+        totSent: rows.reduce((s, x) => s + x.sent, 0), totQc: rows.reduce((s, x) => s + x.qc, 0),
+      };
     });
-    const delMap = {}, qcHistMap = {};
-    histDel.forEach(e => { const sid = String(e.fk_sku_option_id); (delMap[sid] = delMap[sid] || []).push(Object.assign({}, e, { _type: 'delivery' })); });
-    histQc.forEach(e => { const sid = String(e.fk_sku_option_id); (qcHistMap[sid] = qcHistMap[sid] || []).push(Object.assign({}, e, { _type: 'qc' })); });
-    return {
-      rows, delMap, qcHistMap, perm: permR[0] || {},
-      totDo: rows.reduce((s, x) => s + x.do, 0), totCut: rows.reduce((s, x) => s + x.cut, 0),
-      totSent: rows.reduce((s, x) => s + x.sent, 0), totQc: rows.reduce((s, x) => s + x.qc, 0),
-    };
   });
 }
 
@@ -278,38 +422,89 @@ const _pdQcLabels = pdEnumLabelMap('qc_result', 'qc_person');
 function pdLabel(map, v) { if (v == null || v === '') return ''; const k = String(v); return map[k] != null ? map[k] : v; }
 
 // result history: production_result (Sent) + qc_result (QC), all variants, date desc.
-// Two separate queries merged in JS (avoid aggregate fan-out).
 function fetchResultHistory(id) {
-  return Promise.all([
-    runSql('pd_rh_sent_' + id,
-      "SELECT production_result.shipment_date AS event_date, production_result.quantity AS quantity, " +
-      "  production_result.checking_pic AS pic, production_result.is_permakan AS is_permakan, production_result.remarks AS remarks, " +
-      "  sku_option.display AS variant " +
-      "FROM production_result LEFT JOIN sku_option ON production_result.fk_sku_option_id = sku_option.id " +
-      "WHERE production_result.fk_production_id = '" + id + "'"),
-    runSql('pd_rh_qc_' + id,
-      "SELECT qc_result.qc_date AS event_date, qc_result.quantity AS quantity, qc_result.qc_person AS pic, " +
-      "  qc_result.is_defect AS is_defect, sku_option.display AS variant " +
-      "FROM qc_result LEFT JOIN sku_option ON qc_result.fk_sku_option_id = sku_option.id " +
-      "WHERE qc_result.fk_production_id = '" + id + "'"),
-  ]).then(function(r) {
-    const sent = (r[0] || []).map(function(x) { return { kind: 'sent', date: x.event_date, quantity: num(x.quantity), pic: pdLabel(_pdPicLabels, x.pic), is_permakan: !!x.is_permakan, is_defect: false, variant: x.variant }; });
-    const qc = (r[1] || []).map(function(x) { return { kind: 'qc', date: x.event_date, quantity: num(x.quantity), pic: pdLabel(_pdQcLabels, x.pic), is_permakan: false, is_defect: !!x.is_defect, variant: x.variant }; });
-    const all = sent.concat(qc);
-    all.sort(function(a, b) { const av = a.date ? new Date(a.date).getTime() : 0; const bv = b.date ? new Date(b.date).getTime() : 0; return bv - av; });
-    return all;
+  const prP = ctx.api.resource('production_result').list({
+    filter: { fk_production_id: id },
+    fields: ['shipment_date', 'quantity', 'checking_pic', 'is_permakan', 'remarks', 'fk_sku_option_id'],
+    pageSize: 2000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  const qcP = ctx.api.resource('qc_result').list({
+    filter: { fk_production_id: id },
+    fields: ['qc_date', 'quantity', 'qc_person', 'is_defect', 'fk_sku_option_id'],
+    pageSize: 2000,
+  }).then(res => (res && res.data && res.data.data) || []);
+
+  return Promise.all([prP, qcP]).then(function (r) {
+    const prRows = r[0], qcRows = r[1];
+
+    const skuIds = [...new Set(prRows.map(x => x.fk_sku_option_id).concat(qcRows.map(x => x.fk_sku_option_id)).filter(x => x != null))];
+    const skuP = skuIds.length
+      ? ctx.api.resource('sku_option').list({ filter: { id: { $in: skuIds } }, fields: ['id', 'display'], pageSize: 500 })
+          .then(res => (res && res.data && res.data.data) || [])
+      : Promise.resolve([]);
+
+    return skuP.then(function (skuRows) {
+      const skuById = {}; skuRows.forEach(s => { skuById[s.id] = s; });
+
+      const sent = prRows.map(function (x) {
+        return { kind: 'sent', date: x.shipment_date, quantity: num(x.quantity), pic: pdLabel(_pdPicLabels, x.checking_pic), is_permakan: !!x.is_permakan, is_defect: false, variant: (skuById[x.fk_sku_option_id] || {}).display };
+      });
+      const qc = qcRows.map(function (x) {
+        return { kind: 'qc', date: x.qc_date, quantity: num(x.quantity), pic: pdLabel(_pdQcLabels, x.qc_person), is_permakan: false, is_defect: !!x.is_defect, variant: (skuById[x.fk_sku_option_id] || {}).display };
+      });
+      const all = sent.concat(qc);
+      all.sort(function (a, b) { const av = a.date ? new Date(a.date).getTime() : 0; const bv = b.date ? new Date(b.date).getTime() : 0; return bv - av; });
+      return all;
+    });
   });
 }
 
 function fetchHistory(id) {
-  return runSql('pd_dhist_' + id,
-    "SELECT users.nickname AS name, history.create_date AS history_date, history.status, history.message, history.category, history.table_name AS source " +
-    "FROM history, users WHERE history.fk_user_id = users.id AND ( " +
-    "  (history.table_name='production' AND history.table_id=" + id + ") " +
-    "  OR (history.table_name='production_sample' AND history.table_id IN (SELECT id FROM production_sample WHERE fk_production_id=" + id + ")) " +
-    "  OR (history.table_name='production_material' AND history.table_id IN (SELECT id FROM production_material WHERE fk_production_id=" + id + ")) " +
-    ") ORDER BY history_date DESC LIMIT 30"
-  );
+  const sampleIdsP = ctx.api.resource('production_sample').list({
+    filter: { fk_production_id: id }, fields: ['id'], pageSize: 500,
+  }).then(res => ((res && res.data && res.data.data) || []).map(r => r.id).filter(Boolean));
+
+  const matIdsP = ctx.api.resource('production_material').list({
+    filter: { fk_production_id: id }, fields: ['id'], pageSize: 500,
+  }).then(res => ((res && res.data && res.data.data) || []).map(r => r.id).filter(Boolean));
+
+  return Promise.all([sampleIdsP, matIdsP]).then(function (idLists) {
+    const sampleIds = idLists[0], matIds = idLists[1];
+
+    const orConds = [{ table_name: 'production', table_id: id }];
+    if (sampleIds.length) orConds.push({ table_name: 'production_sample', table_id: { $in: sampleIds } });
+    if (matIds.length) orConds.push({ table_name: 'production_material', table_id: { $in: matIds } });
+
+    return ctx.api.resource('history').list({
+      filter: { $or: orConds },
+      fields: ['fk_user_id', 'create_date', 'status', 'message', 'category', 'table_name'],
+      sort: ['-create_date'],
+      pageSize: 30,
+    }).then(function (histRes) {
+      const histRows = (histRes && histRes.data && histRes.data.data) || [];
+      const userIds = [...new Set(histRows.map(r => r.fk_user_id).filter(x => x != null))];
+
+      const userP = userIds.length
+        ? ctx.api.resource('users').list({ filter: { id: { $in: userIds } }, fields: ['id', 'nickname'], pageSize: 200 })
+            .then(res => (res && res.data && res.data.data) || [])
+        : Promise.resolve([]);
+
+      return userP.then(function (userRows) {
+        const userById = {}; userRows.forEach(u => { userById[u.id] = u; });
+        return histRows.map(function (r) {
+          return {
+            name: (userById[r.fk_user_id] || {}).nickname,
+            history_date: r.create_date,
+            status: r.status,
+            message: r.message,
+            category: r.category,
+            source: r.table_name,
+          };
+        });
+      });
+    });
+  }).catch(() => []);
 }
 
 // =====================================================
