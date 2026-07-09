@@ -1,0 +1,37 @@
+const _codeCache = {};
+async function loadCode(ctx, name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const { React, antd, dayjs } = ctx.libs;
+  const uid = 'code_' + name;
+  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main',
+    sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+  const src = (rows && rows[0] && rows[0].code) || '';
+  _codeCache[name] = new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// --- exactly one selected production record ---
+const selectedRows = ctx.resource?.getSelectedRows?.() || [];
+if (selectedRows.length !== 1) { ctx.message.warning('Select exactly one production record to duplicate.'); return; }
+const sourceId = selectedRows[0].id;
+if (!sourceId) { ctx.message.warning('Selected row has no valid ID.'); return; }
+
+const { Modal } = ctx.libs.antd;
+
+// Step 1: plain yes/no, no details.
+Modal.confirm({
+  title: 'Duplicate this production?',
+  content: 'A pre-filled New Production form will open so you can review and edit before saving.',
+  okText: 'Duplicate',
+  cancelText: 'Cancel',
+  onOk: function () {
+    // don't return this promise — let the confirm dialog close immediately,
+    // then open step 2 asynchronously.
+    loadCode(ctx, 'ui_production_edit').then(function (PE) {
+      return PE.openDuplicateDrawer(ctx, sourceId);
+    }).catch(function (e) {
+      ctx.message.error('Duplicate failed: ' + ((e && e.message) || e));
+    });
+  },
+});
