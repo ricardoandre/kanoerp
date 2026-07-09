@@ -14,47 +14,62 @@ function isAccType(matType) {
   return t.indexOf('access') !== -1 || t.indexOf('aks') !== -1;
 }
 
-async function runSql(ctx, uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
-    .then(r => r || []).catch(() => []);
-}
-
 async function fetchSummary(ctx, productionMaterialId) {
-  const pmRows = await runSql(ctx, 'pm_out_lookup_' + productionMaterialId,
-    "SELECT pm.id, pm.fk_material_details_code, rm.type AS mat_type " +
-    "FROM production_material pm " +
-    "LEFT JOIN material_details md ON md.code = pm.fk_material_details_code " +
-    "LEFT JOIN raw_material rm ON rm.code = md.fk_material_code " +
-    "WHERE pm.id = '" + productionMaterialId + "'"
-  );
-  if (!pmRows.length) return null;
-  const materialCode = pmRows[0].fk_material_details_code;
+  // 1. production_material row
+  const pmRes = await ctx.api.resource('production_material').get({
+    filterByTk: productionMaterialId,
+    fields: ['id', 'fk_material_details_code'],
+  }).catch(() => null);
+  const pm = pmRes?.data?.data;
+  if (!pm) return null;
+
+  const materialCode = pm.fk_material_details_code;
   if (!materialCode) return { error: 'no_material_code' };
 
-  const isAcc = isAccType(pmRows[0].mat_type);
+  // 2. material_details -> raw_material, to get mat_type
+  const mdRes = await ctx.api.resource('material_details').get({
+    filterByTk: materialCode,
+    fields: ['code', 'fk_material_code'],
+  }).catch(() => null);
+  const md = mdRes?.data?.data;
 
-  const ledgerHeaderRows = await runSql(ctx, 'pm_out_ledger_hdr_' + productionMaterialId,
-    "SELECT id, transaction_date FROM material_ledger " +
-    "WHERE fk_production_material_id = '" + productionMaterialId + "' " +
-    "ORDER BY transaction_date DESC"
-  );
+  let matType = null;
+  if (md?.fk_material_code) {
+    const rmRes = await ctx.api.resource('raw_material').get({
+      filterByTk: md.fk_material_code,
+      fields: ['code', 'type'],
+    }).catch(() => null);
+    matType = rmRes?.data?.data?.type || null;
+  }
+  const isAcc = isAccType(matType);
+
+  // 3. material_ledger rows for this production material
+  const ledgerRes = await ctx.api.resource('material_ledger').list({
+    filter: { fk_production_material_id: productionMaterialId },
+    fields: ['id', 'transaction_date'],
+    sort: ['-transaction_date'],
+    pageSize: 200,
+  }).catch(() => null);
+  const ledgerHeaderRows = ledgerRes?.data?.data || [];
   const ledgerIds = ledgerHeaderRows.map(r => r.id).filter(Boolean);
 
+  // 4. material_ledger_details for all those ledger ids (batched, no N+1)
   let ledgerDetailRows = [];
   if (ledgerIds.length) {
-    ledgerDetailRows = await runSql(ctx, 'pm_out_ledger_det_' + productionMaterialId,
-      "SELECT fk_material_ledger_id AS ledger_id, COUNT(*) AS cnt, COALESCE(SUM(details), 0) AS total_amount " +
-      "FROM material_ledger_details " +
-      "WHERE fk_material_ledger_id IN (" + ledgerIds.join(',') + ") " +
-      "GROUP BY fk_material_ledger_id"
-    );
+    const detRes = await ctx.api.resource('material_ledger_details').list({
+      filter: { fk_material_ledger_id: { $in: ledgerIds } },
+      fields: ['fk_material_ledger_id', 'details'],
+      pageSize: 1000,
+    }).catch(() => null);
+    ledgerDetailRows = detRes?.data?.data || [];
   }
+
   const byLedger = {};
   ledgerDetailRows.forEach(r => {
-    byLedger[String(r.ledger_id)] = { count: Number(r.cnt) || 0, total: Number(r.total_amount) || 0 };
+    const key = String(r.fk_material_ledger_id);
+    if (!byLedger[key]) byLedger[key] = { count: 0, total: 0 };
+    byLedger[key].count += 1;
+    byLedger[key].total += Number(r.details) || 0;
   });
 
   const ledgerRows = ledgerHeaderRows.map(r => ({
