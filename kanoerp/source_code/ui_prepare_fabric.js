@@ -1,5 +1,5 @@
 // =====================================================
-// kanoui.js — SHARED REUSABLE JBLOCK CODE (canonical source; keep as Project file)
+// ui_prepare_fabric.js — SHARED REUSABLE JBLOCK CODE (canonical source; keep as Project file)
 //
 // Scope for now: ONLY the prepare-fabric action. Nothing table-specific lives here.
 // We add to this file later only when something is proven to repeat across views.
@@ -12,10 +12,11 @@
 //     async function loadKano(ctx) {
 //       if (_kano) return _kano;
 //       const { React, antd, dayjs } = ctx.libs;
-//       const rows = await ctx.sql.save({ uid:'kano_src', dataSourceKey:'main',
-//         sql:"SELECT code FROM source_code WHERE name='kanoui'" })
-//         .then(()=>ctx.sql.runById('kano_src',{ type:'selectRows', dataSourceKey:'main' }));
-//       const src = (rows && rows[0] && rows[0].code) || '';
+//       const res = await ctx.api.resource('source_code').list({
+//         filter: { name: 'kanoui' }, fields: ['code'], pageSize: 1,
+//       });
+//       const rows = res?.data?.data || [];
+//       const src = (rows[0] && rows[0].code) || '';
 //       _kano = new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx);
 //       return _kano;
 //     }
@@ -25,6 +26,29 @@
 //   ITS ctx.libs.React, so the bundle shares the host's React → hooks work.
 //
 // REGISTRY: { fetchFabricRows, PrepareFabricModal, openFabricModal, buildFabricPdf }
+//
+// NOTE (2026-07): fetchFabricRows was converted from raw ctx.sql to
+// ctx.api.resource() calls — ctx.sql.save() is admin/root-gated and silently
+// fails per-record for other roles (see README §3, "ctx.sql.save() is gated to
+// admin/root"). Do not revert this to raw SQL.
+//
+// NOTE (2026-07, fabric grouping update):
+//   - Sort key is `raw_material.code` (the underlying material identifier,
+//     e.g. the fabric type/name — carried per row as `raw_material_code`,
+//     not displayed), NOT `material_details.code` (the more specific
+//     variant/color code, still displayed and returned as `fabric_code`).
+//   - A production's fabric set is now TWO sources, both surfaced here:
+//       1. the product's main fabric — product.fk_main_fabric_code (unchanged)
+//       2. any OTHER fabric-type materials attached via production_material,
+//          joined material_details -> raw_material, filtered raw_material.type
+//          = 'fabric' (same classifier ui_production_material_detail's
+//          isFabric() uses). Accessories-type production_material rows are
+//          excluded.
+//   - Rows are grouped by product: main fabric first, then the product's other
+//     fabric rows in fetch order (NOT re-sorted among themselves). Groups
+//     themselves are sorted by (main fabric code, then product code). A
+//     production_material row whose code matches the main fabric is skipped
+//     to avoid a duplicate line.
 // =====================================================
 const { Modal } = antd;
 const ce = React.createElement;
@@ -43,7 +67,7 @@ function pdfTextW(s, size) { return String(s).length * size * 0.5; } // Helvetic
 
 function buildFabricPdf(data) {
   data = data || [];
-  var PAGE_W = 842, PAGE_H = 595, M = 30, titleH = 36, headerH = 22, rowH = 30, pad = 4;
+  var PAGE_W = 842, PAGE_H = 595, M = 30, titleH = 36, headerH = 22, rowH = 34, pad = 4;
   function PY(topY) { return PAGE_H - topY; }
 
   var cols = [{ t: '#', w: 26, a: 'c' }, { t: 'Product / Fabric', w: 170, a: 'l' }, { t: 'Qty', w: 48, a: 'r' }, { t: 'ROL', w: 48, a: 'r' }];
@@ -94,8 +118,16 @@ function buildFabricPdf(data) {
       var qty = (rol * content).toFixed(2);
       var rolStr = rol % 1 === 0 ? rol.toFixed(0) : rol.toFixed(2);
       cellText(ops, 0, String(startNo + r + 1), rowTop, 9);
-      ops.push('0 0 0 rg BT /F1 9 Tf ' + pdfFmt(xs[1] + pad) + ' ' + pdfFmt(PY(rowTop + 12)) + ' Td (' + pdfEsc(row.product_code || '-') + ') Tj ET');
-      ops.push('0.5 0.5 0.5 rg BT /F1 8 Tf ' + pdfFmt(xs[1] + pad) + ' ' + pdfFmt(PY(rowTop + 24)) + ' Td (' + pdfEsc(row.fabric_code || '-') + ') Tj ET');
+
+      if (row.is_main) {
+        var titleLine = row.product_code + (row.product_name ? (' — ' + row.product_name) : '');
+        ops.push('0 0 0 rg BT /F2 8.5 Tf ' + pdfFmt(xs[1] + pad) + ' ' + pdfFmt(PY(rowTop + 14)) + ' Td (' + pdfEsc(titleLine) + ') Tj ET');
+        ops.push('0.5 0.5 0.5 rg BT /F1 7.5 Tf ' + pdfFmt(xs[1] + pad) + ' ' + pdfFmt(PY(rowTop + 26)) + ' Td (' + pdfEsc(row.fabric_code || '-') + ') Tj ET');
+      } else {
+        // secondary fabric for the same product — indented, single line, no repeated product info
+        ops.push('0.45 0.45 0.45 rg BT /F1 8.5 Tf ' + pdfFmt(xs[1] + pad + 10) + ' ' + pdfFmt(PY(rowTop + 20)) + ' Td (' + pdfEsc('> ' + (row.fabric_code || '-')) + ') Tj ET');
+      }
+
       cellText(ops, 2, qty, rowTop, 9);
       cellText(ops, 3, rolStr, rowTop, 9);
     }
@@ -143,36 +175,186 @@ function downloadFabricPdf(bytes, filename) {
 
 // ─────────────────────────────────────────────────────
 // fetchFabricRows — production ids → modal-shaped rows.
-// Pure and view-agnostic: works from any context with ctx.sql. Reads the fabric
-// code from product.fk_main_fabric_code (the product's main fabric), joining
-// production → product → material_details → raw_material. Single batched query.
-// Returns: [{ product_code, fabric_code, planning_rol, default_content }]
+//
+// Reads TWO fabric sources per production, batched (no N+1):
+//   1. the product's main fabric: product.fk_main_fabric_code
+//   2. any other fabric-type materials on that production, via
+//      production_material -> material_details -> raw_material, filtered
+//      raw_material.type = 'fabric' (excludes accessories, excludes a
+//      production_material row that duplicates the main fabric code).
+//
+// Rows are returned pre-grouped and pre-sorted:
+//   - each product's rows: main fabric first, then its other fabric rows in
+//     fetch order (NOT re-sorted among themselves)
+//   - groups are ordered by (main fabric code, then product code) — "fabric
+//     code" is used as "fabric name" since neither material_details nor
+//     raw_material has a name column (see file header note)
+//
+// Returns: [{ product_code, product_name, fabric_code, raw_material_code,
+//              planning_rol, default_content, is_main }]
 // ─────────────────────────────────────────────────────
 function fetchFabricRows(ctx, ids) {
   ids = (ids || []).filter(function (x) { return x != null; });
   if (!ids.length) return Promise.resolve([]);
-  var idList = ids.map(function (id) { return "'" + id + "'"; }).join(',');
-  var uid = 'kano_fabric_report';
-  var sql =
-    "SELECT product.code AS product_code, " +
-    "  product.fk_main_fabric_code AS fabric_code, " +
-    "  production.planning_rol AS planning_rol, " +
-    "  raw_material.default_content AS default_content " +
-    "FROM production, product, material_details, raw_material " +
-    "WHERE production.id IN (" + idList + ") " +
-    "  AND production.fk_product_code = product.code " +
-    "  AND product.fk_main_fabric_code = material_details.code " +
-    "  AND material_details.fk_material_code = raw_material.code " +
-    "ORDER BY fk_main_fabric_code";
-  return ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: 'main' })
-    .then(function () { return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
-    .then(function (r) { return r || []; })
-    .catch(function () { return []; });
+
+  return ctx.api.resource('production').list({
+    filter: { id: { $in: ids } },
+    fields: ['id', 'planning_rol', 'fk_product_code'],
+    pageSize: 500,
+  })
+  .then(function (prodRes) {
+    var prodRows = (prodRes && prodRes.data && prodRes.data.data) || [];
+    var productCodes = [];
+    prodRows.forEach(function (p) {
+      if (p.fk_product_code && productCodes.indexOf(p.fk_product_code) === -1) productCodes.push(p.fk_product_code);
+    });
+
+    var productsP = productCodes.length
+      ? ctx.api.resource('product').list({
+          filter: { code: { $in: productCodes } },
+          fields: ['code', 'name', 'fk_main_fabric_code'],
+          pageSize: 500,
+        }).then(function (r) { return (r && r.data && r.data.data) || []; })
+      : Promise.resolve([]);
+
+    var pmP = ctx.api.resource('production_material').list({
+      filter: { fk_production_id: { $in: ids } },
+      fields: ['id', 'fk_production_id', 'fk_material_details_code'],
+      sort: ['id'],
+      pageSize: 500,
+    }).then(function (r) { return (r && r.data && r.data.data) || []; });
+
+    return Promise.all([Promise.resolve(prodRows), productsP, pmP]);
+  })
+  .then(function (step1) {
+    var prodRows = step1[0], productRows = step1[1], pmRows = step1[2];
+    var productByCode = {};
+    productRows.forEach(function (p) { productByCode[p.code] = p; });
+
+    // every material_details code we'll need: product-level main fabric codes
+    // + every fabric this production has via production_material
+    var mdCodes = [];
+    productRows.forEach(function (p) {
+      if (p.fk_main_fabric_code && mdCodes.indexOf(p.fk_main_fabric_code) === -1) mdCodes.push(p.fk_main_fabric_code);
+    });
+    pmRows.forEach(function (m) {
+      if (m.fk_material_details_code && mdCodes.indexOf(m.fk_material_details_code) === -1) mdCodes.push(m.fk_material_details_code);
+    });
+
+    var mdP = mdCodes.length
+      ? ctx.api.resource('material_details').list({
+          filter: { code: { $in: mdCodes } },
+          fields: ['code', 'fk_material_code'],
+          pageSize: 500,
+        }).then(function (r) { return (r && r.data && r.data.data) || []; })
+      : Promise.resolve([]);
+
+    return Promise.all([Promise.resolve(prodRows), Promise.resolve(productByCode), Promise.resolve(pmRows), mdP]);
+  })
+  .then(function (step2) {
+    var prodRows = step2[0], productByCode = step2[1], pmRows = step2[2], mdRows = step2[3];
+    var mdByCode = {};
+    mdRows.forEach(function (m) { mdByCode[m.code] = m; });
+
+    var rmCodes = [];
+    mdRows.forEach(function (m) {
+      if (m.fk_material_code && rmCodes.indexOf(m.fk_material_code) === -1) rmCodes.push(m.fk_material_code);
+    });
+
+    var rmP = rmCodes.length
+      ? ctx.api.resource('raw_material').list({
+          filter: { code: { $in: rmCodes } },
+          fields: ['code', 'default_content', 'type'],
+          pageSize: 500,
+        }).then(function (r) { return (r && r.data && r.data.data) || []; })
+      : Promise.resolve([]);
+
+    return Promise.all([Promise.resolve(prodRows), Promise.resolve(productByCode), Promise.resolve(pmRows), Promise.resolve(mdByCode), rmP]);
+  })
+  .then(function (final) {
+    var prodRows = final[0], productByCode = final[1], pmRows = final[2], mdByCode = final[3], rmRows = final[4];
+    var rmByCode = {};
+    rmRows.forEach(function (r) { rmByCode[r.code] = r; });
+
+    function isFabricType(rm) { return !!rm && String(rm.type || '').toLowerCase() === 'fabric'; }
+
+    // group production_material rows by production id
+    var pmByProd = {};
+    pmRows.forEach(function (m) {
+      var pid = m.fk_production_id;
+      if (!pmByProd[pid]) pmByProd[pid] = [];
+      pmByProd[pid].push(m);
+    });
+
+    var groups = [];
+    prodRows.forEach(function (p) {
+      var product = productByCode[p.fk_product_code] || {};
+      var mainFabricCode = product.fk_main_fabric_code || null;
+      var mainMd = mainFabricCode ? mdByCode[mainFabricCode] : null;
+      var mainRm = mainMd ? rmByCode[mainMd.fk_material_code] : null;
+
+      var rows = [];
+      if (mainFabricCode) {
+        rows.push({
+          product_code: p.fk_product_code,
+          product_name: product.name || null,
+          fabric_code: mainFabricCode,
+          raw_material_code: mainRm ? mainRm.code : null,
+          planning_rol: p.planning_rol,
+          default_content: mainRm ? mainRm.default_content : null,
+          is_main: true,
+        });
+      }
+
+      var pmForProd = pmByProd[p.id] || [];
+      pmForProd.forEach(function (m) {
+        if (m.fk_material_details_code === mainFabricCode) return; // don't duplicate the main fabric
+        var md = mdByCode[m.fk_material_details_code];
+        var rm = md ? rmByCode[md.fk_material_code] : null;
+        if (!md || !isFabricType(rm)) return; // only other FABRIC-type materials, skip accessories
+
+        rows.push({
+          product_code: p.fk_product_code,
+          product_name: product.name || null,
+          fabric_code: m.fk_material_details_code,
+          raw_material_code: rm.code,
+          planning_rol: p.planning_rol,
+          default_content: rm.default_content,
+          is_main: false,
+        });
+      });
+
+      if (!rows.length) return; // nothing fabric-related for this production — preserves original INNER JOIN behavior
+
+      groups.push({
+        // sort key is raw_material.code (the actual underlying material
+        // identifier), taken from the main fabric if present, else the
+        // production's first fabric row — NOT material_details.code
+        sortRawCode: rows[0].raw_material_code || '',
+        product_code: p.fk_product_code,
+        rows: rows,
+      });
+    });
+
+    // sort groups by raw_material.code, then product code; rows inside a
+    // group keep main-first, then other-fabrics-in-fetch-order
+    groups.sort(function (a, b) {
+      var fa = a.sortRawCode || '', fb = b.sortRawCode || '';
+      if (fa !== fb) return fa < fb ? -1 : 1;
+      var pa = a.product_code || '', pb = b.product_code || '';
+      return pa < pb ? -1 : pa > pb ? 1 : 0;
+    });
+
+    var out = [];
+    groups.forEach(function (g) { g.rows.forEach(function (r) { out.push(r); }); });
+    return out;
+  })
+  .catch(function () { return []; });
 }
 
 // ─────────────────────────────────────────────────────
 // PrepareFabricModal — presentation only. Takes `data`:
-//   [{ product_code, fabric_code, planning_rol, default_content }]
+//   [{ product_code, product_name, fabric_code, planning_rol, default_content, is_main }]
 // ─────────────────────────────────────────────────────
 function PrepareFabricModal(props) {
   var data = props.data || [];
@@ -197,7 +379,7 @@ function PrepareFabricModal(props) {
     ce('div', { style: { overflowX: 'auto', maxHeight: '62vh' } },
       ce('table', { style: { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed', minWidth: 640 } },
         ce('thead', null, ce('tr', null,
-          ce('th', { style: Object.assign({}, th, { width: 20 }) }, '#'),
+          ce('th', { style: Object.assign({}, th, { width: 26, textAlign: 'center' }) }, '#'),
           ce('th', { style: th }, 'Product / Fabric'),
           ce('th', { style: Object.assign({}, th, { textAlign: 'right', width: 72 }) }, 'Qty'),
           ce('th', { style: Object.assign({}, th, { textAlign: 'right', width: 50 }) }, 'ROL'),
@@ -206,11 +388,15 @@ function PrepareFabricModal(props) {
           var rol = parseFloat(r.planning_rol) || 0;
           var content = parseFloat(r.default_content) || 0;
           var qty = (rol * content).toFixed(2);
+          var isMain = r.is_main !== false; // default true for backward compat
           return ce('tr', { key: i },
-            ce('td', { style: Object.assign({}, td, { color: '#aaa', fontSize: 10 }) }, i + 1),
+            ce('td', { style: Object.assign({}, td, { color: '#aaa', fontSize: 10, textAlign: 'center', whiteSpace: 'nowrap' }) }, i + 1),
             ce('td', { style: td },
-              ce('div', { style: { fontWeight: 500, fontSize: 12 } }, r.product_code || '-'),
-              ce('div', { style: { fontSize: 11, color: '#888', marginTop: 2 } }, r.fabric_code || '-')),
+              isMain
+                ? ce(React.Fragment, null,
+                    ce('div', { style: { fontWeight: 600, fontSize: 12 } }, r.product_code + (r.product_name ? (' — ' + r.product_name) : '')),
+                    ce('div', { style: { fontSize: 11, color: '#0ea5e9', marginTop: 2 } }, r.fabric_code || '-'))
+                : ce('div', { style: { fontSize: 11, color: '#888', paddingLeft: 12 } }, '↳ ' + (r.fabric_code || '-'))),
             ce('td', { style: Object.assign({}, td, { textAlign: 'right' }) }, qty),
             ce('td', { style: Object.assign({}, td, { textAlign: 'right' }) }, rol % 1 === 0 ? rol.toFixed(0) : rol.toFixed(2)),
             entry.map(function (_, j) { return ce('td', { key: j, style: tdE }); }));
@@ -231,7 +417,7 @@ function PrepareFabricModal(props) {
 // ─────────────────────────────────────────────────────
 // openFabricModal — imperative open via Modal.confirm. Right pattern for a click
 // handler (no render root needed; portals to body). Pass the fetched rows.
-//   rows: [{ product_code, fabric_code, planning_rol, default_content }]
+//   rows: [{ product_code, product_name, fabric_code, planning_rol, default_content, is_main }]
 //   selectedCount (optional): for the "N row(s) selected" subtitle.
 // ─────────────────────────────────────────────────────
 function openFabricModal(rows, selectedCount) {
