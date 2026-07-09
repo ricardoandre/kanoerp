@@ -438,7 +438,8 @@ function fetchDuplicateSource(sourceId) {
   });
 }
 
-async function openDuplicateDrawer(hostCtx, sourceId) {
+async function openDuplicateDrawer(sourceId, opts) {
+  opts = opts || {};
   const initialValues = await fetchDuplicateSource(sourceId);
   Modal.confirm({
     title: 'Duplicate Production',
@@ -448,11 +449,10 @@ async function openDuplicateDrawer(hostCtx, sourceId) {
       inline: true,
       open: true,
       initialValues: initialValues,
-      onClose: function() { Modal.destroyAll(); },
+      onClose: function() { Modal.destroyAll(); if (opts.onClose) opts.onClose(); },
       onCreated: function(newId) {
         Modal.destroyAll();
-        hostCtx.message.success('Production duplicated — new id ' + newId + '.');
-        if (hostCtx.resource && hostCtx.resource.refresh) hostCtx.resource.refresh();
+        if (opts.onCreated) opts.onCreated(newId);
       },
     }),
     okButtonProps: { style: { display: 'none' } },
