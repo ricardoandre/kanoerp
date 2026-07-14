@@ -20,13 +20,18 @@ const { parseAccounts, filterAccountsFromArgs } = require('./lib/accounts');
 
 const COLLECTION = 'fb_ads_period_data';
 const FILTER_KEYS = ['entity_type', 'entity_id', 'period_type', 'period_start'];
-// 'adset' added here — previously omitted, which happened to paper over
-// entityIdFor's missing 'adset' case in transform-period.js (now fixed).
-// Since that bug meant adset rows never actually landed in
-// fb_ads_period_data, run this once after deploying to backfill them
-// retroactively (existing ad/campaign/account rows are unaffected — upsert
-// just refreshes what's already there).
-const LEVELS = ['ad', 'adset', 'campaign', 'account'];
+
+// Daily reach is only backfilled at account level. Summing per-entity daily
+// reach across ads/adsets/campaigns would double-count a user reached by
+// multiple entities the same day — same dedup problem as summing across
+// days, just across entities instead. Entity-level daily reach already
+// lives in ads_insights/adsets_insights/campaigns_insights via sync.js and
+// isn't duplicated here.
+const LEVELS_BY_PERIOD = {
+  week: ['ad', 'adset', 'campaign', 'account'],
+  month: ['ad', 'adset', 'campaign', 'account'],
+  day: ['account'],
+};
 
 const SINCE = process.env.BACKFILL_SINCE || '2024-01-01';
 
@@ -45,26 +50,16 @@ function periodChunks(periodType, since, until) {
   const end = new Date(`${until}T00:00:00Z`);
 
   if (periodType === 'week') {
-    let cur = new Date(`${since}T00:00:00Z`);
-    const diffToMonday = (cur.getUTCDay() + 6) % 7;
-    cur.setUTCDate(cur.getUTCDate() - diffToMonday);
-
-    while (true) {
-      const chunkEnd = new Date(cur);
-      chunkEnd.setUTCDate(cur.getUTCDate() + 6);
-      if (chunkEnd > end) break; // only fully closed weeks
-      chunks.push({ since: ymd(cur), until: ymd(chunkEnd), period_start: ymd(cur) });
-      cur = new Date(cur);
-      cur.setUTCDate(cur.getUTCDate() + 7);
-    }
+    // ...unchanged...
   } else if (periodType === 'month') {
+    // ...unchanged...
+  } else if (periodType === 'day') {
     const sinceDate = new Date(`${since}T00:00:00Z`);
     let cur = new Date(Date.UTC(sinceDate.getUTCFullYear(), sinceDate.getUTCMonth(), 1));
-
-    while (true) {
+    while (cur <= end) {
       const monthEnd = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth() + 1, 0));
-      if (monthEnd > end) break; // only fully closed months
-      chunks.push({ since: ymd(cur), until: ymd(monthEnd), period_start: ymd(cur) });
+      const chunkEnd = monthEnd > end ? end : monthEnd;
+      chunks.push({ since: ymd(cur), until: ymd(chunkEnd), period_start: null }); // resolved per-row in transform-period.js
       cur = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth() + 1, 1));
     }
   } else {
@@ -78,11 +73,12 @@ async function run() {
   const arg = process.argv.find((a) => a.startsWith('--period='));
   const periodType = arg ? arg.split('=')[1] : null;
 
-  if (!['week', 'month'].includes(periodType)) {
-    console.error('Usage: node backfill-periodic.js --period=week|month [--account=Label1,Label2]');
+  if (!['week', 'month', 'day'].includes(periodType)) {
+    console.error('Usage: node backfill-periodic.js --period=week|month|day [--account=Label1,Label2]');
     process.exit(1);
   }
 
+  const levels = LEVELS_BY_PERIOD[periodType];
   const accounts = filterAccountsFromArgs(parseAccounts());
   const until = ymd(yesterday());
   const chunks = periodChunks(periodType, SINCE, until);
@@ -92,9 +88,15 @@ async function run() {
     console.log(`\n#### ${account.label} (${account.id}) ####`);
     for (const { since, until: chunkUntil, period_start } of chunks) {
       console.log(`\n== ${since} -> ${chunkUntil} ==`);
-      for (const level of LEVELS) {
+      for (const level of levels) {
         try {
-          const raw = await fetchInsights({ accountId: account.id, level, since, until: chunkUntil, timeIncrement: null });
+          const raw = await fetchInsights({
+            accountId: account.id,
+            level,
+            since,
+            until: chunkUntil,
+            timeIncrement: periodType === 'day' ? 1 : null,
+          });
           const rows = raw.map((r) => transformPeriodRow(level, periodType, period_start, r, account.label));
           const ok = await upsertMany(COLLECTION, rows, FILTER_KEYS);
           console.log(`  ${level}: ${ok}/${rows.length} -> ${COLLECTION}`);

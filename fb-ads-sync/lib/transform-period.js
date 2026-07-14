@@ -30,19 +30,19 @@ function entityIdFor(level, r) {
   throw new Error(`fb_ads_period_data does not support level: ${level}`);
 }
 
-// periodType: 'week' | 'month'
-// periodStart: 'YYYY-MM-DD', the canonical key for the row (Monday for
-// weeks, 1st-of-month for months) — NOT necessarily r.date_start, though
-// they should match when the query range was built correctly.
-// accountLabel: the label from lib/accounts.js's parseAccounts() — stored as
-// a plain column, same as the daily tables. Not part of the row's identity
-// (entity ids are globally unique on Facebook, not scoped per account).
+// periodType: 'week' | 'month' | 'day'
+// periodStart: for week/month, the caller-precomputed key (Monday / 1st-of-month) —
+// one API call = one row = one period, so a single fixed value is correct.
+// For 'day', one API call (time_increment: 1) returns MANY rows, one per day —
+// each row's own date_start IS its period_start, the caller's periodStart arg
+// is meaningless here and ignored.
 function transformPeriodRow(level, periodType, periodStart, r, accountLabel) {
+  const resolvedPeriodStart = periodType === 'day' ? r.date_start : periodStart;
   return {
     entity_type: level,
     entity_id: entityIdFor(level, r),
     period_type: periodType,
-    period_start: periodStart,
+    period_start: resolvedPeriodStart,
     reach: int(r.reach),
     frequency: num(r.frequency),
     impression: int(r.impressions),
