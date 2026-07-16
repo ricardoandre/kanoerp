@@ -1,0 +1,1380 @@
+var React = ctx.React;
+var useState = React.useState;
+var useEffect = React.useEffect;
+var useRef = React.useRef;
+var createElement = React.createElement;
+
+var { Select, Drawer } = ctx.antd;
+
+// ─────────────────────────────────────────────────────────────
+// SHARED CONFIG / CONSTANTS / HELPERS
+// ─────────────────────────────────────────────────────────────
+var CONFIG = {
+  uid_collections: 'photo_dash_cols',
+  uid_samples:     'photo_dash_samp',
+  uid_detail:      'photo_dash_detail',
+  uid_variants:    'photo_dash_variants',
+  uid_images:      'photo_dash_images',
+  uid_designer:    'photo_dash_designer',
+  uid_progress_variants: 'photo_dash_progress_variants',
+
+  uid_summary:        'sample_coll_summary',
+  uid_variants2:      'sample_coll_variants',
+  uid_sample_status:  'sample_coll_sstatus',
+  uid_variant_status: 'sample_coll_vstatus',
+  uid_designer_opts:  'sample_coll_designer_opts',
+};
+
+var STATUS_ORDER = ['ideas','pola','first_sample','pricing','color','done','cancel'];
+
+var STATUS_META = {
+  ideas:        { label: 'Ideas',        color: '#f97316', group: 'inprogress' },
+  pola:         { label: 'Pola',         color: '#f97316', group: 'inprogress' },
+  first_sample: { label: 'First Sample', color: '#d97706', group: 'inprogress' },
+  pricing:      { label: 'Pricing',      color: '#84cc16', group: 'approved' },
+  color:        { label: 'Color Sample', color: '#84cc16', group: 'approved' },
+  done:         { label: 'Done',         color: '#22c55e', group: 'approved' },
+  cancel:       { label: 'Cancel',       color: '#ef4444', group: 'cancel' },
+};
+
+var TYPE_LABELS = {
+  atasan: 'Atasan', tunik: 'Tunik', bawahan: 'Bawahan',
+  dress: 'Dress', set: 'Set', outerwear: 'Outerwear', hijab: 'Hijab',
+  __warna_lama__: 'Warna Lama',
+};
+
+var TYPE_ORDER = ['atasan','tunik','bawahan','dress','set','outerwear','hijab'];
+
+// By-Progress grouping (Collection Preview). Order controls display order.
+var PROGRESS_ORDER = ['ideas','pola','first_sample','revision','qc','approval','approved'];
+
+var PROGRESS_LABELS = {
+  ideas:        'Ideas',
+  pola:         'Pola',
+  first_sample: 'First Sample',
+  revision:     'Revision',
+  qc:           'QC',
+  approval:     'Need Approval',
+  approved:     'Approved',
+};
+
+var SAMPLE_INPROGRESS  = ['ideas','pola','first_sample'];
+var SAMPLE_APPROVED    = ['pricing','color','done'];
+var SAMPLE_CANCEL      = ['cancel'];
+
+var VARIANT_INPROGRESS = ['sewing','qc','approval'];
+var VARIANT_APPROVED   = ['done'];
+var VARIANT_CANCEL     = ['cancel'];
+
+function getStatus(val) {
+  return STATUS_META[String(val || '').toLowerCase()] || { label: val || '—', color: '#9ca3af', group: 'other' };
+}
+
+function classifySample(status) {
+  var s = String(status || '').toLowerCase();
+  if (SAMPLE_INPROGRESS.indexOf(s) !== -1) return 'inprogress';
+  if (SAMPLE_APPROVED.indexOf(s) !== -1)   return 'approved';
+  if (SAMPLE_CANCEL.indexOf(s) !== -1)     return 'cancel';
+  return 'other';
+}
+
+function classifyVariant(status) {
+  var s = String(status || '').toLowerCase();
+  if (VARIANT_INPROGRESS.indexOf(s) !== -1) return 'inprogress';
+  if (VARIANT_APPROVED.indexOf(s) !== -1)   return 'approved';
+  if (VARIANT_CANCEL.indexOf(s) !== -1)     return 'cancel';
+  return 'other';
+}
+
+// Determine the "By Progress" bucket for a sample based on its own status
+// and its variants' statuses.
+//   ideas        -> sample.status = ideas
+//   pola         -> sample.status = pola
+//   first_sample -> sample.status = first_sample, no variant in revision/qc/approval
+//   revision     -> sample.status = first_sample, any variant = minor_revision
+//   qc           -> sample.status = first_sample, any variant = qc
+//   approval     -> sample.status = first_sample, any variant = approval (labeled "Need Approval")
+//   approved     -> sample.status = color or done
+// Priority when a sample has variants in more than one of revision/qc/approval:
+// revision > qc > approval (revision surfaces the sample as needing attention
+// first, then qc, then approval). Anything else (pricing, cancel)
+// returns null and is excluded from the By Progress view.
+function classifyProgress(sample, variantStatuses) {
+  var status = String((sample && sample.status) || '').toLowerCase();
+  if (status === 'ideas') return 'ideas';
+  if (status === 'pola') return 'pola';
+  if (status === 'first_sample') {
+    var vs = (variantStatuses || []).map(function(s) { return String(s || '').toLowerCase(); });
+    if (vs.indexOf('minor_revision') !== -1) return 'revision';
+    if (vs.indexOf('qc') !== -1) return 'qc';
+    if (vs.indexOf('approval') !== -1) return 'approval';
+    return 'first_sample';
+  }
+  if (status === 'color' || status === 'done') return 'approved';
+  return null;
+}
+
+function runSql(uid, sql) {
+  var s = ctx.sql;
+  if (!s) return Promise.resolve([]);
+  return s.save({ uid: uid, sql: sql, dataSourceKey: 'main' })
+    .catch(function(){})
+    .then(function() { return s.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+    .then(function(r) { return r || []; });
+}
+
+function buildImgUrl(filename, url) {
+  if (url) return url;
+  if (filename) return window.location.origin + '/storage/uploads/' + filename;
+  return '';
+}
+
+// Small opaque price label shown on thumbnails / detail meta rows
+function formatPrice(v) {
+  var n = Number(v);
+  if (!n) return '';
+  return 'Rp' + n.toLocaleString('id-ID');
+}
+
+// ─────────────────────────────────────────────────────────────
+// SAMPLE DETAIL MODAL (opened from a thumbnail inside Collection Preview)
+// ─────────────────────────────────────────────────────────────
+var SampleModal = function(props) {
+  var sampleId = props.sampleId;
+  var onClose  = props.onClose;
+
+  var stateD  = useState(null); var detail       = stateD[0];   var setDetail       = stateD[1];
+  var stateV  = useState([]);   var variants     = stateV[0];   var setVariants     = stateV[1];
+  var stateI  = useState([]);   var images       = stateI[0];   var setImages       = stateI[1];
+  var stateL  = useState(true); var loading      = stateL[0];   var setLoading      = stateL[1];
+  var stateBI = useState(0);    var bigImg       = stateBI[0];  var setBigImg       = stateBI[1];
+  var stateOD = useState({});   var designerMap  = stateOD[0];  var setDesignerMap  = stateOD[1];
+  var stateOS = useState({});   var sewingPicMap = stateOS[0];  var setSwingPicMap  = stateOS[1];
+  var stateCm = useState([]);   var comments     = stateCm[0];  var setComments     = stateCm[1];
+  var stateMt = useState([]);   var materials    = stateMt[0];  var setMaterials    = stateMt[1];
+  var stateNC = useState('');   var newComment   = stateNC[0];  var setNewComment   = stateNC[1];
+  var statePosting = useState(false); var posting = statePosting[0]; var setPosting = statePosting[1];
+
+  useEffect(function() {
+    if (!sampleId) return;
+    setLoading(true);
+    setDetail(null); setVariants([]); setImages([]); setBigImg(0);
+
+    var sql = ctx.sql;
+    function q(uid, sqlStr) {
+      return sql.save({ uid: uid, sql: sqlStr, dataSourceKey: 'main' })
+        .catch(function(){})
+        .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+        .then(function(r) { return r || []; });
+    }
+
+    function parseOptionsMap(optionsJson) {
+      var map = {};
+      try {
+        var parsed = typeof optionsJson === 'string' ? JSON.parse(optionsJson) : optionsJson;
+        var enumArr = (parsed && parsed.uiSchema && parsed.uiSchema.enum) ? parsed.uiSchema.enum : [];
+        enumArr.forEach(function(o) { if (o.value && o.label) map[o.value] = o.label; });
+      } catch(e) {}
+      return map;
+    }
+
+    function loadComments() {
+      return q('photo_dash_comments_' + sampleId,
+        "SELECT sample_comment.id AS id, users.nickname AS name, " +
+        "sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+        "FROM sample_comment, users " +
+        "WHERE sample_comment.fk_sample_id = " + sampleId + " " +
+        "AND sample_comment.created_by_id = users.id " +
+        "ORDER BY sample_comment.created_at DESC"
+      ).then(function(rows) { setComments(rows); });
+    }
+
+    function loadMaterials() {
+      return q('photo_dash_materials_' + sampleId,
+        "SELECT fk_raw_material_code AS material_code " +
+        "FROM sample_material WHERE fk_sample_id = " + sampleId + " ORDER BY id ASC"
+      ).then(function(rows) { setMaterials(rows); });
+    }
+
+    q(CONFIG.uid_detail + '_' + sampleId,
+      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
+      "sample.type AS type, sample.designer AS designer, sample.target_price AS target_price, " +
+      "sample.description AS sample_description, " +
+      "sample.remarks AS sample_remarks, " +
+      "collection.name AS collection_name " +
+      "FROM sample, collection " +
+      "WHERE sample.id = " + sampleId + " AND sample.fk_collection_id = collection.id"
+    ).then(function(rows) {
+      if (rows.length) setDetail(rows[0]);
+      return q('photo_dash_fld_designer',
+        "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'"
+      );
+    }).then(function(frows) {
+      if (frows.length && frows[0].options) setDesignerMap(parseOptionsMap(frows[0].options));
+      return q('photo_dash_fld_sewingpic',
+        "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample_variant' AND name = 'sewing_pic'"
+      );
+    }).then(function(frows) {
+      if (frows.length && frows[0].options) setSwingPicMap(parseOptionsMap(frows[0].options));
+      return q(CONFIG.uid_variants + '_' + sampleId,
+        "SELECT sample_variant.id AS id, sample_variant.status AS status, " +
+        "sample_variant.sewing_pic AS sewing_pic, sample_variant.fk_fabric_code AS fabric_code " +
+        "FROM sample_variant WHERE sample_variant.fk_sample_variant_id = " + sampleId
+      );
+    }).then(function(vrows) {
+      setVariants(vrows);
+      return q(CONFIG.uid_images + '_' + sampleId,
+        "SELECT attachments.url AS img_url, attachments.filename AS img_filename " +
+        "FROM t_wda3bnmr9c9, attachments " +
+        "WHERE t_wda3bnmr9c9.f_57nmxuosclw = " + sampleId + " " +
+        "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd ORDER BY attachments.id ASC"
+      );
+    }).then(function(irows) {
+      var origin = window.location.origin;
+      setImages(irows.map(function(r) {
+        return r.img_url || (r.img_filename ? origin + '/storage/uploads/' + r.img_filename : null);
+      }).filter(Boolean));
+      setLoading(false);
+      loadComments();
+      loadMaterials();
+    }).catch(function(e) { console.error('modal load error', e); setLoading(false); });
+  }, [sampleId]);
+
+  function addComment() {
+    var text = newComment.trim();
+    if (!text || !sampleId) return;
+    setPosting(true);
+
+    var apiCall;
+    if (ctx.api && typeof ctx.api.resource === 'function') {
+      apiCall = ctx.api.resource('sample_comment').create({
+        values: { fk_sample_id: sampleId, comment: text }
+      });
+    } else if (ctx.api && typeof ctx.api.request === 'function') {
+      apiCall = ctx.api.request({
+        url: 'sample_comment:create',
+        method: 'post',
+        data: { fk_sample_id: sampleId, comment: text }
+      });
+    } else {
+      console.error('No ctx.api available', ctx.api);
+      setPosting(false);
+      return;
+    }
+
+    apiCall.then(function() {
+      setNewComment('');
+      setPosting(false);
+      var sql = ctx.sql;
+      var uid = 'photo_dash_comments_reload_' + Date.now();
+      return sql.save({
+        uid: uid,
+        sql: "SELECT sample_comment.id AS id, users.nickname AS name, " +
+          "sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+          "FROM sample_comment, users " +
+          "WHERE sample_comment.fk_sample_id = " + sampleId + " " +
+          "AND sample_comment.created_by_id = users.id " +
+          "ORDER BY sample_comment.created_at DESC",
+        dataSourceKey: 'main'
+      }).catch(function(){})
+      .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+      .then(function(rows) { setComments(rows || []); });
+    }).catch(function(e) {
+      console.error('post comment error', e);
+      setPosting(false);
+    });
+  }
+
+  var st = detail ? getStatus(detail.status) : { label: '—', color: '#9ca3af' };
+
+  function metaRow(label, value) {
+    if (!value) return null;
+    return createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 6 } },
+      createElement('div', { style: { fontSize: 11, color: '#9ca3af', minWidth: 80, paddingTop: 1 } }, label),
+      createElement('div', { style: { fontSize: 12, color: '#1e293b', fontWeight: 500 } }, value)
+    );
+  }
+
+  function htmlBlock(label, html) {
+    if (!html) return null;
+    return createElement('div', { style: { marginBottom: 16 } },
+      createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 6 } }, label),
+      createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.7 }, dangerouslySetInnerHTML: { __html: html } })
+    );
+  }
+
+  function openEditDrawer() {
+    try {
+      var popupUid = ctx.model.uid + '-1';
+      ctx.openView(popupUid, {
+        navigation: false,
+        mode: 'drawer',
+        size: 'large',
+        title: 'Edit Sample',
+        dataSourceKey: 'main',
+        collectionName: 'sample',
+        filterByTk: detail.id,
+      });
+    } catch (e) { console.error('open edit drawer', e); }
+  }
+
+  return createElement(Drawer, {
+    open: true,
+    onClose: onClose,
+    placement: 'right',
+    closable: false,
+    maskClosable: true,
+    width: 480,
+    rootClassName: 'sample-modal-drawer',
+    bodyStyle: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' },
+    title: createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 } },
+      createElement('button', { onClick: onClose, style: { border: 'none', background: '#f1f5f9', borderRadius: 6, width: 28, height: 28, flexShrink: 0, cursor: 'pointer', fontSize: 14, color: '#64748b', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '✕'),
+      createElement('div', { style: { fontSize: 15, fontWeight: 700, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, detail ? detail.name : '…')
+    ),
+    extra: detail ? createElement('button', {
+      onClick: openEditDrawer,
+      style: { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 6, padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#475569', fontWeight: 500 }
+    }, '✏️ Edit') : null,
+  },
+    createElement('style', null, `
+      @media (min-width: 701px) {
+        .sample-modal-drawer .ant-drawer-content-wrapper { width: min(980px, 92vw) !important; }
+        .cp-modal-summary { flex-direction: row !important; align-items: flex-start !important; }
+        .cp-modal-images { width: 280px !important; flex-shrink: 0 !important; }
+        .cp-modal-fields { flex: 1 1 auto !important; }
+        .cp-modal-lower { flex-direction: row !important; align-items: flex-start !important; }
+        .cp-modal-detail { flex: 1 1 auto !important; min-width: 0 !important; }
+        .cp-modal-comments { width: 320px !important; flex-shrink: 0 !important; border-left: 1px solid #f1f5f9 !important; border-top: none !important; }
+      }
+      @media (max-width: 700px) {
+        .sample-modal-drawer .ant-drawer-content-wrapper { width: 100% !important; }
+      }
+    `),
+    createElement('div', { style: { height: 3, width: '100%', flexShrink: 0, background: st.color } }),
+    loading
+      ? createElement('div', { style: { padding: 60, textAlign: 'center', color: '#94a3b8' } }, 'Loading…')
+      : createElement('div', { className: 'cp-modal-body', style: { display: 'flex', flexDirection: 'column', flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', minHeight: 0 } },
+            createElement('div', { className: 'cp-modal-summary', style: { display: 'flex', flexDirection: 'column', flexShrink: 0, gap: 16, padding: '16px 20px', borderBottom: '1px solid #f1f5f9' } },
+              createElement('div', { className: 'cp-modal-images', style: { width: '100%', flexShrink: 0, background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
+                images.length > 0
+                  ? createElement('img', { src: images[bigImg] || images[0], style: { width: '100%', display: 'block', objectFit: 'contain', maxHeight: 260, background: '#f8fafc' } })
+                  : createElement('div', { style: { height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#cbd5e1', fontSize: 13 } }, 'No images'),
+                images.length > 1
+                  ? createElement('div', { style: { display: 'flex', gap: 4, padding: 8, overflowX: 'auto', background: '#f1f5f9', borderTop: '1px solid #e5e7eb' } },
+                      images.map(function(url, ii) {
+                        return createElement('img', { key: ii, src: url, onClick: function() { setBigImg(ii); }, style: { width: 52, height: 52, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', flexShrink: 0, border: bigImg === ii ? '2px solid #6366f1' : '2px solid #e2e8f0', opacity: bigImg === ii ? 1 : 0.7 } });
+                      })
+                    )
+                  : null
+              ),
+              createElement('div', { className: 'cp-modal-fields', style: { minWidth: 0 } },
+                detail ? createElement('div', { style: { marginBottom: 14 } },
+                  createElement('span', { style: { background: st.color + '20', color: st.color, border: '1px solid ' + st.color + '44', borderRadius: 99, padding: '3px 12px', fontSize: 11, fontWeight: 700 } }, st.label)
+                ) : null,
+                detail ? createElement('div', null,
+                  metaRow('Collection', detail.collection_name),
+                  metaRow('Type', TYPE_LABELS[detail.type] || detail.type),
+                  metaRow('Designer', designerMap[detail.designer] || detail.designer),
+                  metaRow('Target Price', detail.target_price ? formatPrice(detail.target_price) : null),
+                ) : null
+              )
+            ),
+            createElement('div', { className: 'cp-modal-lower', style: { display: 'flex', flexDirection: 'column' } },
+            createElement('div', { className: 'cp-modal-detail', style: { padding: '16px 20px', flexShrink: 0, minWidth: 0, overflow: 'hidden' } },
+              variants.length > 0
+                ? createElement('div', { style: { marginBottom: 16 } },
+                    createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 8 } }, 'Variants (' + variants.length + ')'),
+                    variants.map(function(v, vi) {
+                      var vs = getStatus(v.status);
+                      return createElement('div', { key: vi, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderRadius: 6, background: '#f8fafc', marginBottom: 4, fontSize: 12, minWidth: 0, overflow: 'hidden' } },
+                        createElement('div', { style: { width: 7, height: 7, borderRadius: '50%', background: vs.color, flexShrink: 0 } }),
+                        createElement('span', { style: { color: '#374151', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, v.fabric_code || '—'),
+                        createElement('span', { style: { fontSize: 10, color: '#64748b', flexShrink: 0, whiteSpace: 'nowrap' } }, sewingPicMap[v.sewing_pic] || v.sewing_pic || ''),
+                        createElement('span', { style: { fontSize: 10, fontWeight: 600, color: vs.color, background: vs.color + '15', borderRadius: 4, padding: '1px 6px', flexShrink: 0, whiteSpace: 'nowrap' } }, vs.label)
+                      );
+                    })
+                  )
+                : null,
+              materials.length > 0
+                ? createElement('div', { style: { marginBottom: 16 } },
+                    createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 8 } }, 'Materials'),
+                    createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                      materials.map(function(m, mi) {
+                        return createElement('div', { key: mi, style: { padding: '5px 8px', borderRadius: 6, background: '#f8fafc', fontSize: 12, fontWeight: 600, color: '#1e293b' } }, m.material_code);
+                      })
+                    )
+                  )
+                : null,
+              detail && detail.sample_description ? htmlBlock('Description', detail.sample_description) : null,
+              detail && detail.sample_remarks ? htmlBlock('Remarks', detail.sample_remarks) : null
+            ),
+
+            createElement('div', { className: 'cp-modal-comments', style: { width: '100%', flexShrink: 0, borderLeft: 'none', borderTop: '1px solid #f1f5f9', padding: '16px 20px', display: 'flex', flexDirection: 'column' } },
+              createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 10 } }, 'Comments'),
+              createElement('div', { className: 'cp-modal-comments-list', style: { maxHeight: 240, overflowY: 'auto', marginBottom: 10 } },
+                comments.length === 0
+                  ? createElement('div', { style: { color: '#d1d5db', fontSize: 12, fontStyle: 'italic' } }, 'No comments yet')
+                  : comments.map(function(c, ci) {
+                      return createElement('div', { key: ci, style: { borderLeft: '2px solid #e2e8f0', paddingLeft: 10, marginBottom: 10 } },
+                        createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 } },
+                          createElement('span', { style: { fontWeight: 700, fontSize: 11, color: '#1e293b' } }, c.name || '—'),
+                          createElement('span', { style: { fontSize: 9, color: '#94a3b8' } }, String(c.comment_date || '').substring(0, 16).replace('T', ' '))
+                        ),
+                        createElement('div', { style: { fontSize: 11, color: '#374151', lineHeight: 1.5 }, dangerouslySetInnerHTML: { __html: c.comment || '' } })
+                      );
+                    })
+              ),
+              createElement('div', { style: { borderTop: '1px solid #f1f5f9', paddingTop: 10 } },
+                createElement('textarea', {
+                  value: newComment,
+                  onChange: function(e) { setNewComment(e.target.value); },
+                  placeholder: 'Add a comment…',
+                  rows: 3,
+                  style: { width: '100%', fontSize: 12, padding: 8, borderRadius: 6, border: '1px solid #e2e8f0', resize: 'vertical', fontFamily: 'inherit', marginBottom: 6, boxSizing: 'border-box' }
+                }),
+                createElement('button', {
+                  onClick: addComment,
+                  disabled: posting || !newComment.trim(),
+                  style: {
+                    width: '100%', padding: '6px 0', fontSize: 12, fontWeight: 600,
+                    border: 'none', borderRadius: 6, cursor: (posting || !newComment.trim()) ? 'not-allowed' : 'pointer',
+                    background: (posting || !newComment.trim()) ? '#e2e8f0' : '#6366f1',
+                    color: (posting || !newComment.trim()) ? '#94a3b8' : '#fff',
+                  }
+                }, posting ? 'Posting…' : 'Post Comment'),
+                createElement('button', {
+                  onClick: onClose,
+                  style: {
+                    width: '100%', padding: '6px 0', fontSize: 12, fontWeight: 600, marginTop: 6,
+                    border: '1px solid #e2e8f0', borderRadius: 6, cursor: 'pointer',
+                    background: '#fff', color: '#64748b',
+                  }
+                }, 'Close'),
+                createElement('div', { className: 'cp-modal-spacer', style: { width: '100%', height: 100 } })
+              )
+            )
+            )
+          )
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// MOODBOARD TILE (with target_price overlay, top-left, small & opaque)
+// ─────────────────────────────────────────────────────────────
+var SampleTile = function(props) {
+  var s = props.sample;
+  var onOpen = props.onOpen;
+  var st = getStatus(s.status);
+  var firstImg = s.img_url || '';
+  var priceLabel = formatPrice(s.target_price);
+
+  return createElement('div', {
+    style: { position: 'relative', overflow: 'hidden', borderRadius: 6, cursor: 'pointer', background: '#e5e7eb', breakInside: 'avoid', marginBottom: 8 },
+    onClick: function() { onOpen(s.id); },
+  },
+    firstImg
+      ? createElement('img', { src: firstImg, style: { width: '100%', display: 'block', borderRadius: 6 }, onerror: function(e) { e.target.parentElement.style.display = 'none'; } })
+      : createElement('div', { style: { height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 18 } }, '📷'),
+    priceLabel
+      ? createElement('div', {
+          style: {
+            position: 'absolute', top: 5, left: 5,
+            background: 'rgba(15,23,42,0.55)', color: '#fff',
+            fontSize: 9, fontWeight: 700, borderRadius: 4,
+            padding: '1px 5px', lineHeight: 1.5, letterSpacing: '0.01em',
+          }
+        }, priceLabel)
+      : null,
+    createElement('div', {
+      style: { position: 'absolute', bottom: 6, right: 6, width: 8, height: 8, borderRadius: '50%', background: st.group === 'approved' ? '#22c55e' : st.group === 'cancel' ? '#ef4444' : '#f97316', opacity: 0.75, boxShadow: '0 0 0 2px rgba(255,255,255,0.65)' }
+    })
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// GROUP CARD (Pinterest style, used inside Collection Preview for both
+// "By Type" and "By Progress" grouped views). `label` overrides the
+// TYPE_LABELS lookup so it can be reused for progress-bucket labels too.
+// ─────────────────────────────────────────────────────────────
+var TypeCard = function(props) {
+  var typeKey  = props.typeKey;
+  var samples  = props.samples;
+  var onSelect = props.onSelect;
+
+  var label  = props.label || TYPE_LABELS[typeKey] || typeKey;
+  var nonCancel = samples.filter(function(s) { return getStatus(s.status).group !== 'cancel'; });
+  var inProg = nonCancel.filter(function(s) { return getStatus(s.status).group === 'inprogress'; }).length;
+  var approv = nonCancel.filter(function(s) { return getStatus(s.status).group === 'approved'; }).length;
+
+  var previews = nonCancel.filter(function(s) { return !!s.img_url; }).slice(0, 4);
+
+  return createElement('div', {
+    onClick: function() { onSelect(typeKey); },
+    style: { borderRadius: 10, overflow: 'hidden', cursor: 'pointer', background: '#fff', border: '1px solid #e5e7eb', boxShadow: '0 1px 4px rgba(0,0,0,0.06)', transition: 'box-shadow 0.15s' }
+  },
+    createElement('div', {
+      style: { display: 'grid', gridTemplateColumns: previews.length > 1 ? '1fr 1fr' : '1fr', gridTemplateRows: previews.length > 2 ? '1fr 1fr' : '1fr', height: 180, background: '#f1f5f9', gap: 1, overflow: 'hidden' }
+    },
+      previews.length === 0
+        ? createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 28 } }, '📷')
+        : previews.map(function(s, i) {
+            return createElement('div', { key: i, style: { overflow: 'hidden' } },
+              createElement('img', {
+                src: s.img_url,
+                style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
+                onerror: function(e) { e.target.parentElement.style.background = '#e5e7eb'; e.target.style.display = 'none'; }
+              })
+            );
+          })
+    ),
+    createElement('div', { style: { padding: '8px 10px' } },
+      createElement('div', { style: { fontWeight: 700, fontSize: 13, color: '#1e293b', marginBottom: 3 } }, label),
+      createElement('div', { style: { display: 'flex', gap: 8, fontSize: 11 } },
+        createElement('span', { style: { color: '#64748b' } }, nonCancel.length + ' samples'),
+        createElement('span', { style: { color: '#f97316', fontWeight: 600 } }, '● ' + inProg),
+        createElement('span', { style: { color: '#22c55e', fontWeight: 600 } }, '● ' + approv)
+      )
+    )
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// MASONRY GRID
+// ─────────────────────────────────────────────────────────────
+var MasonryGrid = function(props) {
+  var samples  = props.samples;
+  var onOpen   = props.onOpen;
+  var maxCols  = props.maxCols || 4;
+
+  var STATUS_SORT = ['done','color','pricing','first_sample','pola','ideas'];
+  var sorted = samples.slice().sort(function(a, b) {
+    var ai = STATUS_SORT.indexOf(String(a.status || '').toLowerCase());
+    var bi = STATUS_SORT.indexOf(String(b.status || '').toLowerCase());
+    if (ai === -1) ai = 99; if (bi === -1) bi = 99;
+    return ai - bi;
+  });
+
+  var columns = [];
+  for (var c = 0; c < maxCols; c++) columns.push([]);
+  sorted.forEach(function(s, idx) {
+    columns[idx % maxCols].push(s);
+  });
+
+  return createElement('div', { style: { display: 'flex', gap: 8 } },
+    columns.map(function(colSamples, colIdx) {
+      return createElement('div', { key: colIdx, style: { flex: 1, display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 } },
+        colSamples.map(function(s) {
+          return createElement(SampleTile, { key: s.id, sample: s, onOpen: onOpen });
+        })
+      );
+    })
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// GROUP DETAIL VIEW (back from category/progress grid within Collection
+// Preview). `label` overrides the TYPE_LABELS lookup, same as TypeCard.
+// ─────────────────────────────────────────────────────────────
+var TypeDetailView = function(props) {
+  var typeKey    = props.typeKey;
+  var samples    = props.samples;
+  var onBack     = props.onBack;
+  var onOpen     = props.onOpen;
+  var colCount   = props.colCount;
+
+  var label = props.label || TYPE_LABELS[typeKey] || typeKey;
+  var nonCancel = samples.filter(function(s) { return String(s.status || '') !== 'cancel'; });
+
+  return createElement('div', null,
+    createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 } },
+      createElement('button', {
+        onClick: onBack,
+        style: { border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#64748b' }
+      }, '← Back'),
+      createElement('span', { style: { fontSize: 15, fontWeight: 700, color: '#1e293b' } }, label),
+      createElement('span', { style: { fontSize: 12, color: '#94a3b8' } }, samples.length + ' samples')
+    ),
+    createElement(MasonryGrid, { samples: nonCancel, onOpen: onOpen, maxCols: colCount })
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// COLLECTION PREVIEW PAGE (full page, replaces the old standalone jblock)
+// props: initialCollectionId, initialType, initialViewMode, onBack
+// ─────────────────────────────────────────────────────────────
+var CollectionPreviewPage = function(props) {
+  var stateC   = useState([]);      var collections   = stateC[0];   var setCollections   = stateC[1];
+  var stateSel = useState(props.initialCollectionId ? String(props.initialCollectionId) : null);
+  var selectedCol = stateSel[0]; var setSelectedCol = stateSel[1];
+  var stateS   = useState([]);      var samples       = stateS[0];   var setSamples       = stateS[1];
+  var stateLS  = useState(false);   var loadingSamp   = stateLS[0];  var setLoadingSamp   = stateLS[1];
+  var stateSz  = useState('md');    var thumbSize     = stateSz[0];  var setThumbSize     = stateSz[1];
+  var stateMod = useState(null);    var modalSampleId = stateMod[0]; var setModalSampleId = stateMod[1];
+  var stateDM  = useState({});      var designerMap   = stateDM[0];  var setDesignerMap   = stateDM[1];
+  var stateVw  = useState(props.initialViewMode || 'all'); var viewMode = stateVw[0]; var setViewMode = stateVw[1];
+  var stateST  = useState(props.initialType || null); var selectedType = stateST[0]; var setSelectedType = stateST[1];
+
+  var firstRunRef = useRef(true);
+
+  // Switch view mode (all / category / progress) and clear any drill-down
+  // selection, since selectedType keys differ between "By Type" and
+  // "By Progress" and a stale value would look up an empty group.
+  function switchViewMode(mode) {
+    setSelectedType(null);
+    setViewMode(mode);
+  }
+
+  useEffect(function() {
+    runSql(CONFIG.uid_collections,
+      "SELECT collection.id AS id, collection.name AS name, collection.target_photoshoot AS target_photoshoot " +
+      "FROM collection " +
+      "WHERE (collection.photoshoot IS NULL OR collection.photoshoot = 0 OR collection.photoshoot = FALSE) " +
+      "ORDER BY collection.target_photoshoot ASC, collection.name ASC"
+    ).then(function(rows) {
+      setCollections(rows);
+      if (rows.length > 0) {
+        setSelectedCol(function(prev) { return prev || String(rows[0].id); });
+      }
+    });
+
+    var s = ctx.sql;
+    if (!s) return;
+    var designerOptUid = 'photo_dash_designer_' + Date.now();
+    s.save({ uid: designerOptUid, sql: "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'", dataSourceKey: 'main' })
+      .catch(function(){})
+      .then(function() { return s.runById(designerOptUid, { type: 'selectRows', dataSourceKey: 'main' }); })
+      .then(function(frows) {
+        var map = {};
+        try {
+          var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
+          var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
+          arr.forEach(function(o) { if (o.value) map[o.value] = o.label || o.value; });
+        } catch(e) {}
+        setDesignerMap(map);
+      });
+  }, []);
+
+  useEffect(function() {
+    if (!selectedCol) return;
+    setLoadingSamp(true);
+    setSamples([]);
+    if (firstRunRef.current) {
+      // Preserve any initial selectedType/viewMode passed in via props on first load
+      firstRunRef.current = false;
+    } else {
+      setSelectedType(null);
+    }
+    var sampUid = CONFIG.uid_samples + '_' + selectedCol + '_' + Date.now();
+    var imgUid  = CONFIG.uid_samples + '_img_' + selectedCol + '_' + Date.now();
+    var varUid  = CONFIG.uid_progress_variants + '_' + selectedCol + '_' + Date.now();
+
+    runSql(sampUid,
+      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
+      "sample.type AS type, sample.designer AS designer, sample.is_new AS is_new, " +
+      "sample.target_price AS target_price " +
+      "FROM sample " +
+      "WHERE sample.fk_collection_id = " + selectedCol + " " +
+      "ORDER BY sample.name ASC"
+    ).then(function(sampleRows) {
+      return runSql(imgUid,
+        "SELECT t_wda3bnmr9c9.f_57nmxuosclw AS sample_id, " +
+        "attachments.url AS img_url, attachments.filename AS img_filename " +
+        "FROM t_wda3bnmr9c9, attachments " +
+        "WHERE attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+        "ORDER BY attachments.id ASC"
+      ).then(function(imgRows) {
+        var imgMap = {};
+        imgRows.forEach(function(r) {
+          var sid = String(r.sample_id);
+          if (!imgMap[sid]) imgMap[sid] = buildImgUrl(r.img_filename, r.img_url);
+        });
+
+        return runSql(varUid,
+          "SELECT sample_variant.fk_sample_variant_id AS sample_id, sample_variant.status AS status " +
+          "FROM sample_variant, sample " +
+          "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+          "AND sample.fk_collection_id = " + selectedCol
+        ).then(function(varRows) {
+          var variantMap = {};
+          varRows.forEach(function(r) {
+            var sid = String(r.sample_id);
+            if (!variantMap[sid]) variantMap[sid] = [];
+            variantMap[sid].push(r.status);
+          });
+
+          var grouped = sampleRows.map(function(r) {
+            var isOld = String(r.is_new) === 'false' || r.is_new === 0 || r.is_new === false;
+            return {
+              id: r.id, name: r.name, status: r.status, type: r.type, designer: r.designer,
+              target_price: r.target_price,
+              is_old: isOld,
+              img_url: imgMap[String(r.id)] || '',
+              progress: classifyProgress(r, variantMap[String(r.id)]),
+            };
+          });
+
+          setSamples(grouped);
+          setLoadingSamp(false);
+        });
+      });
+    });
+  }, [selectedCol]);
+
+  var selectedColData = collections.find(function(c) { return String(c.id) === selectedCol; });
+
+  var nonCancelSamples = samples.filter(function(s) { return getStatus(s.status).group !== 'cancel' && !s.is_old; });
+  var inProgressCount = nonCancelSamples.filter(function(s) { return getStatus(s.status).group === 'inprogress'; }).length;
+  var approvedCount   = nonCancelSamples.filter(function(s) { return getStatus(s.status).group === 'approved'; }).length;
+
+  var designerCounts = {};
+  nonCancelSamples.forEach(function(s) {
+    if (!s.designer) return;
+    designerCounts[s.designer] = (designerCounts[s.designer] || 0) + 1;
+  });
+  var designerEntries = Object.keys(designerCounts).sort(function(a, b) { return designerCounts[b] - designerCounts[a]; });
+
+  var STATUS_SORT = ['done','color','pricing','first_sample','pola','ideas'];
+  var sortedSamples = samples.filter(function(s) {
+    return String(s.status || '') !== 'cancel' && !s.is_old;
+  }).slice().sort(function(a, b) {
+    var ai = STATUS_SORT.indexOf(String(a.status || '')); var bi = STATUS_SORT.indexOf(String(b.status || ''));
+    if (ai === -1) ai = 99; if (bi === -1) bi = 99;
+    return ai - bi;
+  });
+
+  var oldSamples = samples.filter(function(s) { return s.is_old; });
+
+  var typeGroups = {};
+  samples.forEach(function(s) {
+    if (s.is_old) return;
+    var t = s.type || 'unknown';
+    if (!typeGroups[t]) typeGroups[t] = [];
+    typeGroups[t].push(s);
+  });
+  var typeKeys = TYPE_ORDER.filter(function(t) { return typeGroups[t] && typeGroups[t].length > 0; });
+  var unknownTypes = Object.keys(typeGroups).filter(function(t) { return TYPE_ORDER.indexOf(t) === -1; });
+  typeKeys = typeKeys.concat(unknownTypes);
+
+  // Progress groups (Ideas / Pola / First Sample / Revision / QC / Approval)
+  var progressGroups = {};
+  samples.forEach(function(s) {
+    if (s.is_old) return;
+    if (!s.progress) return;
+    if (!progressGroups[s.progress]) progressGroups[s.progress] = [];
+    progressGroups[s.progress].push(s);
+  });
+  var progressKeys = PROGRESS_ORDER.filter(function(p) { return progressGroups[p] && progressGroups[p].length > 0; });
+
+  var colCount = { sm: 6, md: 4, lg: 3 }[thumbSize] || 4;
+  var SIZES = [{ key: 'sm', icon: '⣿' }, { key: 'md', icon: '▦' }, { key: 'lg', icon: '□' }];
+
+  return createElement('div', { style: { padding: 16, fontFamily: 'system-ui,sans-serif', background: '#f8fafc', minHeight: '100%' } },
+
+    createElement('style', null, `
+      @media (max-width: 1024px) {
+        .cp-toggle-group { margin-left: 0 !important; }
+      }
+      @media (max-width: 640px) {
+        .cp-header { flex-direction: column !important; align-items: flex-start !important; }
+        .cp-header-select-row { width: 100% !important; }
+        .cp-header-select-row .ant-select { min-width: 0 !important; width: 100% !important; }
+        .cp-meta-bar { justify-content: flex-start !important; }
+        .cp-toggle-group { flex-basis: 100% !important; justify-content: flex-start !important; }
+      }
+    `),
+
+    modalSampleId
+      ? createElement(SampleModal, { sampleId: modalSampleId, onClose: function() { setModalSampleId(null); } })
+      : null,
+
+    // Header
+    createElement('div', { className: 'cp-header', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', marginBottom: 14, gap: 12 } },
+      createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        props.onBack ? createElement('button', {
+          onClick: props.onBack,
+          style: { border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#64748b' }
+        }, '← Back') : null,
+        createElement('div', { style: { fontSize: 16, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.01em' } }, 'Collection Preview')
+      ),
+      createElement('div', { className: 'cp-header-select-row', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+        createElement('span', { style: { fontSize: 12, fontWeight: 600, color: '#475569' } }, 'Collection:'),
+        createElement(Select, {
+          value: selectedCol,
+          onChange: function(v) { setSelectedCol(v); },
+          style: { minWidth: 220 },
+          options: collections.map(function(c) {
+            var date = c.target_photoshoot ? ' · ' + String(c.target_photoshoot).substring(0, 10) : '';
+            return { value: String(c.id), label: c.name + date };
+          }),
+        })
+      )
+    ),
+
+    // Meta bar
+    selectedColData
+      ? createElement('div', {
+          className: 'cp-meta-bar',
+          style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14, padding: '8px 12px', background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', fontSize: 11 }
+        },
+          createElement('span', { style: { fontWeight: 700, color: '#0f172a', fontSize: 13 } }, selectedColData.name),
+          createElement('span', { style: { color: '#e2e8f0' } }, '·'),
+          createElement('span', { style: { color: '#64748b' } }, nonCancelSamples.length + ' samples'),
+          createElement('span', { style: { color: '#e2e8f0' } }, '·'),
+          createElement('span', { style: { color: '#f97316', fontWeight: 600 } }, '● ' + inProgressCount + ' in progress'),
+          createElement('span', { style: { color: '#22c55e', fontWeight: 600 } }, '● ' + approvedCount + ' approved'),
+          selectedColData.target_photoshoot
+            ? createElement('span', { style: { color: '#64748b' } }, '📅 ' + String(selectedColData.target_photoshoot).substring(0, 10))
+            : null,
+          designerEntries.length > 0 ? createElement('span', { style: { color: '#e2e8f0' } }, '·') : null,
+          designerEntries.map(function(d) {
+            return createElement('span', { key: d, style: { background: '#f0f4ff', color: '#4338ca', border: '1px solid #c7d2fe', borderRadius: 99, padding: '1px 8px', fontWeight: 600, fontSize: 10 } },
+              (designerMap[d] || d) + ' ' + designerCounts[d]
+            );
+          }),
+
+          createElement('div', { className: 'cp-toggle-group', style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' } },
+            createElement('div', { style: { display: 'flex', gap: 2, border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
+              createElement('button', {
+                onClick: function() { switchViewMode('all'); },
+                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', background: viewMode === 'all' ? '#eef2ff' : '#fff', color: viewMode === 'all' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'all' ? 700 : 400 }
+              }, 'All'),
+              createElement('button', {
+                onClick: function() { switchViewMode('category'); },
+                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'category' ? '#eef2ff' : '#fff', color: viewMode === 'category' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'category' ? 700 : 400 }
+              }, 'By Type'),
+              createElement('button', {
+                onClick: function() { switchViewMode('progress'); },
+                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'progress' ? '#eef2ff' : '#fff', color: viewMode === 'progress' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'progress' ? 700 : 400 }
+              }, 'By Progress')
+            ),
+            createElement('div', { style: { display: 'flex', gap: 3 } },
+              SIZES.map(function(sz) {
+                var active = thumbSize === sz.key;
+                return createElement('button', {
+                  key: sz.key,
+                  onClick: function() { setThumbSize(sz.key); },
+                  style: { padding: '2px 8px', fontSize: 11, cursor: 'pointer', border: '1px solid ' + (active ? '#6366f1' : '#e2e8f0'), borderRadius: 4, background: active ? '#eef2ff' : '#fff', color: active ? '#4338ca' : '#94a3b8', fontWeight: active ? 700 : 400 }
+                }, sz.icon);
+              })
+            )
+          )
+        )
+      : null,
+
+    // Content
+    loadingSamp
+      ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#94a3b8' } }, 'Loading…')
+      : samples.length === 0
+        ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in this collection')
+        : viewMode === 'all'
+          ? createElement(MasonryGrid, { samples: sortedSamples, onOpen: function(id) { setModalSampleId(id); }, maxCols: colCount })
+          : viewMode === 'progress'
+            ? (
+                selectedType
+                  ? createElement(TypeDetailView, {
+                      typeKey:  selectedType,
+                      label:    PROGRESS_LABELS[selectedType] || selectedType,
+                      samples:  progressGroups[selectedType] || [],
+                      onBack:   function() { setSelectedType(null); },
+                      onOpen:   function(id) { setModalSampleId(id); },
+                      colCount: colCount,
+                    })
+                  : progressKeys.length === 0
+                    ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in ideas/pola/first sample stages')
+                    : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
+                        progressKeys.map(function(pKey) {
+                          return createElement(TypeCard, {
+                            key:      pKey,
+                            typeKey:  pKey,
+                            label:    PROGRESS_LABELS[pKey],
+                            samples:  progressGroups[pKey] || [],
+                            onSelect: function(t) { setSelectedType(t); },
+                          });
+                        })
+                      )
+              )
+            : selectedType
+              ? createElement(TypeDetailView, {
+                  typeKey:  selectedType,
+                  samples:  selectedType === '__warna_lama__' ? oldSamples : (typeGroups[selectedType] || []),
+                  onBack:   function() { setSelectedType(null); },
+                  onOpen:   function(id) { setModalSampleId(id); },
+                  colCount: colCount,
+                })
+              : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
+                  typeKeys.map(function(typeKey) {
+                    return createElement(TypeCard, {
+                      key:      typeKey,
+                      typeKey:  typeKey,
+                      samples:  typeGroups[typeKey] || [],
+                      onSelect: function(t) { setSelectedType(t); },
+                    });
+                  }),
+                  oldSamples.length > 0
+                    ? createElement(TypeCard, {
+                        key:      '__warna_lama__',
+                        typeKey:  '__warna_lama__',
+                        samples:  oldSamples,
+                        onSelect: function(t) { setSelectedType(t); },
+                      })
+                    : null
+                )
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// SUMMARY REPORT PAGE (default view). Clicking a card, or a type
+// row inside it, navigates to the Collection Preview page (full
+// page change with a Back button) instead of opening a popup.
+// props: onOpenCollection(collectionId, { type, viewMode })
+// ─────────────────────────────────────────────────────────────
+var SummaryReportPage = function (props) {
+  var _d = useState(null), data = _d[0], setData = _d[1];
+  var _l = useState(true), loading = _l[0], setLoading = _l[1];
+
+  useEffect(function () {
+    setLoading(true);
+    var sql = ctx.sql;
+
+    function q(uid, sqlStr) {
+      return sql.save({ uid: uid, sql: sqlStr, dataSourceKey: 'main' })
+        .catch(function(){})
+        .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+        .then(function(r) { return r || []; });
+    }
+
+    q(CONFIG.uid_summary,
+      "SELECT collection.name AS collection_name, collection.id AS collection_id, " +
+      "collection.target_photoshoot AS target_photoshoot, " +
+      "sample.type AS type, sample.designer AS designer, sample.status AS sample_status, " +
+      "sample.is_new AS is_new, " +
+      "COUNT(*) AS sample_count, GROUP_CONCAT(sample.id) AS sample_ids " +
+      "FROM sample, collection " +
+      "WHERE sample.fk_collection_id = collection.id " +
+      "AND sample.status <> 'cancel' " +
+      "AND (collection.photoshoot = FALSE OR collection.photoshoot IS NULL) " +
+      "GROUP BY collection.id, sample.type, sample.designer, sample.status, sample.is_new " +
+      "ORDER BY collection.target_photoshoot ASC, collection.name"
+    ).then(function(rows) {
+
+      return q(CONFIG.uid_variants2,
+        "SELECT sample_variant.fk_sample_variant_id AS sample_id, sample_variant.status AS status, COUNT(*) AS variant_count " +
+        "FROM sample_variant, sample " +
+        "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+        "AND sample.status <> 'cancel' " +
+        "AND sample_variant.status <> 'cancel' " +
+        "GROUP BY sample_variant.fk_sample_variant_id, sample_variant.status"
+      ).then(function(varRows) {
+
+        return q('sample_coll_oldcount',
+          "SELECT sample.fk_collection_id AS collection_id, COUNT(*) AS old_count " +
+          "FROM sample_variant, sample " +
+          "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+          "AND sample.status <> 'cancel' " +
+          "AND sample.is_new = FALSE " +
+          "AND sample_variant.status <> 'cancel' " +
+          "GROUP BY sample.fk_collection_id"
+        ).then(function(oldRows) {
+
+        return q(CONFIG.uid_sample_status,
+          "SELECT fk_collection_id AS collection_id, status, COUNT(*) AS cnt " +
+          "FROM sample GROUP BY fk_collection_id, status"
+        ).then(function(sStatusRows) {
+
+          return q(CONFIG.uid_variant_status,
+            "SELECT sample.fk_collection_id AS collection_id, sample_variant.status AS status, COUNT(*) AS cnt " +
+            "FROM sample_variant, sample " +
+            "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+            "GROUP BY sample.fk_collection_id, sample_variant.status"
+          ).then(function(vStatusRows) {
+
+          return q(CONFIG.uid_designer_opts,
+            "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'"
+          ).then(function(frows) {
+
+            return q('sample_coll_checkpoints',
+              "SELECT fk_collection_id AS collection_id, checkpoint_date, approved_sample " +
+              "FROM collection_checkpoint ORDER BY checkpoint_date ASC"
+            ).then(function(cpRows) {
+
+            return q('sample_coll_target',
+              "SELECT fk_collection_id AS collection_id, approved_sample AS total_sample " +
+              "FROM collection_checkpoint " +
+              "WHERE (fk_collection_id, checkpoint_date) IN (" +
+              "  SELECT fk_collection_id, MAX(checkpoint_date) FROM collection_checkpoint GROUP BY fk_collection_id" +
+              ")"
+            ).then(function(targetRows) {
+
+            var targetMap = {};
+            targetRows.forEach(function(r) {
+              targetMap[String(r.collection_id)] = Number(r.total_sample) || 0;
+            });
+
+              var designerLabelMap = {};
+              try {
+                var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
+                var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
+                arr.forEach(function(o) { if (o.value) designerLabelMap[o.value] = o.label || o.value; });
+              } catch(e) {}
+
+              var sampleVariantMap = {};
+              varRows.forEach(function(v) {
+                var sid = String(v.sample_id);
+                if (!sampleVariantMap[sid]) sampleVariantMap[sid] = { total: 0, statuses: [] };
+                sampleVariantMap[sid].total += Number(v.variant_count) || 0;
+                for (var i = 0; i < (Number(v.variant_count) || 0); i++) {
+                  sampleVariantMap[sid].statuses.push(String(v.status || '').toLowerCase());
+                }
+              });
+
+              var collOrder = [];
+              var collMap = {};
+
+              rows.forEach(function(row) {
+                var cid = String(row.collection_id);
+                if (!collMap[cid]) {
+                  collOrder.push(cid);
+                  collMap[cid] = {
+                    name: row.collection_name,
+                    target_photoshoot: row.target_photoshoot,
+                    types: {},
+                    designers: {},
+                    sampleStatus:  { inprogress: 0, approved: 0, cancel: 0 },
+                    variantStatus: { inprogress: 0, approved: 0, cancel: 0 },
+                    totalVariants: 0,
+                    estVariants: 0,
+                    oldCount: 0,
+                  };
+                }
+
+                var sampleIds = row.sample_ids ? String(row.sample_ids).split(',') : [];
+
+                var variantTotal = sampleIds.reduce(function(sum, sid) {
+                  return sum + ((sampleVariantMap[sid.trim()] || {}).total || 0);
+                }, 0);
+
+                var isOld = String(row.is_new) === 'false' || row.is_new === 0 || row.is_new === false;
+                var sampleStatusLower = String(row.sample_status || '').toLowerCase();
+                var isDoneOrColor = (sampleStatusLower === 'done' || sampleStatusLower === 'color');
+
+                var estTotal = sampleIds.reduce(function(sum, sid) {
+                  var sv = sampleVariantMap[sid.trim()];
+                  var total = sv ? sv.total : 0;
+
+                  if (isDoneOrColor) return sum + total;
+                  if (isOld) return sum + total;
+                  if (!sv || total === 0) return sum + 3;
+                  if (total > 1) return sum + total;
+
+                  if (total === 1) {
+                    var allInProgress = sv.statuses.every(function(s) {
+                      return VARIANT_INPROGRESS.indexOf(s) !== -1;
+                    });
+                    if (allInProgress) return sum + 3;
+                  }
+
+                  return sum + total;
+                }, 0);
+
+                var typeKey = row.type || 'unknown';
+                if (!isOld) {
+                  if (!collMap[cid].types[typeKey]) {
+                    collMap[cid].types[typeKey] = { sample_count: 0 };
+                  }
+                  collMap[cid].types[typeKey].sample_count += Number(row.sample_count) || 0;
+
+                  var dKey = row.designer || '';
+                  if (dKey) {
+                    collMap[cid].designers[dKey] = (collMap[cid].designers[dKey] || 0) + (Number(row.sample_count) || 0);
+                  }
+                }
+
+                collMap[cid].totalVariants += variantTotal;
+                collMap[cid].estVariants   += estTotal;
+              });
+
+              sStatusRows.forEach(function(r) {
+                var cid = String(r.collection_id);
+                if (!collMap[cid]) return;
+                var cls = classifySample(r.status);
+                if (cls === 'inprogress' || cls === 'approved' || cls === 'cancel') {
+                  collMap[cid].sampleStatus[cls] += Number(r.cnt) || 0;
+                }
+              });
+
+              var today = new Date();
+              today.setHours(0, 0, 0, 0);
+
+              var cpMap = {};
+              cpRows.forEach(function(cp) {
+                var cid = String(cp.collection_id);
+                if (!cpMap[cid]) cpMap[cid] = [];
+                cpMap[cid].push({
+                  date: new Date(cp.checkpoint_date),
+                  dateStr: String(cp.checkpoint_date).substring(0, 10),
+                  approved_sample: Number(cp.approved_sample) || 0,
+                });
+              });
+
+              function fmtDate(d) {
+                var m = String(d.getMonth() + 1).padStart(2, '0');
+                var day = String(d.getDate()).padStart(2, '0');
+                return d.getFullYear() + '-' + m + '-' + day;
+              }
+
+              Object.keys(collMap).forEach(function(cid) {
+                collMap[cid].targetSample = targetMap[cid] || 0;
+                var cps = cpMap[cid] || [];
+                var past = null, next = null;
+                cps.forEach(function(cp) {
+                  if (cp.date <= today) {
+                    if (!past || cp.date > past.date) past = cp;
+                  } else {
+                    if (!next || cp.date < next.date) next = cp;
+                  }
+                });
+                var approvedCount = collMap[cid].sampleStatus.approved;
+                var isLate = past && approvedCount < past.approved_sample;
+                collMap[cid].pastCheckpoint = past ? Object.assign({}, past, { dateStr: fmtDate(past.date) }) : null;
+                collMap[cid].nextCheckpoint = next ? Object.assign({}, next, { dateStr: fmtDate(next.date) }) : null;
+                collMap[cid].isLate = isLate;
+              });
+
+              vStatusRows.forEach(function(r) {
+                var cid = String(r.collection_id);
+                if (!collMap[cid]) return;
+                var cls = classifyVariant(r.status);
+                if (cls === 'inprogress' || cls === 'approved' || cls === 'cancel') {
+                  collMap[cid].variantStatus[cls] += Number(r.cnt) || 0;
+                }
+              });
+
+              oldRows.forEach(function(r) {
+                var cid = String(r.collection_id);
+                if (collMap[cid]) collMap[cid].oldCount = Number(r.old_count) || 0;
+              });
+
+              setData({ collMap: collMap, collOrder: collOrder, designerLabelMap: designerLabelMap });
+              setLoading(false);
+            });
+            });
+          });
+          });
+        });
+        });
+      });
+    }).catch(function() { setLoading(false); });
+  }, []);
+
+  var S = {
+    wrap:      { padding: 16, background: '#fff', borderRadius: 8, fontFamily: 'system-ui,sans-serif', boxSizing: 'border-box' },
+    title:     { fontSize: 16, fontWeight: 700, marginBottom: 16, color: '#111827' },
+    grid:      { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 14 },
+    card:      { border: '1px solid #e5e7eb', borderRadius: 12, overflow: 'hidden', cursor: 'pointer', boxSizing: 'border-box', width: '100%' },
+    cardHead:  { padding: '12px 16px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb' },
+    cardName:  { fontSize: 14, fontWeight: 700, color: '#111827', marginBottom: 8 },
+    sumRow:    { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 },
+    chip: function(bg, color) {
+      return { display: 'inline-flex', gap: 4, background: bg, color: color, borderRadius: 6, padding: '2px 8px', fontSize: 11, fontWeight: 600 };
+    },
+    statusCard:  { background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: 8, padding: '6px 10px' },
+    statusLabel: { fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#6b7280', marginBottom: 4 },
+    statusRow:   { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+    statusItem:  { display: 'flex', flexDirection: 'column', alignItems: 'center' },
+    statusNum: function(c) { return { fontSize: 16, fontWeight: 700, color: c, lineHeight: 1 }; },
+    statusSub:   { fontSize: 9, color: '#9ca3af', marginTop: 2 },
+    statusDivider: { width: 1, height: 20, background: '#e5e7eb' },
+    cardBody:  { padding: '10px 16px 14px' },
+    secLabel:  { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 6 },
+    typeRow:   { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 10px', borderRadius: 8, background: '#f9fafb', marginBottom: 4, cursor: 'pointer' },
+    typeName:  { fontSize: 13, fontWeight: 600, color: '#374151', flex: 1 },
+    statBox:   { display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 44 },
+    statNum: function(c) { return { fontSize: 14, fontWeight: 700, color: c, lineHeight: 1 }; },
+    statLbl:   { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase', marginTop: 2 },
+  };
+
+  function statusSection(label, statusObj) {
+    return React.createElement('div', { style: S.statusCard },
+      React.createElement('div', { style: S.statusLabel }, label),
+      React.createElement('div', { style: S.statusRow },
+        React.createElement('div', { style: S.statusItem },
+          React.createElement('div', { style: S.statusNum('#f97316') }, statusObj.inprogress),
+          React.createElement('div', { style: S.statusSub }, 'In Progress')
+        ),
+        React.createElement('div', { style: S.statusDivider }),
+        React.createElement('div', { style: S.statusItem },
+          React.createElement('div', { style: S.statusNum('#22c55e') }, statusObj.approved),
+          React.createElement('div', { style: S.statusSub }, 'Approved')
+        )
+      )
+    );
+  }
+
+  if (loading) {
+    return React.createElement('div', { style: S.wrap },
+      React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…')
+    );
+  }
+  if (!data || !data.collOrder || !data.collOrder.length) {
+    return React.createElement('div', { style: S.wrap },
+      React.createElement('div', { style: S.title }, 'Sample Summary Report'),
+      React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#d1d5db', fontStyle: 'italic' } }, 'No data found')
+    );
+  }
+
+  var collections = data.collOrder.map(function(cid) { return data.collMap[cid]; });
+  var designerLabelMap = data.designerLabelMap || {};
+
+  return React.createElement('div', { className: 'ssr-wrap', style: S.wrap },
+    React.createElement('style', null, `
+      @media (max-width: 640px) {
+        .ssr-wrap { padding: 12px !important; }
+        .ssr-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
+      }
+    `),
+    React.createElement('div', { style: S.title }, 'Sample Summary Report'),
+    React.createElement('div', { className: 'ssr-grid', style: S.grid },
+      collections.map(function(coll, ci) {
+        var collId = data.collOrder[ci];
+        var types = Object.keys(coll.types).sort();
+        var totalSamples = types.reduce(function(s, t) { return s + coll.types[t].sample_count; }, 0);
+        var designers = Object.keys(coll.designers).sort(function(a, b) { return coll.designers[b] - coll.designers[a]; });
+
+        return React.createElement('div', {
+          key: ci,
+          style: Object.assign({}, S.card, coll.isLate ? { border: '1.5px solid #fca5a5', boxShadow: '0 0 0 3px #fee2e220' } : {}),
+          onClick: function() { props.onOpenCollection(collId); }
+        },
+
+          React.createElement('div', { style: Object.assign({}, S.cardHead, coll.isLate ? { background: '#fff5f5' } : {}) },
+
+            React.createElement('div', { style: S.cardName },
+              coll.name,
+              coll.target_photoshoot
+                ? React.createElement('span', { style: { fontSize: 11, fontWeight: 400, color: '#9ca3af', marginLeft: 8 } },
+                    '📅 ' + String(coll.target_photoshoot).substring(0, 10))
+                : null,
+              coll.targetSample > 0
+                ? React.createElement('span', { style: { fontSize: 11, fontWeight: 400, color: '#9ca3af', marginLeft: 8 } },
+                    '· ' + coll.targetSample + ' sample')
+                : null
+            ),
+
+            React.createElement('div', { style: S.sumRow },
+              React.createElement('span', { style: S.chip('#eff6ff','#3b82f6') }, totalSamples + ' samples'),
+              React.createElement('span', { style: S.chip('#f0fdf4','#16a34a') }, coll.totalVariants + ' warna'),
+              React.createElement('span', { style: S.chip('#faf5ff','#9333ea') }, coll.estVariants + ' est. total'),
+              coll.sampleStatus.cancel > 0
+                ? React.createElement('span', { style: S.chip('#fef2f2','#ef4444') }, coll.sampleStatus.cancel + ' cancel')
+                : null,
+              coll.oldCount > 0
+                ? React.createElement('span', { style: S.chip('#f8fafc','#64748b') }, coll.oldCount + ' warna lama')
+                : null
+            ),
+
+            designers.length > 0
+              ? React.createElement('div', { style: { display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 8 } },
+                  designers.map(function(d) {
+                    return React.createElement('span', {
+                      key: d,
+                      style: { background: '#f0f4ff', color: '#4338ca', border: '1px solid #c7d2fe', borderRadius: 99, padding: '1px 8px', fontSize: 10, fontWeight: 600 }
+                    }, (designerLabelMap[d] || d) + ' ' + coll.designers[d]);
+                  })
+                )
+              : null,
+
+            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 10px', marginTop: 8 } },
+              statusSection('Sample Status', coll.sampleStatus),
+              statusSection('Warna Status', coll.variantStatus)
+            ),
+
+            (coll.pastCheckpoint || coll.nextCheckpoint)
+              ? React.createElement('div', { style: { marginTop: 8, display: 'flex', gap: 6 } },
+                  coll.pastCheckpoint
+                    ? React.createElement('div', { style: { flex: 1, background: coll.isLate ? '#fef2f2' : '#f0fdf4', border: '1px solid ' + (coll.isLate ? '#fca5a5' : '#86efac'), borderRadius: 6, padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 } },
+                        React.createElement('div', null,
+                          React.createElement('span', { style: { fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: coll.isLate ? '#dc2626' : '#16a34a' } }, 'Past '),
+                          React.createElement('span', { style: { fontSize: 10, color: '#9ca3af' } }, coll.pastCheckpoint.dateStr),
+                          React.createElement('div', { style: { fontSize: 10, color: '#6b7280' } }, coll.pastCheckpoint.approved_sample + ' sample approved')
+                        ),
+                        coll.isLate
+                          ? React.createElement('span', { style: { fontSize: 14 } }, '⚠️')
+                          : React.createElement('span', { style: { fontSize: 14 } }, '✅')
+                      )
+                    : null,
+                  coll.nextCheckpoint
+                    ? React.createElement('div', { style: { flex: 1, background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 } },
+                        React.createElement('div', null,
+                          React.createElement('span', { style: { fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#3b82f6' } }, 'Next '),
+                          React.createElement('span', { style: { fontSize: 10, color: '#9ca3af' } }, coll.nextCheckpoint.dateStr),
+                          React.createElement('div', { style: { fontSize: 10, color: '#6b7280' } }, coll.nextCheckpoint.approved_sample + ' sample approved')
+                        ),
+                        React.createElement('span', { style: { fontSize: 14 } }, '🎯')
+                      )
+                    : null
+                )
+              : null
+          ),
+
+          React.createElement('div', { style: S.cardBody },
+            React.createElement('div', { style: S.secLabel }, 'Breakdown by type'),
+            types.map(function(type, ti) {
+              var sc = coll.types[type].sample_count;
+              return React.createElement('div', {
+                key: ti,
+                style: S.typeRow,
+                onClick: function(e) {
+                  e.stopPropagation();
+                  props.onOpenCollection(collId, { type: type, viewMode: 'category' });
+                }
+              },
+                React.createElement('div', { style: S.typeName }, TYPE_LABELS[type] || type || '—'),
+                React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                  React.createElement('div', { style: S.statBox },
+                    React.createElement('div', { style: S.statNum('#3b82f6') }, sc),
+                    React.createElement('div', { style: S.statLbl }, 'Samples')
+                  ),
+                  React.createElement('span', { style: { fontSize: 12, color: '#cbd5e1' } }, '›')
+                )
+              );
+            })
+          )
+        );
+      })
+    )
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// APP — page switcher: 'summary' (default) <-> 'preview'
+// ─────────────────────────────────────────────────────────────
+var App = function() {
+  var stateStage = useState('summary'); var page = stateStage[0]; var setPage = stateStage[1];
+  var statePreview = useState(null); var previewParams = statePreview[0]; var setPreviewParams = statePreview[1];
+
+  function openCollection(collectionId, opts) {
+    setPreviewParams({
+      collectionId: collectionId,
+      initialType: (opts && opts.type) ? opts.type : null,
+      initialViewMode: (opts && opts.viewMode) ? opts.viewMode : 'all',
+    });
+    setPage('preview');
+  }
+
+  function backToSummary() {
+    setPage('summary');
+    setPreviewParams(null);
+  }
+
+  if (page === 'preview' && previewParams) {
+    return createElement(CollectionPreviewPage, {
+      initialCollectionId: previewParams.collectionId,
+      initialType: previewParams.initialType,
+      initialViewMode: previewParams.initialViewMode,
+      onBack: backToSummary,
+    });
+  }
+  return createElement(SummaryReportPage, { onOpenCollection: openCollection });
+};
+
+ctx.render(createElement(App));
