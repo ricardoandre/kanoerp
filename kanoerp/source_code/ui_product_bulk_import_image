@@ -1,0 +1,359 @@
+// ui_product_bulk_import_image — bulk-match image files to products by filename=code, upload + link.
+// (renamed from ui_bulk_product_image)
+// Input:  openModal({ ctx, onDone })
+// Depends on: none.
+// NOTE 1: product table has no separate `id` — `code` is the natural key (matches every
+// other table's fk_product_code→product.code convention). All reads/writes keyed on code.
+// NOTE 2: FormData is NOT available in this sandbox (same family as FileReader/fetch), so
+// the multipart body is built manually as a Blob([header, file, footer]) — Blob accepts a
+// File directly without needing to read its bytes, so no FileReader is needed either.
+// NOTE 3: existing-image check uses ctx.api.resource('product').list with appends:['image'],
+// scoped to only the matched codes (not the whole table). If it errors, falls back to
+// treating all matches as "unknown" and always confirming.
+
+const { useState, useEffect, useRef } = React;
+const { Modal } = antd;
+const ce = React.createElement;
+
+const ACTION_NAME = 'attachments:upload';
+
+function stripExt(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx === -1 ? filename : filename.substring(0, idx);
+}
+
+// "O230001 - Beige Seville.png" -> "O230001", "O280065- Boat in Rose.png" -> "O280065",
+// "O280067(1).png" -> "O280067". Only the leading run of characters up to the first
+// separator (whitespace, -, _, ( or )) is treated as the product code.
+function extractCode(filename) {
+  const noExt = stripExt(filename).trim();
+  return noExt.split(/[\s\-_()]+/)[0] || '';
+}
+
+function describeError(e) {
+  const respData = e && e.response && e.response.data;
+  if (respData) {
+    return respData.errors ? JSON.stringify(respData.errors) : (respData.message || JSON.stringify(respData));
+  }
+  return (e && e.message) || 'unknown error';
+}
+
+function escapeSqlString(str) {
+  return String(str).replace(/'/g, "''");
+}
+
+// ===== canonical SQL helper (matches ui_store_stock_in_import / ui_material_out) =====
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+
+// Only looks up the exact codes we need — doesn't load the whole product table,
+// so this stays fast regardless of how large the catalog grows.
+async function fetchMatchingProductCodes(ctx, rawCodes) {
+  const unique = Array.from(new Set(rawCodes.filter(Boolean)));
+  if (!unique.length) return [];
+  const inList = unique.map(function (c) { return "'" + escapeSqlString(c) + "'"; }).join(',');
+  const uid = 'bpi_match_' + unique.length + '_' + Date.now();
+  const rows = await runSql(ctx, uid, "SELECT code FROM product WHERE code IN (" + inList + ")");
+  return rows.map(function (r) { return String(r.code || '').trim(); }).filter(Boolean);
+}
+
+function hasImageValue(v) {
+  if (Array.isArray(v)) return v.length > 0;
+  return !!v;
+}
+
+// Best-effort: whether each matched code already has an image set.
+// Returns null (not {}) on failure so callers can distinguish "checked, none have images"
+// from "couldn't check at all".
+async function fetchExistingImageFlags(ctx, codes) {
+  if (!codes.length) return {};
+  try {
+    const res = await ctx.api.resource('product').list({
+      filter: { code: { $in: codes } },
+      appends: ['image'],
+      pageSize: codes.length,
+      page: 1,
+    });
+    const rows = (res && res.data && res.data.data) || [];
+    const flags = {};
+    rows.forEach(function (r) { flags[r.code] = hasImageValue(r.image); });
+    return flags;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Builds a multipart/form-data body by hand (no FormData constructor available).
+// Blob accepts a File object directly in its parts array, so no FileReader needed.
+function buildMultipartBody(file, fieldName) {
+  const boundary = '----kanoerpBoundary' + Date.now() + Math.random().toString(16).slice(2);
+  const CRLF = '\r\n';
+  const header = '--' + boundary + CRLF +
+    'Content-Disposition: form-data; name="' + fieldName + '"; filename="' + file.name + '"' + CRLF +
+    'Content-Type: ' + (file.type || 'application/octet-stream') + CRLF + CRLF;
+  const footer = CRLF + '--' + boundary + '--' + CRLF;
+  const blob = new Blob([header, file, footer]);
+  return { blob: blob, contentType: 'multipart/form-data; boundary=' + boundary };
+}
+
+async function uploadAttachment(ctx, file) {
+  const built = buildMultipartBody(file, 'file');
+  const resp = await ctx.api.axios.post(ACTION_NAME, built.blob, {
+    headers: { 'Content-Type': built.contentType },
+  });
+  const id = resp && resp.data && resp.data.data && resp.data.data.id;
+  if (!id) throw new Error('No attachment id returned');
+  return id;
+}
+
+async function linkImageToProduct(ctx, productCode, attachmentId) {
+  await ctx.api.resource('product').update({
+    filterByTk: productCode,
+    values: { image: { id: attachmentId } },
+  });
+}
+
+function StatusBadge(props) {
+  const map = {
+    matched: { bg: '#f1f5f9', color: '#475569', label: 'Ready' },
+    unmatched: { bg: '#fef2f2', color: '#dc2626', label: 'No match' },
+    uploading: { bg: '#eff6ff', color: '#2563eb', label: 'Uploading…' },
+    done: { bg: '#f0fdf4', color: '#16a34a', label: 'Done' },
+    error: { bg: '#fef2f2', color: '#dc2626', label: 'Failed' },
+  };
+  const s = map[props.status] || map.matched;
+  return ce('span', {
+    style: {
+      display: 'inline-block', padding: '2px 8px', borderRadius: 10, fontSize: 11,
+      fontWeight: 600, background: s.bg, color: s.color, whiteSpace: 'nowrap',
+    }
+  }, s.label);
+}
+
+function DropZone(props) {
+  const onFiles = props.onFiles;
+  const disabled = props.disabled;
+  const [dragOver, setDragOver] = useState(false);
+
+  return ce('div', {
+    onDragOver: function (e) { e.preventDefault(); if (!disabled) setDragOver(true); },
+    onDragLeave: function (e) { e.preventDefault(); setDragOver(false); },
+    onDrop: function (e) {
+      e.preventDefault();
+      setDragOver(false);
+      if (disabled) return;
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length) onFiles(files);
+    },
+    style: {
+      border: '2px dashed ' + (dragOver ? '#22c55e' : '#d9d9d9'),
+      borderRadius: 8, padding: '18px 12px', textAlign: 'center',
+      background: dragOver ? '#f0fdf4' : '#fafafa',
+      marginBottom: 14, transition: 'all 0.15s',
+    }
+  },
+    ce('div', { style: { fontSize: 12, color: dragOver ? '#16a34a' : '#94a3b8', marginBottom: 8 } },
+      'Drag & drop image files here, or'
+    ),
+    ce('label', {
+      style: {
+        display: 'inline-block', padding: '5px 14px', fontSize: 12, cursor: disabled ? 'not-allowed' : 'pointer',
+        border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff', fontWeight: 600, color: '#475569',
+      }
+    },
+      'Choose Files',
+      ce('input', {
+        type: 'file', multiple: true, accept: 'image/*', disabled: disabled,
+        onChange: function (e) { if (e.target.files && e.target.files.length) onFiles(e.target.files); e.target.value = ''; },
+        style: { display: 'none' }
+      })
+    )
+  );
+}
+
+function BulkImageUpload(props) {
+  const ctx = props.ctx;
+  const onDone = props.onDone;
+
+  const [rows, setRows] = useState([]); // [{file, name, code, status, errorMsg}]
+  const [hasImageFlags, setHasImageFlags] = useState({}); // code -> bool
+  const [imageCheckUnknown, setImageCheckUnknown] = useState(false);
+  const [matching, setMatching] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [matchErr, setMatchErr] = useState(null);
+
+  async function processFiles(fileList) {
+    const files = Array.prototype.slice.call(fileList);
+    setMatching(true);
+    setMatchErr(null);
+    try {
+      const rawCodes = files.map(function (f) { return extractCode(f.name); });
+      const found = await fetchMatchingProductCodes(ctx, rawCodes);
+      const byLower = {};
+      found.forEach(function (c) { byLower[c.toLowerCase()] = c; });
+
+      const nextRows = files.map(function (file) {
+        const rawCode = extractCode(file.name);
+        const match = byLower[rawCode.toLowerCase()];
+        return match
+          ? { file: file, name: file.name, code: match, status: 'matched', errorMsg: null }
+          : { file: file, name: file.name, code: rawCode, status: 'unmatched', errorMsg: null };
+      });
+      setRows(nextRows);
+
+      const matchedCodes = nextRows.filter(function (r) { return r.status === 'matched'; }).map(function (r) { return r.code; });
+      const flags = await fetchExistingImageFlags(ctx, matchedCodes);
+      if (flags === null) {
+        setImageCheckUnknown(true);
+        setHasImageFlags({});
+      } else {
+        setImageCheckUnknown(false);
+        setHasImageFlags(flags);
+      }
+    } catch (err) {
+      setMatchErr(describeError(err));
+    }
+    setMatching(false);
+  }
+
+  function updateRow(index, patch) {
+    setRows(function (prev) {
+      const next = prev.slice();
+      next[index] = Object.assign({}, next[index], patch);
+      return next;
+    });
+  }
+
+  function startUpload() {
+    const matchedRows = rows.filter(function (r) { return r.status === 'matched'; });
+    if (!matchedRows.length) return;
+
+    if (imageCheckUnknown) {
+      Modal.confirm({
+        title: 'Confirm bulk upload',
+        content: 'Could not verify which of these ' + matchedRows.length + ' product(s) already have an image, so any of them may be overwritten. Continue?',
+        okText: 'Yes, upload', cancelText: 'Cancel',
+        onOk: function () { runUpload(); },
+      });
+      return;
+    }
+
+    const overwriteCount = matchedRows.filter(function (r) { return hasImageFlags[r.code]; }).length;
+    if (overwriteCount === 0) {
+      runUpload();
+      return;
+    }
+    Modal.confirm({
+      title: 'Confirm bulk upload',
+      content: overwriteCount + ' of ' + matchedRows.length + ' product(s) already have an image and will be replaced. This cannot be undone from here. Continue?',
+      okText: 'Yes, upload', cancelText: 'Cancel',
+      onOk: function () { runUpload(); },
+    });
+  }
+
+  async function runUpload() {
+    setUploading(true);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.status !== 'matched') continue;
+      updateRow(i, { status: 'uploading' });
+      try {
+        const attachmentId = await uploadAttachment(ctx, row.file);
+        await linkImageToProduct(ctx, row.code, attachmentId);
+        updateRow(i, { status: 'done' });
+      } catch (e) {
+        updateRow(i, { status: 'error', errorMsg: describeError(e) });
+      }
+    }
+    setUploading(false);
+    ctx.notification.success({ message: 'Bulk image upload finished', duration: 6 });
+    if (onDone) onDone();
+  }
+
+  function handleClose() { Modal.destroyAll(); }
+
+  const matchedCount = rows.filter(function (r) { return r.status === 'matched'; }).length;
+  const unmatchedCount = rows.filter(function (r) { return r.status === 'unmatched'; }).length;
+  const doneCount = rows.filter(function (r) { return r.status === 'done'; }).length;
+  const errorCount = rows.filter(function (r) { return r.status === 'error'; }).length;
+  const overwriteCount = imageCheckUnknown ? 0 : rows.filter(function (r) { return r.status === 'matched' && hasImageFlags[r.code]; }).length;
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+    ce('div', { style: { color: '#888', fontSize: 12, marginBottom: 10 } },
+      'Select or drop image files whose name starts with the product code — e.g. "ABC123.jpg", "ABC123 - Beige Seville.jpg", or "ABC123-Boat in Rose.jpg". Only the leading code (up to the first space, dash, or underscore) is used to match.'),
+
+    ce(DropZone, { onFiles: processFiles, disabled: uploading || matching }),
+
+    matching ? ce('div', { style: { fontSize: 12, color: '#64748b', marginBottom: 10 } }, 'Matching filenames against products…') : null,
+    matchErr ? ce('div', { style: { fontSize: 12, color: '#dc2626', marginBottom: 10 } }, matchErr) : null,
+
+    rows.length > 0
+      ? ce('div', { style: { display: 'flex', gap: 12, fontSize: 11, color: '#64748b', marginBottom: 10, flexWrap: 'wrap' } },
+          ce('span', null, matchedCount + ' ready'),
+          overwriteCount > 0 ? ce('span', { style: { color: '#d97706' } }, overwriteCount + ' will overwrite') : null,
+          ce('span', null, unmatchedCount + ' unmatched'),
+          doneCount ? ce('span', { style: { color: '#16a34a' } }, doneCount + ' done') : null,
+          errorCount ? ce('span', { style: { color: '#dc2626' } }, errorCount + ' failed') : null
+        )
+      : null,
+
+    rows.length > 0
+      ? ce('div', { style: { maxHeight: 320, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 6, marginBottom: 14 } },
+          rows.map(function (r, i) {
+            const overwrite = !imageCheckUnknown && r.status === 'matched' && hasImageFlags[r.code];
+            return ce('div', {
+              key: i,
+              style: {
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '6px 10px', borderBottom: i < rows.length - 1 ? '1px solid #f1f5f9' : 'none',
+              }
+            },
+              ce('div', { style: { minWidth: 0, flex: 1 } },
+                ce('div', { style: { fontSize: 12, fontWeight: 600, color: '#334155', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r.name),
+                overwrite ? ce('div', { style: { fontSize: 11, color: '#d97706' } }, 'Already has an image — will be replaced') : null,
+                r.status === 'error' ? ce('div', { style: { fontSize: 11, color: '#dc2626' } }, r.errorMsg) : null
+              ),
+              ce(StatusBadge, { status: r.status })
+            );
+          })
+        )
+      : null,
+
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+      ce('button', { onClick: handleClose, disabled: uploading, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, uploading ? 'Close' : 'Cancel'),
+      ce('button', {
+        onClick: startUpload, disabled: uploading || matching || !matchedCount,
+        style: {
+          padding: '5px 16px', fontSize: 12, cursor: (uploading || matching || !matchedCount) ? 'not-allowed' : 'pointer',
+          border: 'none', borderRadius: 4, fontWeight: 600, color: '#fff',
+          background: (uploading || matching || !matchedCount) ? '#d9d9d9' : '#22c55e',
+        }
+      }, uploading ? 'Uploading…' : 'Upload ' + matchedCount + ' image(s)')
+    ),
+    ce('div', { style: { height: 80 } })
+  );
+}
+
+function openModal(args) {
+  const ctx = args.ctx;
+  const onDone = args.onDone;
+  if (!ctx) return;
+
+  Modal.confirm({
+    title: 'Bulk Product Image Upload',
+    width: 560,
+    icon: null,
+    content: ce(BulkImageUpload, { ctx: ctx, onDone: onDone }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: false,
+    onCancel() {},
+  });
+}
+
+return { openModal };
