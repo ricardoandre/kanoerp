@@ -1,0 +1,293 @@
+// =====================================================
+// view_product_detail — jblock FIXED to a specific product record.
+//
+// NOT a standalone Page/list. This is added as a custom code block inside the
+// `product` collection's own native record popup/drawer — it reads the
+// current record via ctx.getVar('ctx.record') / ctx.popup.record / ctx.record
+// (whichever the host provides), the same pattern as the reference
+// production-detail popup block. No raw SQL — plain REST ctx.api.resource()
+// calls, batched to avoid N+1 (mirrors the reference's material_ledger chain).
+//
+// Sections:
+//   1. Product info    — image, code, name, description, model, designer
+//   2. Materials        — main_fabric + product_material (material_details, quantity)
+//   3. Variants          — product_variant (sku_option, code, web_price, marketplace_price)
+//   4. Measurements      — the product_measurement row linked to each variant
+//
+// NOTE: MEASURE_FIELDS is duplicated a third time now (ui_product_measurement,
+// ui_product_detail, here) — all three uses are now real, so this is a solid
+// candidate for a lib_measurement_fields row per extract-on-second-use. Left
+// as-is for this pass; flag if you want it pulled out.
+//
+// NOTE: ctx.getVar isn't in the confirmed ctx surface table (README §4.3) —
+// this comes straight from your reference code, so trusting it here. Worth
+// adding to that table once confirmed working in this popup context.
+// =====================================================
+const { React, antd } = ctx.libs;
+const { useEffect, useState } = React;
+const { Col, Row, Spin, Typography, Table } = antd;
+const { Text } = Typography;
+const ce = React.createElement;
+
+function money(v) { return (v === null || v === undefined || v === '') ? '—' : 'Rp ' + Number(v).toLocaleString('id-ID'); }
+
+const sectionTitle = { fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#9ca3af', marginBottom: 12 };
+function metaItem(label, value) {
+  return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+    ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, label),
+    ce('div', { style: { fontSize: 13, color: '#111827', fontWeight: 500 } }, (value !== null && value !== undefined && value !== '') ? value : '—'));
+}
+function pill(text, bg, color) {
+  return ce('span', { style: { display: 'inline-block', padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: bg, color: color, letterSpacing: '0.04em' } }, text);
+}
+function card(children, extraStyle) {
+  return ce('div', { style: Object.assign({ borderRadius: 16, border: '1px solid #e5e7eb', background: '#fff', padding: '20px 24px', height: '100%' }, extraStyle || {}) }, children);
+}
+
+const MEASURE_FIELDS = [
+  { key: 'bust',              label: 'Lr. Dada (Bust)' },
+  { key: 'shoulder',          label: 'Bahu (Shoulder)' },
+  { key: 'waist',             label: 'Ling. Pinggang (Waist)' },
+  { key: 'hips',              label: 'Ling. Pinggul (Hips)' },
+  { key: 'length',            label: 'Panjang (Length)' },
+  { key: 'length2',           label: 'Panjang2 (Length 2)' },
+  { key: 'bottom_hole',       label: 'Ling. Bawah (Bottom)' },
+  { key: 'neck',              label: 'Ling. Leher (Neck)' },
+  { key: 'arm_hole',          label: 'Ling. Ketiak (Arm Hole)' },
+  { key: 'bottom_sleeve',     label: 'Lr Lengan (Btm Sleeve)' },
+  { key: 'mid_sleeve',        label: 'Pangkal Lengan (Mid Sleeve)' },
+  { key: 'sleeve_length',     label: 'Pj Lengan (Sleeve Len)' },
+  { key: 'thigh',             label: 'Lr Paha (Thigh)' },
+  { key: 'est_main_fabric',   label: 'Est Bahan (Fabric)' },
+  { key: 'est_furing',        label: 'Est Furing' },
+  { key: 'est_main_fabric_2', label: 'Est Bahan 2' },
+];
+
+const hostRecord =
+  (await ctx.getVar?.('ctx.record')) ||
+  (await ctx.getVar?.('ctx.popup.record')) ||
+  ctx.record ||
+  null;
+
+const ProductDetailView = function () {
+  const [loading, setLoading]     = useState(true);
+  const [errorText, setErrorText] = useState('');
+  const [product, setProduct]     = useState(null);
+  const [imageUrl, setImageUrl]   = useState('');
+  const [mainFabric, setMainFabric] = useState(null);
+  const [bomRows, setBomRows]     = useState([]);
+  const [variantRows, setVariantRows] = useState([]);
+  const [measMap, setMeasMap]     = useState({});
+
+  useEffect(function () {
+    let active = true;
+
+    async function bootstrap() {
+      const code = hostRecord?.code;
+      if (!code) {
+        setErrorText('Product record is unavailable.');
+        setLoading(false);
+        return;
+      }
+
+      setLoading(true);
+      setErrorText('');
+
+      try {
+        // 1. Main product record + image + main_fabric — one call, nested via appends
+        const prodRes = await ctx.api.resource('product').get({ filterByTk: code, appends: ['image', 'main_fabric'] });
+        const p = prodRes?.data?.data;
+        if (!active) return;
+        if (!p) { setErrorText('No product record found.'); setLoading(false); return; }
+
+        const img = p.image?.[0] || null;
+        const imgUrl = img ? (img.url || (img.filename ? '/storage/uploads/' + img.filename : '')) : '';
+
+        // 2. product_material (BOM) rows for this product
+        const pmRes = await ctx.api.resource('product_material').list({
+          filter: { fk_product_code: code },
+          fields: ['id', 'fk_material_details_code', 'quantity'],
+          pageSize: 200,
+        });
+        const pmRows = pmRes?.data?.data || [];
+
+        // 3. material_details for BOM codes + main fabric code (batched, one call)
+        const mainFabricCode = p.fk_main_fabric_code;
+        const materialCodes = [...new Set(
+          pmRows.map(m => m.fk_material_details_code).concat(mainFabricCode ? [mainFabricCode] : []).filter(Boolean)
+        )];
+        let mdRows = [];
+        if (materialCodes.length) {
+          const mdRes = await ctx.api.resource('material_details').list({
+            filter: { code: { $in: materialCodes } },
+            fields: ['code', 'variant', 'fk_material_code', 'fk_supplier_id'],
+            pageSize: 200,
+          });
+          mdRows = mdRes?.data?.data || [];
+        }
+        const mdByCode = {}; mdRows.forEach(r => { mdByCode[r.code] = r; });
+
+        // 4. raw_material for the referenced codes (batched, no N+1)
+        const rawCodes = [...new Set(mdRows.map(r => r.fk_material_code).filter(Boolean))];
+        let rmRows = [];
+        if (rawCodes.length) {
+          const rmRes = await ctx.api.resource('raw_material').list({
+            filter: { code: { $in: rawCodes } }, fields: ['code', 'type', 'composition'], pageSize: 200,
+          });
+          rmRows = rmRes?.data?.data || [];
+        }
+        const rmByCode = {}; rmRows.forEach(r => { rmByCode[r.code] = r; });
+
+        // 5. supplier for the referenced ids (batched, no N+1)
+        const supplierIds = [...new Set(mdRows.map(r => r.fk_supplier_id).filter(Boolean))];
+        let supRows = [];
+        if (supplierIds.length) {
+          const supRes = await ctx.api.resource('supplier').list({
+            filter: { id: { $in: supplierIds } }, fields: ['id', 'name'], pageSize: 200,
+          });
+          supRows = supRes?.data?.data || [];
+        }
+        const supById = {}; supRows.forEach(r => { supById[String(r.id)] = r; });
+
+        function enrichMaterial(matCode, quantity, id) {
+          const md = mdByCode[matCode] || {};
+          const rm = rmByCode[md.fk_material_code] || {};
+          const sup = supById[String(md.fk_supplier_id)] || {};
+          return { id: id, material_code: matCode, variant: md.variant, raw_code: rm.code, raw_type: rm.type, composition: rm.composition, supplier_name: sup.name, quantity: quantity };
+        }
+        const bom = pmRows.map(m => enrichMaterial(m.fk_material_details_code, m.quantity, m.id));
+        const mf = mainFabricCode ? enrichMaterial(mainFabricCode, null, null) : null;
+
+        // 6. product_variant rows for this product
+        const pvRes = await ctx.api.resource('product_variant').list({
+          filter: { fk_product_code: code },
+          fields: ['id', 'code', 'web_price', 'marketplace_price', 'fk_sku_option_id', 'fk_product_measurement_id'],
+          pageSize: 100,
+        });
+        const pvRows = pvRes?.data?.data || [];
+
+        // 7. sku_option for the referenced ids (batched, no N+1)
+        const skuIds = [...new Set(pvRows.map(v => v.fk_sku_option_id).filter(Boolean))];
+        let skuRows = [];
+        if (skuIds.length) {
+          const skuRes = await ctx.api.resource('sku_option').list({ filter: { id: { $in: skuIds } }, fields: ['id', 'display', 'sort'], pageSize: 100 });
+          skuRows = skuRes?.data?.data || [];
+        }
+        const skuById = {}; skuRows.forEach(r => { skuById[String(r.id)] = r; });
+
+        const variants = pvRows.map(v => {
+          const sku = skuById[String(v.fk_sku_option_id)] || {};
+          return {
+            id: v.id, code: v.code, web_price: v.web_price, marketplace_price: v.marketplace_price,
+            measurement_id: v.fk_product_measurement_id, sku_display: sku.display || '—', sku_sort: sku.sort != null ? sku.sort : 999,
+          };
+        }).sort((a, b) => a.sku_sort - b.sku_sort);
+
+        // 8. product_measurement for the referenced ids (batched, no N+1)
+        const measIds = [...new Set(variants.map(v => v.measurement_id).filter(Boolean))];
+        let measMapLocal = {};
+        if (measIds.length) {
+          const measRes = await ctx.api.resource('product_measurement').list({
+            filter: { id: { $in: measIds } },
+            fields: ['id', 'name'].concat(MEASURE_FIELDS.map(f => f.key)).concat(['remarks']),
+            pageSize: 100,
+          });
+          (measRes?.data?.data || []).forEach(r => { measMapLocal[String(r.id)] = r; });
+        }
+
+        if (!active) return;
+        setProduct(p);
+        setImageUrl(imgUrl);
+        setMainFabric(mf);
+        setBomRows(bom);
+        setVariantRows(variants);
+        setMeasMap(measMapLocal);
+
+      } catch (err) {
+        if (!active) return;
+        setErrorText(err?.message || 'Failed to load product detail.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    bootstrap();
+    return function () { active = false; };
+  }, [hostRecord?.code]);
+
+  if (loading) {
+    return ce('div', { style: { padding: 80, textAlign: 'center' } }, ce(Spin, { size: 'large' }));
+  }
+  if (errorText) {
+    return ce('div', { style: { padding: 24 } }, ce(Text, { type: 'danger' }, errorText));
+  }
+
+  const p = product;
+
+  // ── Section 1: Product info ──
+  const infoCard = card(ce('div', null,
+    ce('div', { style: sectionTitle }, 'Product Info'),
+    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      ce('div', { style: { width: '100%', borderRadius: 12, overflow: 'hidden', background: '#f3f4f6', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 160 } },
+        imageUrl ? ce('img', { src: imageUrl, style: { maxWidth: '100%', maxHeight: 260, display: 'block' } }) : ce('span', { style: { fontSize: 42, color: '#cbd5e1' } }, '👕')),
+      ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+        metaItem('Code', p.code), metaItem('Name', p.name), metaItem('Model', p.model), metaItem('Designer', p.designer), metaItem('Display', p.display)),
+      ce('div', null,
+        ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500, marginBottom: 4 } }, 'Description'),
+        p.description
+          ? ce('div', { style: { fontSize: 13, color: '#374151', lineHeight: 1.7, whiteSpace: 'pre-wrap' } }, p.description)
+          : ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No description')))));
+
+  // ── Section 2: Materials (main + additional) ──
+  function materialLine(m, isMain) {
+    return ce('div', { key: m.id || m.material_code, style: { borderRadius: 8, border: '1px solid #f0f0f0', padding: '10px 12px', marginBottom: 8, background: '#fafafa' } },
+      ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+        ce('div', { style: { fontWeight: 600, fontSize: 13, color: '#111827' } }, m.material_code + (m.variant ? (' · ' + m.variant) : '')),
+        isMain ? pill('Main Material', '#eef2ff', '#4f46e5') : (m.quantity != null ? ce('span', { style: { fontWeight: 700, fontSize: 13, color: '#374151' } }, m.quantity) : null)));
+  }
+  const materialsCard = card(ce('div', null,
+    ce('div', { style: sectionTitle }, 'Materials'),
+    mainFabric ? materialLine(mainFabric, true) : ce('div', { style: { fontSize: 12, color: '#d1d5db', marginBottom: 12, fontStyle: 'italic' } }, 'No main material set'),
+    ce('div', { style: { fontSize: 11, fontWeight: 700, color: '#6b7280', margin: '12px 0 6px', textTransform: 'uppercase', letterSpacing: '0.05em' } }, 'Additional Material'),
+    bomRows.length ? bomRows.map(m => materialLine(m, false)) : ce('div', { style: { fontSize: 12, color: '#d1d5db', fontStyle: 'italic' } }, 'No additional materials')));
+
+  // ── Section 3: Variants ──
+  const variantsCard = card(ce('div', null,
+    ce('div', { style: sectionTitle }, 'Variants'),
+    variantRows.length
+      ? ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          variantRows.map(v => ce('div', { key: v.id, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', border: '1px solid #f1f5f9', borderRadius: 8 } },
+            ce('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } },
+              ce('span', { style: { fontWeight: 700, fontSize: 13, color: '#0f172a', width: 44, flexShrink: 0 } }, v.sku_display),
+              ce('span', { style: { fontSize: 12, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, v.code || '—')),
+            ce('div', { style: { display: 'flex', gap: 14, flexShrink: 0, marginLeft: 10 } },
+              ce('div', { style: { textAlign: 'right' } }, ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase' } }, 'Web'), ce('div', { style: { fontSize: 12, fontWeight: 700, color: '#374151' } }, money(v.web_price))),
+              ce('div', { style: { textAlign: 'right' } }, ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase' } }, 'MP'), ce('div', { style: { fontSize: 12, fontWeight: 700, color: '#374151' } }, money(v.marketplace_price)))))))
+      : ce('div', { style: { fontSize: 12, color: '#d1d5db', fontStyle: 'italic' } }, 'No variants')));
+
+  // ── Section 4: Measurements ──
+  const measColumns = [
+    { title: 'Size', dataIndex: 'sku_display', key: 'sku_display', fixed: 'left', width: 60, render: v => ce('span', { style: { fontWeight: 700 } }, v) },
+  ].concat(MEASURE_FIELDS.map(f => ({ title: f.label, dataIndex: f.key, key: f.key, width: 90, render: v => v != null ? v : ce('span', { style: { color: '#d1d5db' } }, '—') })));
+  const measData = variantRows.map(v => {
+    const m = v.measurement_id ? (measMap[String(v.measurement_id)] || {}) : {};
+    return Object.assign({ sku_display: v.sku_display, _rowKey: v.id }, m);
+  });
+  const linkedCount = variantRows.filter(v => v.measurement_id).length;
+  const measurementCard = card(ce('div', null,
+    ce('div', { style: sectionTitle }, 'Measurements'),
+    linkedCount
+      ? ce(Table, { size: 'small', dataSource: measData, columns: measColumns, rowKey: '_rowKey', pagination: false, scroll: { x: 1500 } })
+      : ce('div', { style: { fontSize: 12, color: '#d1d5db', fontStyle: 'italic' } }, 'No measurements linked yet')));
+
+  return ce('div', { style: { fontFamily: 'sans-serif', display: 'flex', flexDirection: 'column', gap: 12 } },
+    ce(Row, { gutter: [12, 12] },
+      ce(Col, { xs: 24, md: 10 }, infoCard),
+      ce(Col, { xs: 24, md: 14 }, materialsCard)),
+    ce(Row, { gutter: [12, 12] },
+      ce(Col, { xs: 24 }, variantsCard)),
+    ce(Row, { gutter: [12, 12] },
+      ce(Col, { xs: 24 }, measurementCard)));
+};
+
+ctx.render(ce(ProductDetailView));
