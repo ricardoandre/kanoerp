@@ -1,0 +1,119 @@
+// =====================================================
+// jblock — PRODUCTION MATERIAL (record-level)
+//
+// Embedded in production_material's own native NocoBase record popup.
+// Thin shell only — delegates rendering to the shared
+// `ui_production_material_details` row's MaterialDetailBody.
+//
+// v2: ctx.render() now fires immediately; record resolution + component
+// loading happen inside useEffect with try/catch, so any failure (e.g.
+// ctx.getVar not behaving as expected in this popup context) shows up as
+// a visible error message instead of a blank screen.
+// =====================================================
+const { React, antd, dayjs } = ctx.libs;
+const { useEffect, useState } = React;
+const { Spin, Typography } = antd;
+const { Text } = Typography;
+const ce = React.createElement;
+
+// shared code loader (same convention as view_production_material.js)
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const uid = 'code_' + name;
+  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
+  const src = (rows && rows[0] && rows[0].code) || '';
+  if (!src) throw new Error("source_code row '" + name + "' was not found or is empty.");
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// try every known way of reading the current record, in order, and report
+// exactly which ones were attempted if all of them come back empty.
+async function resolveHostRecord() {
+  const attempts = [
+    ['ctx.getVar("ctx.record")',       () => ctx.getVar?.('ctx.record')],
+    ['ctx.getVar("ctx.popup.record")', () => ctx.getVar?.('ctx.popup.record')],
+    ['ctx.getVar("currentRecord")',    () => ctx.getVar?.('currentRecord')],
+    ['ctx.record',                     () => ctx.record],
+  ];
+  const tried = [];
+  for (const [label, fn] of attempts) {
+    try {
+      const v = await fn();
+      tried.push(label + ' → ' + (v ? JSON.stringify(Object.keys(v)) : 'empty'));
+      if (v && v.id != null) return { record: v, tried };
+    } catch (e) {
+      tried.push(label + ' → threw: ' + ((e && e.message) || e));
+    }
+  }
+  return { record: null, tried };
+}
+
+const ProductionMaterialRecordView = function () {
+  const [loading, setLoading]       = useState(true);
+  const [errorText, setErrorText]   = useState('');
+  const [Mod, setMod]               = useState(null);
+  const [pmId, setPmId]             = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  useEffect(function () {
+    let active = true;
+
+    (async function () {
+      try {
+        const { record, tried } = await resolveHostRecord();
+        if (!active) return;
+
+        if (!record || record.id == null) {
+          setErrorText(
+            'Could not resolve the current production_material record.\n' +
+            'Attempts:\n' + tried.join('\n')
+          );
+          setLoading(false);
+          return;
+        }
+
+        setPmId(record.id);
+
+        const mod = await loadCode('ui_production_material_detail');
+        if (!active) return;
+        setMod(function () { return mod; });
+        setLoading(false);
+      } catch (e) {
+        if (!active) return;
+        setErrorText((e && (e.stack || e.message)) || String(e));
+        setLoading(false);
+      }
+    })();
+
+    return function () { active = false; };
+  }, []);
+
+  if (loading) {
+    return ce('div', { style: { padding: 60, textAlign: 'center' } },
+      ce(Spin, { size: 'large' })
+    );
+  }
+  if (errorText) {
+    return ce('div', { style: { padding: 24 } },
+      ce(Text, { type: 'danger', style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'monospace' } }, errorText)
+    );
+  }
+  if (!Mod || pmId == null) {
+    return ce('div', { style: { padding: 24, color: '#9ca3af' } }, 'Nothing to show.');
+  }
+
+  return ce('div', { style: { fontFamily: "'Segoe UI', sans-serif" } },
+    ce(Mod.MaterialDetailBody, {
+      pmId: pmId,
+      refreshKey: refreshKey,
+      onOpenProduction: null, // no cross-record nav host in the native record popup
+      onChanged: function () { setRefreshKey(function (n) { return n + 1; }); },
+    }),
+    ce('div', { style: { height: 40 } })
+  );
+};
+
+ctx.render(ce(ProductionMaterialRecordView));
