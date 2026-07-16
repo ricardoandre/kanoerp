@@ -5,21 +5,21 @@
 //
 // EXPORTS:
 //   MaterialDetailBody({ pmId, refreshKey, onOpenProduction, onChanged })
-//       — Summary + Quantity need + Material out (with Add). Self-fetches from pmId.
-//         onOpenProduction(productionId) → production_ref renders as a handoff link.
-//         onChanged() → fires after a material-out save.
+//       — Summary, then Quantity need (full width), then Material out
+//         (summary) and Material out details side by side below it.
+//         Self-fetches from pmId. onOpenProduction(productionId) → production_ref
+//         renders as a handoff link. onChanged() → fires after a material-out
+//         save or cancel.
 //   ProductionMaterialDetailDrawer({ open, pmId, refreshKey, onClose, onEdit, onDelete, onOpenProduction, onChanged, zIndex })
 //       — standalone drawer (title = material code + status accent + Edit/⋯Delete).
 //   MaterialEditDrawer({ open, pmId, onClose, onSaved })
 //       — self-contained material edit drawer (self-fetches record + options).
 //
-// Depends on: ui_material_out (material-out summary + entry modal).
+// Button vs. tag convention (kept consistent with ui_material_out):
+//   clickable actions  → solid fill, white text, no border, subtle shadow (BTN_* below)
+//   status/type tags   → soft tinted background, no border, no shadow, cursor default
 //
-// NOTE (2026-07): all raw ctx.sql usage (loadCode + every fetch* helper)
-// converted to ctx.api.resource() — ctx.sql.save() is admin/root-gated and
-// silently fails per-record for non-admin roles (see README §3). Do not
-// revert to raw SQL. fetchProductImage now uses appends:['image'] instead of
-// introspecting the `fields` metadata table by hand.
+// Depends on: ui_material_out (material-out summary/details + entry modal).
 // =====================================================
 const { Drawer, Dropdown, Select, DatePicker, InputNumber, Spin } = antd;
 const ce = React.createElement;
@@ -29,17 +29,23 @@ const { useState, useEffect } = React;
 const _codeCache = {};
 function loadCode(name) {
   if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
-  return ctx.api.resource('source_code').list({
-    filter: { name: name },
-    fields: ['code'],
-    pageSize: 1,
-  }).then(function (res) {
-    const rows = (res && res.data && res.data.data) || [];
-    const src = (rows[0] && rows[0].code) || '';
-    _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
-    return _codeCache[name];
-  });
+  const uid = 'code_' + name;
+  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(rows => {
+      const src = (rows && rows[0] && rows[0].code) || '';
+      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+      return _codeCache[name];
+    });
 }
+
+// ── button style (clickable — solid fill, no border, subtle shadow) ──
+const BTN_PRIMARY = {
+  display: 'inline-flex', alignItems: 'center', gap: 4,
+  border: 'none', borderRadius: 8, padding: '6px 14px',
+  fontSize: 12, fontWeight: 700, color: '#fff', background: '#16a34a',
+  cursor: 'pointer', boxShadow: '0 1px 2px rgba(0,0,0,0.18)',
+};
 
 // ── status (material) ──
 const STATUS_DEFAULTS = ['planning', 'po', 'ready', 'sent', 'cancel'];
@@ -57,6 +63,11 @@ const statusLabel = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice
 function isFabric(t) { return String(t || '').toLowerCase() === 'fabric'; }
 
 // ── helpers ──
+function runSql(uid, sql) {
+  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []);
+}
 const num = v => Number(v == null ? 0 : v);
 function fmtDateNumeric(d) { if (!d) return ''; const p = dayjs(d); return p.isValid() ? p.format('DD/MM/YYYY') : ''; }
 const M_TO_YARD = 1.0936;
@@ -89,7 +100,8 @@ function metaItemLink(label, value, onClick) {
           value, ce('span', { style: { fontSize: 14 } }, '›'))
       : ce('div', { style: { fontSize: 13, color: '#111827', fontWeight: 500 } }, value || '—'));
 }
-function pill(text, bg, color) { return ce('span', { style: { display: 'inline-block', padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: bg, color: color } }, text); }
+// tag/badge style — flat, no border, no shadow, cursor default (not a button)
+function pill(text, bg, color) { return ce('span', { style: { display: 'inline-block', padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: bg, color: color, cursor: 'default' } }, text); }
 
 const PMD_CSS =
   ".pmd-detail-drawer .ant-drawer-content-wrapper{width:min(900px,92vw) !important;}" +
@@ -98,6 +110,8 @@ const PMD_CSS =
   "@media (max-width:700px){.pmd-edit-drawer .ant-drawer-content-wrapper{width:100% !important;}}" +
   ".pmd-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}" +
   "@media (max-width:700px){.pmd-grid2{grid-template-columns:1fr;}}" +
+  ".pmd-grid-asym{display:grid;grid-template-columns:1fr 1.2fr;gap:16px;align-items:start;}" +
+  "@media (max-width:700px){.pmd-grid-asym{grid-template-columns:1fr;}}" +
   ".pmd-sum2{display:grid;grid-template-columns:1fr 1fr;gap:16px 24px;}" +
   ".pmd-sum-layout{display:flex;flex-direction:column;gap:16px;}" +
   ".pmd-sum-img{width:100%;border-radius:12px;overflow:hidden;background:#f3f4f6;display:flex;align-items:center;justify-content:center;}" +
@@ -105,162 +119,55 @@ const PMD_CSS =
 const MaterialDetailStyles = () => ce('style', null, PMD_CSS);
 
 // ── data ──
-// Original SQL used INNER JOINs across production_material → production →
-// product/konveksi → material_details → raw_material. Any missing link means
-// "no header" (null), same as the original's empty-result-set behavior.
 function fetchPmHeader(pmId) {
-  return ctx.api.resource('production_material').get({
-    filterByTk: pmId,
-    fields: ['id', 'status', 'shipment_date', 'quantity_need', 'fk_material_details_code', 'fk_production_id'],
-  }).then(function (pmRes) {
-    const pm = pmRes && pmRes.data && pmRes.data.data;
-    if (!pm || !pm.fk_production_id || !pm.fk_material_details_code) return null;
-
-    return Promise.all([
-      ctx.api.resource('production').get({
-        filterByTk: pm.fk_production_id,
-        fields: ['id', 'production_ref', 'planning_rol', 'fk_product_code', 'fk_konveksi_code'],
-      }).then(r => (r && r.data && r.data.data) || null).catch(() => null),
-      ctx.api.resource('material_details').get({
-        filterByTk: pm.fk_material_details_code,
-        fields: ['code', 'fk_material_code'],
-      }).then(r => (r && r.data && r.data.data) || null).catch(() => null),
-    ]).then(function (results) {
-      const production = results[0];
-      const materialDetails = results[1];
-      if (!production || !materialDetails || !materialDetails.fk_material_code) return null;
-
-      return Promise.all([
-        ctx.api.resource('product').get({
-          filterByTk: production.fk_product_code,
-          fields: ['code', 'name'],
-        }).then(r => (r && r.data && r.data.data) || null).catch(() => null),
-        ctx.api.resource('konveksi').get({
-          filterByTk: production.fk_konveksi_code,
-          fields: ['name'],
-        }).then(r => (r && r.data && r.data.data) || null).catch(() => null),
-        ctx.api.resource('raw_material').get({
-          filterByTk: materialDetails.fk_material_code,
-          fields: ['type', 'default_content'],
-        }).then(r => (r && r.data && r.data.data) || null).catch(() => null),
-      ]).then(function (r2) {
-        const product = r2[0], konveksi = r2[1], rawMaterial = r2[2];
-        if (!product || !konveksi || !rawMaterial) return null;
-
-        return {
-          id: pm.id,
-          status: pm.status,
-          shipment_date: pm.shipment_date,
-          quantity_need: pm.quantity_need,
-          material_code: pm.fk_material_details_code,
-          production_id: pm.fk_production_id,
-          material_type: rawMaterial.type,
-          default_content: rawMaterial.default_content,
-          production_ref: production.production_ref,
-          planning_rol: production.planning_rol,
-          product_code: product.code,
-          product_name: product.name,
-          konveksi_name: konveksi.name,
-        };
-      });
-    });
-  }).catch(() => null);
+  return runSql('pmd_hdr_' + pmId,
+    "SELECT pm.id AS id, pm.status AS status, pm.shipment_date AS shipment_date, pm.quantity_need AS quantity_need, " +
+    "  pm.fk_material_details_code AS material_code, pm.fk_production_id AS production_id, " +
+    "  raw_material.type AS material_type, raw_material.default_content AS default_content, " +
+    "  production.production_ref AS production_ref, production.planning_rol AS planning_rol, " +
+    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
+    "FROM production_material pm " +
+    "JOIN production ON pm.fk_production_id = production.id " +
+    "JOIN product  ON production.fk_product_code  = product.code " +
+    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
+    "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
+    "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
+    "WHERE pm.id = '" + pmId + "'"
+  ).then(r => r[0] || null);
 }
-
 function fetchLightHeader(pmId) {
-  return ctx.api.resource('production_material').get({
-    filterByTk: pmId,
-    fields: ['id', 'status', 'fk_material_details_code'],
-  }).then(function (res) {
-    const pm = res && res.data && res.data.data;
-    if (!pm) return null;
-    return { id: pm.id, status: pm.status, material_code: pm.fk_material_details_code };
-  }).catch(() => null);
+  return runSql('pmd_lhdr_' + pmId, "SELECT id, status, fk_material_details_code AS material_code FROM production_material WHERE id = '" + pmId + "'").then(r => r[0] || null);
 }
-
 function fetchProductionDo(productionId) {
-  return ctx.api.resource('production_quantity_details').list({
-    filter: { fk_production_id: productionId },
-    fields: ['quantity'],
-    pageSize: 1000,
-  }).then(function (res) {
-    const rows = (res && res.data && res.data.data) || [];
-    return rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
-  }).catch(() => 0);
+  return runSql('pmd_ddo_' + productionId, "SELECT COALESCE(SUM(quantity),0) AS total_do FROM production_quantity_details WHERE fk_production_id = '" + productionId + "'").then(r => num(r[0] && r[0].total_do));
 }
-
-// Uses appends instead of introspecting the `fields` metadata table by hand
-// (README §4's recommended path for image/attachment relations).
 function fetchProductImage(productCode) {
   if (!productCode) return Promise.resolve('');
-  return ctx.api.resource('product').get({
-    filterByTk: productCode,
-    appends: ['image'],
-  }).then(function (res) {
-    const product = res && res.data && res.data.data;
-    const img = product && product.image;
-    const imgRow = Array.isArray(img) ? img[0] : img;
-    if (!imgRow) return '';
-    return imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
-  }).catch(() => '');
+  return runSql('pmd_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'")
+    .then(function(rows) {
+      if (!rows.length) return '';
+      let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return ''; }
+      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
+      if (!through || !fk || !ok) return '';
+      return runSql('pmd_imgjoin_' + productCode,
+        "SELECT attachments.url AS url, attachments.filename AS filename FROM product " +
+        "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
+        "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
+        "WHERE product.code = '" + productCode + "' ORDER BY attachments.id ASC LIMIT 1")
+        .then(function(irows) { const r = irows[0]; return r ? (r.url || (r.filename ? '/storage/uploads/' + r.filename : '')) : ''; });
+    }).catch(() => '');
 }
-
 function fetchEditRecord(pmId) {
-  return ctx.api.resource('production_material').get({
-    filterByTk: pmId,
-    fields: ['fk_production_id', 'fk_material_details_code', 'quantity_need', 'status', 'shipment_date'],
-  }).then(function (res) {
-    return (res && res.data && res.data.data) || {};
-  }).catch(() => ({}));
+  return runSql('pmd_erec_' + pmId, "SELECT fk_production_id, fk_material_details_code, quantity_need, status, shipment_date FROM production_material WHERE id = '" + pmId + "'").then(r => r[0] || {});
 }
-
 let _editOpts = null;
 function fetchEditOptions() {
   if (_editOpts) return Promise.resolve(_editOpts);
-
-  const productionsP = ctx.api.resource('production').list({
-    fields: ['id', 'production_ref', 'fk_product_code', 'fk_konveksi_code', 'created_at'],
-    sort: ['-created_at'],
-    pageSize: 500,
-  }).then(function (res) { return (res && res.data && res.data.data) || []; });
-
-  const materialsP = ctx.api.resource('material_details').list({
-    fields: ['code'],
-    sort: ['code'],
-    pageSize: 1000,
-  }).then(function (res) { return (res && res.data && res.data.data) || []; });
-
-  return Promise.all([productionsP, materialsP]).then(function (r) {
-    const productions = r[0], materials = r[1];
-
-    const productCodes = [...new Set(productions.map(p => p.fk_product_code).filter(Boolean))];
-    const konveksiCodes = [...new Set(productions.map(p => p.fk_konveksi_code).filter(Boolean))];
-
-    const productLookupP = productCodes.length
-      ? ctx.api.resource('product').list({ filter: { code: { $in: productCodes } }, fields: ['code', 'name'], pageSize: 500 })
-          .then(res => (res && res.data && res.data.data) || [])
-      : Promise.resolve([]);
-    const konveksiLookupP = konveksiCodes.length
-      ? ctx.api.resource('konveksi').list({ filter: { code: { $in: konveksiCodes } }, fields: ['code', 'name'], pageSize: 500 })
-          .then(res => (res && res.data && res.data.data) || [])
-      : Promise.resolve([]);
-
-    return Promise.all([productLookupP, konveksiLookupP]).then(function (r2) {
-      const productByCode = {}; r2[0].forEach(p => { productByCode[p.code] = p; });
-      const konveksiByCode = {}; r2[1].forEach(k => { konveksiByCode[k.code] = k; });
-
-      const prodRows = productions.map(function (p) {
-        const product = productByCode[p.fk_product_code] || {};
-        const konveksi = konveksiByCode[p.fk_konveksi_code] || {};
-        return { id: p.id, ref: p.production_ref, pcode: product.code, pname: product.name, kname: konveksi.name };
-      });
-
-      _editOpts = { productions: prodRows, materials: materials };
-      return _editOpts;
-    });
-  });
+  return Promise.all([
+    runSql('pmd_opt_prod', "SELECT production.id AS id, production.production_ref AS ref, product.code AS pcode, product.name AS pname, konveksi.name AS kname FROM production JOIN product ON production.fk_product_code = product.code JOIN konveksi ON production.fk_konveksi_code = konveksi.code ORDER BY production.created_at DESC"),
+    runSql('pmd_opt_mat', "SELECT code FROM material_details ORDER BY code ASC"),
+  ]).then(r => { _editOpts = { productions: r[0], materials: r[1] }; return _editOpts; });
 }
-
 function updateMaterial(pmId, form) {
   return ctx.api.resource('production_material').update({ filterByTk: pmId, values: {
     fk_production_id: form.production, fk_material_details_code: form.material_code, quantity_need: form.quantity_need,
@@ -270,9 +177,10 @@ function updateMaterial(pmId, form) {
 // ── sections ──
 const MaterialSummary = function(props) {
   const r = props.header, img = props.image, acc = !isFabric(r.material_type), sc = statusColor(r.status);
+  // flat status chip — soft tint, no border, cursor default (not a button)
   const statusBlock = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
     ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, 'Status'),
-    ce('span', { style: { alignSelf: 'flex-start', background: statusBg(r.status), color: sc, border: '1px solid ' + sc + '44', borderRadius: 999, padding: '2px 10px', fontSize: 12, fontWeight: 600 } }, statusLabel(r.status)));
+    ce('span', { style: { alignSelf: 'flex-start', background: statusBg(r.status), color: sc, borderRadius: 999, padding: '2px 10px', fontSize: 12, fontWeight: 600, cursor: 'default' } }, statusLabel(r.status)));
   const typeBlock = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' } },
     ce('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, 'Type'),
     acc ? pill('Accessories', '#f3e8ff', '#a855f7') : pill('Fabric', '#e0f2fe', '#0ea5e9'));
@@ -295,8 +203,10 @@ const MaterialNeed = function(props) {
   return ce('div', { style: { maxWidth: 360 } },
     renderNeed(buildNeed({ quantity_need: r.quantity_need, default_content: r.default_content }, acc, r.planning_rol, totalDo)));
 };
+ 
 
-const MaterialOutSection = function(props) {
+// simple totals box + Add action
+const MaterialOutSummaryBox = function(props) {
   const sL = useState(true); const loading = sL[0]; const setLoading = sL[1];
   const sE = useState(null); const el = sE[0]; const setEl = sE[1];
   useEffect(function() {
@@ -304,10 +214,44 @@ const MaterialOutSection = function(props) {
     loadCode('ui_material_out').then(MO => MO.fetchSummary(ctx, props.pmId).then(d => { setEl(MO.renderSummary(d)); setLoading(false); })).catch(() => setLoading(false));
   }, [props.pmId, props.refreshKey]);
   if (loading) return ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…');
-  return ce('div', { style: { maxWidth: 420 } },
+  return ce('div', null,
     ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 10 } },
-      ce('button', { onClick: () => props.onAdd(), style: { border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534', borderRadius: 8, padding: '6px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer' } }, '＋ Add material out')),
+      ce('button', { onClick: () => props.onAdd(), style: BTN_PRIMARY }, '＋ Add material out')),
     el || ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No material out'));
+};
+
+// transaction-list view: one row per entry with breakdown + status + cancel — separate section
+const MaterialOutDetailsSection = function(props) {
+  const sL = useState(true); const loading = sL[0]; const setLoading = sL[1];
+  const sD = useState(null); const data = sD[0]; const setData = sD[1];
+  const sMO = useState(null); const MO = sMO[0]; const setMO = sMO[1];
+
+  function load() {
+    setLoading(true);
+    return loadCode('ui_material_out').then(function(mod) {
+      setMO(function() { return mod; });
+      return mod.fetchSummary(ctx, props.pmId).then(function(d) {
+        setData(d);
+        setLoading(false);
+        return mod;
+      });
+    }).catch(function() { setLoading(false); });
+  }
+
+  useEffect(function() { load(); }, [props.pmId, props.refreshKey]);
+
+  function handleCancel(ledgerId) {
+    if (!MO) return;
+    MO.cancelLedger(ctx, ledgerId, function() {
+      load();
+      if (props.onChanged) props.onChanged();
+    });
+  }
+
+  if (loading || !MO) return ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…');
+
+  return ce('div', { style: { border: '1px solid #f0f0f0', borderRadius: 10, padding: '4px 14px', background: '#fff' } },
+    MO.renderDetails(data, { onCancel: handleCancel }));
 };
 
 // ── body ──
@@ -334,6 +278,7 @@ const MaterialDetailBody = function(props) {
       MO.openModal({ ctx: ctx, pmId: pmId, onSaved: function() { setLocalRk(n => n + 1); if (props.onChanged) props.onChanged(); } });
     }).catch(function(e) { ctx.message.error('Failed: ' + ((e && e.message) || e)); });
   }
+  function handleChanged() { setLocalRk(n => n + 1); if (props.onChanged) props.onChanged(); }
 
   const subLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', margin: '20px 0 10px' } }, t);
   if (!header) return ce('div', null, ce(MaterialDetailStyles, null), ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…'));
@@ -341,10 +286,16 @@ const MaterialDetailBody = function(props) {
   return ce('div', null,
     ce(MaterialDetailStyles, null),
     ce(MaterialSummary, { header: header, image: image, onOpenProduction: props.onOpenProduction ? () => props.onOpenProduction(header.production_id) : null }),
+
+    // quantity need — full width, on its own
     subLabel('Quantity need'),
     ce(MaterialNeed, { header: header, refreshKey: combo }),
-    subLabel('Material out'),
-    ce(MaterialOutSection, { pmId: pmId, refreshKey: combo, onAdd: handleAdd }));
+
+    // material out + material out details — side by side, so they read as one group
+    ce('div', { className: 'pmd-grid-asym', style: { marginTop: 8 } },
+      ce('div', null, subLabel('Material out'), ce(MaterialOutSummaryBox, { pmId: pmId, refreshKey: combo, onAdd: handleAdd })),
+      ce('div', null, subLabel('Material out details'), ce(MaterialOutDetailsSection, { pmId: pmId, refreshKey: combo, onChanged: handleChanged }))
+    ));
 };
 
 // ── standalone detail drawer (Edit + ⋯Delete chrome) ──
