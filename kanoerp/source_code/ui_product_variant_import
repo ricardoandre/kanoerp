@@ -1,0 +1,548 @@
+// ui_product_variant_import — bulk import/reimport of legacy product_variant codes.
+// Parses each pasted legacy code into { product, sku_option } by matching known
+// product code prefixes against sku_option values (empty suffix = "All Size").
+// For codes that already exist, compares web_price/marketplace_price against
+// stored values: same -> ignored, different -> requires explicit confirmation
+// before overwriting (no-delete / no-silent-overwrite pattern).
+// Input:  openModal({ ctx, onSaved })
+// Depends on: none.
+
+const { useState, useEffect } = React;
+const { Modal, Select, Checkbox } = antd;
+const ce = React.createElement;
+
+const ALL_SIZE_MATCH = ['all size', 'allsize', 'all-size', 'all'];
+
+// ===== §4.2 canonical SQL helper =====
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+
+async function fetchProducts(ctx) {
+  return runSql(ctx, 'pvi_products', "SELECT code, name, model FROM product ORDER BY code ASC");
+}
+async function fetchSkuOptions(ctx) {
+  return runSql(ctx, 'pvi_sku_options', "SELECT id, value, display FROM sku_option ORDER BY sort ASC");
+}
+async function fetchExistingVariants(ctx) {
+  return runSql(ctx, 'pvi_existing',
+    "SELECT id, code, fk_product_code, fk_sku_option_id, web_price, marketplace_price FROM product_variant"
+  );
+}
+
+// ===== pure parsing (no SQL — operates on preloaded lists) =====
+function findAllSizeOption(skuOptions) {
+  return skuOptions.find(function (o) {
+    const v = String(o.value || '').trim().toLowerCase();
+    const d = String(o.display || '').trim().toLowerCase();
+    return ALL_SIZE_MATCH.indexOf(v) !== -1 || ALL_SIZE_MATCH.indexOf(d) !== -1;
+  }) || null;
+}
+
+function parseLegacyCode(rawCode, products, skuOptions, allSizeOption) {
+  const code = String(rawCode || '').trim();
+  if (!code) return null;
+
+  const candidates = [];
+  products.forEach(function (p) {
+    if (code.indexOf(p.code) === 0) {
+      const suffix = code.slice(p.code.length);
+      if (suffix === '') {
+        if (allSizeOption) candidates.push({ product: p, skuOption: allSizeOption, suffix: '(none — All Size)' });
+      } else {
+        const match = skuOptions.find(function (o) {
+          return String(o.value).trim().toLowerCase() === suffix.trim().toLowerCase();
+        });
+        if (match) candidates.push({ product: p, skuOption: match, suffix: suffix });
+      }
+    }
+  });
+
+  return { code: code, candidates: candidates };
+}
+
+// ===== price field classifier =====
+// 'same'     -> nothing pasted, or pasted value matches what's already stored -> no action
+// 'fill'     -> existing value is empty/0 and a real value was pasted -> auto-apply, no confirmation needed
+// 'conflict' -> existing value is a real, different value -> requires explicit confirmation to overwrite
+function classifyPriceField(existingVal, newVal) {
+  if (newVal === null || newVal === 0) return 'same';
+  const ex = (existingVal === null || existingVal === undefined || existingVal === '') ? 0 : Number(existingVal);
+  if (ex === 0) return 'fill';
+  if (ex === newVal) return 'same';
+  return 'conflict';
+}
+
+// ===== single source of truth for row status, used by both render and save =====
+function deriveRow(res, rowInput, chosenIndex, existingByCode, existingComboMap) {
+  if (!res) return null;
+
+  if (!res.candidates.length) {
+    return { code: res.code, status: 'not_found' };
+  }
+
+  const newWeb = rowInput.webPrice.trim() !== '' ? parseFloat(rowInput.webPrice) : null;
+  const newMp = rowInput.marketplacePrice.trim() !== '' ? parseFloat(rowInput.marketplacePrice) : null;
+
+  const existingRow = existingByCode[res.code];
+  if (existingRow) {
+    const webClass = classifyPriceField(existingRow.web_price, newWeb);
+    const mpClass = classifyPriceField(existingRow.marketplace_price, newMp);
+    const hasConflict = webClass === 'conflict' || mpClass === 'conflict';
+    const hasFill = webClass === 'fill' || mpClass === 'fill';
+    const status = hasConflict ? 'existing_diff' : (hasFill ? 'existing_fill' : 'existing_same');
+    return {
+      code: res.code,
+      status: status,
+      candidates: res.candidates,
+      existingRow: existingRow,
+      newWeb: newWeb, newMp: newMp,
+      webClass: webClass, mpClass: mpClass,
+      webChanged: webClass !== 'same', mpChanged: mpClass !== 'same',
+    };
+  }
+
+  let chosen = null;
+  if (res.candidates.length === 1) chosen = res.candidates[0];
+  else if (chosenIndex != null && res.candidates[chosenIndex]) chosen = res.candidates[chosenIndex];
+
+  if (!chosen) {
+    return { code: res.code, status: 'ambiguous', candidates: res.candidates };
+  }
+
+  const comboKey = chosen.product.code + '|' + chosen.skuOption.id;
+  const comboExisting = existingComboMap[comboKey];
+  if (comboExisting) {
+    return { code: res.code, status: 'combo_conflict', candidates: res.candidates, chosen: chosen, comboExisting: comboExisting };
+  }
+
+  return { code: res.code, status: 'new', candidates: res.candidates, chosen: chosen, newWeb: newWeb, newMp: newMp };
+}
+
+// ===== paste grid =====
+function emptyRow() { return { code: '', webPrice: '', marketplacePrice: '' }; }
+function makeInitialRows(n) {
+  const arr = [];
+  for (let i = 0; i < n; i++) arr.push(emptyRow());
+  return arr;
+}
+
+const STATUS_META = {
+  ok: { color: '#22c55e', label: 'OK' },
+  new: { color: '#22c55e', label: 'New' },
+  existing_same: { color: '#94a3b8', label: 'No change' },
+  existing_fill: { color: '#22c55e', label: 'Fill in' },
+  existing_diff: { color: '#f59e0b', label: 'Needs confirm' },
+  ambiguous: { color: '#f59e0b', label: 'Pick match' },
+  not_found: { color: '#ef4444', label: 'No match' },
+  combo_conflict: { color: '#ef4444', label: 'Code conflict' },
+};
+
+function PasteGrid(props) {
+  const rows = props.rows;
+  const setRows = props.setRows;
+  const derived = props.derived;
+  const resolvedChoice = props.resolvedChoice;
+  const setResolvedChoice = props.setResolvedChoice;
+  const overwriteConfirm = props.overwriteConfirm;
+  const setOverwriteConfirm = props.setOverwriteConfirm;
+
+  function updateCell(rowIndex, field, value) {
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      next[rowIndex][field] = value;
+      const last = next[next.length - 1];
+      if (last.code !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+
+  function handlePaste(e, rowIndex, colIndex) {
+    const text = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+    if (!text) return;
+    e.preventDefault();
+    const lines = text.replace(/\r/g, '').split('\n').filter(function (l, i, arr) { return !(i === arr.length - 1 && l === ''); });
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      lines.forEach(function (line, li) {
+        const cells = line.split('\t');
+        const targetRow = rowIndex + li;
+        while (next.length <= targetRow) next.push(emptyRow());
+        cells.forEach(function (cellVal, ci) {
+          const targetCol = colIndex + ci;
+          const val = cellVal.trim();
+          if (targetCol === 0) next[targetRow].code = val;
+          else if (targetCol === 1) next[targetRow].webPrice = val;
+          else if (targetCol === 2) next[targetRow].marketplacePrice = val;
+        });
+      });
+      const last = next[next.length - 1];
+      if (last.code !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+
+  function removeRow(rowIndex) {
+    setRows(function (prev) {
+      const next = prev.filter(function (_, i) { return i !== rowIndex; });
+      return next.length ? next : [emptyRow()];
+    });
+  }
+
+  return ce('div', { style: { border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
+    ce('div', { style: { display: 'grid', gridTemplateColumns: '32px 1.1fr 0.7fr 0.7fr 1.9fr 28px', background: '#fafafa', borderBottom: '2px solid #e8e8e8', fontSize: 11, fontWeight: 600, color: '#555' } },
+      ce('div', { style: { padding: '6px 4px' } }, '#'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Legacy Code'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Web Price'),
+      ce('div', { style: { padding: '6px 8px' } }, 'MP Price'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Parsed / Match'),
+      ce('div', null)
+    ),
+    ce('div', { style: { maxHeight: 420, overflowY: 'auto' } },
+      rows.map(function (row, i) {
+        const d = derived && derived[i];
+        const meta = d ? STATUS_META[d.status] : null;
+
+        return ce('div', {
+          key: i,
+          style: { display: 'grid', gridTemplateColumns: '32px 1.1fr 0.7fr 0.7fr 1.9fr 28px', borderBottom: '1px solid #f0f0f0', alignItems: 'flex-start' }
+        },
+          ce('div', { style: { padding: '6px 4px', fontSize: 11, color: '#aaa' } }, i + 1),
+          ce('input', {
+            value: row.code,
+            onChange: function (e) { updateCell(i, 'code', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 0); },
+            placeholder: 'e.g. O230034L',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box' }
+          }),
+          ce('input', {
+            value: row.webPrice,
+            onChange: function (e) { updateCell(i, 'webPrice', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 1); },
+            placeholder: '—',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box', textAlign: 'right' }
+          }),
+          ce('input', {
+            value: row.marketplacePrice,
+            onChange: function (e) { updateCell(i, 'marketplacePrice', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 2); },
+            placeholder: '—',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box', textAlign: 'right' }
+          }),
+          ce('div', { style: { padding: '6px 8px' } },
+            !d ? null :
+            d.status === 'ambiguous'
+              ? ce(Select, {
+                  size: 'small', style: { width: '100%' }, placeholder: 'Select match',
+                  onChange: function (val) { setResolvedChoice(function (prev) { const next = { ...prev }; next[i] = val; return next; }); },
+                  options: d.candidates.map(function (c, ci) {
+                    return { value: ci, label: c.product.code + ' — ' + (c.product.name || '') + ' — ' + (c.skuOption.display || c.skuOption.value) };
+                  })
+                })
+              : d.status === 'not_found'
+                ? ce('span', { style: { fontSize: 11, color: meta.color } }, meta.label)
+                : d.status === 'combo_conflict'
+                  ? ce('div', { style: { fontSize: 11 } },
+                      ce('span', { style: { color: meta.color, fontWeight: 600 } }, meta.label),
+                      ce('div', { style: { color: '#94a3b8' } }, 'already used by code "' + d.comboExisting.code + '"')
+                    )
+                  : ce('div', { style: { fontSize: 11 } },
+                      ce('span', { style: { fontWeight: 600, color: (d.status === 'existing_diff' ? '#f59e0b' : '#22c55e') } },
+                        (d.chosen ? d.chosen.product.code : (d.existingRow ? d.existingRow.fk_product_code : '')) + ' + ' +
+                        (d.chosen ? (d.chosen.skuOption.display || d.chosen.skuOption.value) : '')
+                      ),
+                      d.status === 'existing_same'
+                        ? ce('div', { style: { color: '#94a3b8' } }, 'already imported — no change')
+                        : d.status === 'existing_fill'
+                          ? ce('div', null,
+                              d.webChanged ? ce('div', { style: { color: '#22c55e' } }, 'web: — → ' + d.newWeb + ' (auto-filled)') : null,
+                              d.mpChanged ? ce('div', { style: { color: '#22c55e' } }, 'mp: — → ' + d.newMp + ' (auto-filled)') : null
+                            )
+                          : d.status === 'existing_diff'
+                            ? ce('div', null,
+                                d.webChanged ? ce('div', { style: { color: '#f59e0b' } }, 'web: ' + (d.existingRow.web_price ?? '—') + ' → ' + d.newWeb) : null,
+                                d.mpChanged ? ce('div', { style: { color: '#f59e0b' } }, 'mp: ' + (d.existingRow.marketplace_price ?? '—') + ' → ' + d.newMp) : null,
+                                ce(Checkbox, {
+                                  checked: !!overwriteConfirm[i],
+                                  onChange: function (e) { setOverwriteConfirm(function (prev) { const next = { ...prev }; next[i] = e.target.checked; return next; }); },
+                                  style: { marginTop: 4 }
+                                }, 'Overwrite')
+                              )
+                            : null
+                    )
+          ),
+          (row.code !== '')
+            ? ce('button', { onClick: function () { removeRow(i); }, style: { border: 'none', background: 'none', color: '#ccc', cursor: 'pointer', fontSize: 11, marginTop: 6 } }, '✕')
+            : ce('div', null)
+        );
+      })
+    )
+  );
+}
+
+// ===== validation summary banner =====
+function ValidationSummary(props) {
+  const counts = props.counts;
+  const errorCount = counts.not_found + counts.ambiguous + counts.combo_conflict;
+  const bg = errorCount > 0 ? '#fef2f2' : '#f0fdf4';
+  const border = errorCount > 0 ? '#fca5a5' : '#86efac';
+  const titleColor = errorCount > 0 ? '#b91c1c' : '#166534';
+
+  const parts = [];
+  if (counts.new) parts.push(counts.new + ' new');
+  if (counts.existing_same) parts.push(counts.existing_same + ' unchanged');
+  if (counts.existing_fill) parts.push(counts.existing_fill + ' auto-fill');
+  if (counts.existing_diff) parts.push(counts.existing_diff + ' need price confirmation');
+  if (counts.ambiguous) parts.push(counts.ambiguous + ' ambiguous');
+  if (counts.not_found) parts.push(counts.not_found + ' not found');
+  if (counts.combo_conflict) parts.push(counts.combo_conflict + ' code conflict');
+
+  return ce('div', { style: { background: bg, border: '1px solid ' + border, borderRadius: 4, padding: '8px 12px', marginBottom: 10, fontSize: 12 } },
+    ce('div', { style: { fontWeight: 700, color: titleColor, marginBottom: 2 } },
+      errorCount > 0 ? (errorCount + ' row(s) need attention') : 'All rows parsed successfully'
+    ),
+    ce('div', { style: { color: '#64748b' } }, parts.join(' · '))
+  );
+}
+
+// ===== main content =====
+function ImportContent(props) {
+  const ctx = props.ctx;
+  const products = props.products;
+  const skuOptions = props.skuOptions;
+  const existingVariants = props.existingVariants;
+  const onSaved = props.onSaved;
+
+  const allSizeOption = findAllSizeOption(skuOptions);
+
+  const [rows, setRows] = useState(makeInitialRows(15));
+  const [parsedResults, setParsedResults] = useState(null);
+  const [resolvedChoice, setResolvedChoice] = useState({});
+  const [overwriteConfirm, setOverwriteConfirm] = useState({});
+  const [validating, setValidating] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const existingByCode = {};
+  const existingComboMap = {};
+  existingVariants.forEach(function (v) {
+    existingByCode[v.code] = v;
+    existingComboMap[v.fk_product_code + '|' + v.fk_sku_option_id] = v;
+  });
+
+  function handleClose() { Modal.destroyAll(); }
+
+  function activeRows() {
+    return rows.map(function (r, i) { return { i: i, row: r }; }).filter(function (x) { return x.row.code.trim() !== ''; });
+  }
+
+  function handleValidate() {
+    const active = activeRows();
+    if (!active.length) { ctx.message.warning('Paste or enter at least one legacy code.'); return; }
+    setValidating(true);
+    try {
+      const next = new Array(rows.length).fill(null);
+      active.forEach(function (x) {
+        next[x.i] = parseLegacyCode(x.row.code, products, skuOptions, allSizeOption);
+      });
+      setParsedResults(next);
+      setResolvedChoice({});
+      setOverwriteConfirm({});
+    } finally {
+      setValidating(false);
+    }
+  }
+
+  const derived = parsedResults
+    ? rows.map(function (row, i) {
+        return deriveRow(parsedResults[i], row, resolvedChoice[i], existingByCode, existingComboMap);
+      })
+    : null;
+
+  const counts = { new: 0, existing_same: 0, existing_fill: 0, existing_diff: 0, ambiguous: 0, not_found: 0, combo_conflict: 0 };
+  if (derived) {
+    derived.forEach(function (d) { if (d && counts.hasOwnProperty(d.status)) counts[d.status]++; });
+  }
+
+  function buildSaveList() {
+    if (!derived) return { creates: [], updates: [] };
+    const creates = [];
+    const updates = [];
+    derived.forEach(function (d, i) {
+      if (!d) return;
+      if (d.status === 'new') {
+        creates.push({
+          code: d.code,
+          productCode: d.chosen.product.code,
+          skuOptionId: d.chosen.skuOption.id,
+          webPrice: d.newWeb,
+          marketplacePrice: d.newMp,
+        });
+      } else if (d.status === 'existing_fill') {
+        // existing value was empty/0 -> auto-apply, no confirmation needed
+        const values = {};
+        if (d.webChanged) values.web_price = d.newWeb;
+        if (d.mpChanged) values.marketplace_price = d.newMp;
+        updates.push({ id: d.existingRow.id, code: d.code, values: values });
+      } else if (d.status === 'existing_diff' && overwriteConfirm[i]) {
+        const values = {};
+        if (d.webChanged) values.web_price = d.newWeb;
+        if (d.mpChanged) values.marketplace_price = d.newMp;
+        updates.push({ id: d.existingRow.id, code: d.code, values: values });
+      }
+    });
+    return { creates: creates, updates: updates };
+  }
+
+  async function handleSave() {
+    const { creates, updates } = buildSaveList();
+    if (!creates.length && !updates.length) {
+      ctx.message.warning('Nothing ready to save — validate, resolve ambiguous rows, and confirm any price changes first.');
+      return;
+    }
+
+    setSaving(true);
+    let createOk = 0, updateOk = 0;
+    const failed = [];
+    try {
+      for (const item of creates) {
+        try {
+          await ctx.api.resource('product_variant').create({
+            values: {
+              product: { code: item.productCode },
+              sku_option: { id: item.skuOptionId },
+              code: item.code,
+              web_price: item.webPrice,
+              marketplace_price: item.marketplacePrice,
+            }
+          });
+          createOk++;
+        } catch (rowErr) {
+          console.error('Create error:', item.code, rowErr);
+          failed.push(item.code + ' (create)');
+        }
+      }
+      for (const item of updates) {
+        try {
+          await ctx.api.resource('product_variant').update({
+            filterByTk: item.id,
+            values: item.values,
+          });
+          updateOk++;
+        } catch (rowErr) {
+          console.error('Update error:', item.code, rowErr);
+          failed.push(item.code + ' (update)');
+        }
+      }
+
+      Modal.destroyAll();
+      ctx.notification.success({
+        message: 'Product Variant Import Complete',
+        description: createOk + ' created, ' + updateOk + ' updated' + (failed.length ? ('. ' + failed.length + ' failed: ' + failed.join(', ')) : '.'),
+        duration: 8,
+      });
+      if (onSaved) onSaved();
+    } catch (e) {
+      console.error('Save error:', e);
+      setSaving(false);
+      ctx.message.error('Failed to save: ' + (e.message || 'unknown error'));
+    }
+  }
+
+  const { creates, updates } = buildSaveList();
+  const readyCount = creates.length + updates.length;
+  const activeCount = activeRows().length;
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+
+    !allSizeOption
+      ? ce('div', { style: { background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e', borderRadius: 4, padding: '6px 10px', fontSize: 11, marginBottom: 10 } },
+          '⚠ No "All Size" sku_option found — codes with no variant suffix will show as "No match" until one exists.'
+        )
+      : null,
+
+    ce('div', { style: { marginBottom: 8, fontSize: 11, color: '#94a3b8' } },
+      'Paste legacy codes from your export — one per row. Prices are optional and can be filled in now or on a later reimport.'
+    ),
+
+    ce(PasteGrid, {
+      rows: rows,
+      setRows: function (fn) { setParsedResults(null); setRows(fn); },
+      derived: derived,
+      resolvedChoice: resolvedChoice, setResolvedChoice: setResolvedChoice,
+      overwriteConfirm: overwriteConfirm, setOverwriteConfirm: setOverwriteConfirm,
+    }),
+
+    derived ? ce(ValidationSummary, { counts: counts }) : null,
+
+    ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '12px 0' } },
+      ce('span', { style: { fontSize: 12, color: '#888' } },
+        derived ? (readyCount + ' of ' + activeCount + ' row(s) ready to save') : (activeCount + ' row(s) entered')
+      ),
+      ce('button', {
+        onClick: handleValidate, disabled: validating || !activeCount,
+        style: { padding: '5px 14px', fontSize: 12, cursor: (validating || !activeCount) ? 'not-allowed' : 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }
+      }, validating ? 'Parsing…' : 'Parse & Validate')
+    ),
+
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, borderTop: '1px solid #eee', paddingTop: 12 } },
+      ce('button', { onClick: handleClose, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Cancel'),
+      ce('button', {
+        onClick: handleSave, disabled: saving || !derived || !readyCount,
+        style: { padding: '5px 16px', fontSize: 12, cursor: (saving || !derived || !readyCount) ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 4, fontWeight: 600, color: '#fff', background: (saving || !derived || !readyCount) ? '#d9d9d9' : '#22c55e' }
+      }, saving ? 'Saving…' : ('Save ' + readyCount + ' Row(s)'))
+    ),
+
+    ce('div', { style: { height: 20 } })
+  );
+}
+
+// ===== loader =====
+function ImportLoader(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+  const [state, setState] = useState({ loading: true, products: [], skuOptions: [], existingVariants: [], err: null });
+
+  useEffect(function () {
+    let alive = true;
+    Promise.all([fetchProducts(ctx), fetchSkuOptions(ctx), fetchExistingVariants(ctx)])
+      .then(function (res) {
+        if (alive) setState({ loading: false, products: res[0], skuOptions: res[1], existingVariants: res[2], err: null });
+      })
+      .catch(function (e) {
+        if (alive) setState({ loading: false, products: [], skuOptions: [], existingVariants: [], err: (e && e.message) || 'load failed' });
+      });
+    return function () { alive = false; };
+  }, []);
+
+  if (state.loading) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…');
+  if (state.err) return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, state.err);
+
+  return ce(ImportContent, {
+    ctx: ctx, products: state.products, skuOptions: state.skuOptions,
+    existingVariants: state.existingVariants, onSaved: onSaved,
+  });
+}
+
+// ===== entry point =====
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+
+  Modal.confirm({
+    title: 'Import Legacy Product Variant Codes',
+    width: 780,
+    icon: null,
+    content: ce(ImportLoader, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal };
