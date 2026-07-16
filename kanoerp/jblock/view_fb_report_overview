@@ -23,6 +23,15 @@
 //
 // Shared logic/UI lives in source_code rows (fn_fbads_data,
 // ui_fbads_controls) — see view_fb_ads_structure.js for the same pattern.
+//
+// NOTE (2026-07): loadCode and both fetch* functions converted from raw
+// ctx.sql/fn.runSql to ctx.api.resource() — ctx.sql.save() is admin/root-
+// gated and silently fails for non-admin roles (see README §3). The
+// original SQL grouped by a computed period-bucket expression, which the
+// resource API can't do server-side, so both fetchers now pull raw
+// date-stamped rows (paginated via fetchAllRows) and bucket/sum them in JS
+// against the already-known `periods` array instead. Do not revert to raw
+// SQL or fn.runSql for these two functions.
 // =====================================================
 
 const { React, antd, dayjs } = ctx.libs;
@@ -32,19 +41,39 @@ const ce = React.createElement;
 
 const DEFAULT_GRANULARITY = 'weekly';
 const DEFAULT_PERIOD_COUNT = 8;
-const GRANULARITY_OPTIONS = [{ label: 'Weekly', value: 'weekly' }, { label: 'Monthly', value: 'monthly' }]; // no Daily — see header note
+const GRANULARITY_OPTIONS = [{ label: 'Daily', value: 'daily' }, { label: 'Weekly', value: 'weekly' }, { label: 'Monthly', value: 'monthly' }];
 
 // ── shared code loader (README §3) ──
 let fn = null, ui = null;
 const _codeCache = {};
 async function loadCode(name) {
   if (_codeCache[name]) return _codeCache[name];
-  const uid = 'code_' + name;
-  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
-  const src = (rows && rows[0] && rows[0].code) || '';
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
   _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
   return _codeCache[name];
+}
+
+// Paginates a ctx.api.resource(collection).list() call until a short page
+// comes back — used here since both fetchers need every row in a date
+// range, not a single page.
+async function fetchAllRows(collection, opts) {
+  const pageSize = 500;
+  let page = 1;
+  let out = [];
+  while (true) {
+    const res = await ctx.api.resource(collection).list(Object.assign({}, opts, { page: page, pageSize: pageSize })).catch(() => null);
+    const rows = (res && res.data && res.data.data) || [];
+    out = out.concat(rows);
+    if (rows.length < pageSize) break;
+    page++;
+  }
+  return out;
 }
 
 // =====================================================
@@ -52,36 +81,67 @@ async function loadCode(name) {
 // =====================================================
 // Additive metrics only — real, exact, summed across every campaign under
 // the account. No reach/impressions here; see fetchAccountPeriodReach.
+// Converted: fetches raw daily rows in the date range, buckets each into
+// whichever `periods[i]` window it falls inside, sums in JS.
 function fetchAccountTotalsAgg(granularity, periods, account) {
   const since = periods[periods.length - 1].start, until = periods[0].end;
-  const keyExpr = fn.periodKeyExpr(granularity);
-  return fn.runSql(ctx, 'fbov_totals',
-    "SELECT " + keyExpr + " AS period_key, " +
-    "       COALESCE(SUM(spend),0) AS spend, " +
-    "       COALESCE(SUM(link_clicks),0) AS link_clicks, " +
-    "       COALESCE(SUM(atc),0) AS atc, " +
-    "       COALESCE(SUM(purchase),0) AS purchase, " +
-    "       COALESCE(SUM(revenue),0) AS revenue " +
-    "FROM campaigns_insights " +
-    "WHERE date BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
-    fn.accountFilterSql(account) +
-    "GROUP BY period_key"
-  );
+  const filter = {
+    date: { $gte: since.format('YYYY-MM-DD'), $lte: until.format('YYYY-MM-DD') },
+  };
+  if (account) filter.account = account;
+
+  return fetchAllRows('campaigns_insights', {
+    filter: filter,
+    fields: ['date', 'spend', 'link_clicks', 'atc', 'purchase', 'revenue'],
+  }).then(function (rows) {
+    const sums = {};
+    periods.forEach(function (p) {
+      sums[p.key] = { period_key: p.key, spend: 0, link_clicks: 0, atc: 0, purchase: 0, revenue: 0 };
+    });
+    rows.forEach(function (r) {
+      if (!r.date) return;
+      const d = dayjs(r.date);
+      const p = periods.find(function (pp) { return !d.isBefore(pp.start, 'day') && !d.isAfter(pp.end, 'day'); });
+      if (!p) return;
+      const s = sums[p.key];
+      s.spend += fn.num(r.spend);
+      s.link_clicks += fn.num(r.link_clicks);
+      s.atc += fn.num(r.atc);
+      s.purchase += fn.num(r.purchase);
+      s.revenue += fn.num(r.revenue);
+    });
+    return Object.values(sums);
+  });
 }
+
 // Real, deduplicated account-level reach/impressions — the only source
 // used for these fields. No fallback approximation: a period with no row
 // here just stays missing (see buildOverallMap / reachMissing below).
+// Converted: period.key already matches fb_ads_period_data.period_start's
+// format exactly (both 'YYYY-MM-DD'), so filtering by the exact set of
+// period keys reproduces the original's GROUP BY period_start precisely.
 function fetchAccountPeriodReach(periodType, periods, account) {
-  const since = periods[periods.length - 1].start, until = periods[0].start;
-  return fn.runSql(ctx, 'fbov_acct_reach',
-    "SELECT period_start AS period_key, " +
-    "       COALESCE(SUM(reach),0) AS reach, COALESCE(SUM(impression),0) AS impressions " +
-    "FROM fb_ads_period_data " +
-    "WHERE entity_type = 'account' AND period_type = '" + periodType + "' " +
-    "  AND period_start BETWEEN '" + fn.sqlDate(since) + "' AND '" + fn.sqlDate(until) + "' " +
-    fn.accountFilterSql(account) +
-    "GROUP BY period_start"
-  );
+  const periodKeys = periods.map(function (p) { return p.key; });
+  const filter = {
+    entity_type: 'account',
+    period_type: periodType,
+    period_start: { $in: periodKeys },
+  };
+  if (account) filter.account = account;
+
+  return fetchAllRows('fb_ads_period_data', {
+    filter: filter,
+    fields: ['period_start', 'reach', 'impression'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const key = r.period_start;
+      if (!sums[key]) sums[key] = { period_key: key, reach: 0, impressions: 0 };
+      sums[key].reach += fn.num(r.reach);
+      sums[key].impressions += fn.num(r.impression);
+    });
+    return Object.values(sums);
+  });
 }
 
 function buildOverallMap(totalsRows, periods) {
@@ -257,7 +317,7 @@ const Root = function () {
   function generate(gran, count, account, lastDateParam) {
     setLoading(true); setErr(null);
     const p = fn.buildPeriods(gran, count, lastDateParam);
-    const periodType = gran === 'monthly' ? 'month' : 'week';
+    const periodType = gran === 'monthly' ? 'month' : gran === 'daily' ? 'day' : 'week';
 
     Promise.all([fetchAccountTotalsAgg(gran, p, account), fetchAccountPeriodReach(periodType, p, account)])
       .then(function (res) {
