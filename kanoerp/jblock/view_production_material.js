@@ -1,319 +1,551 @@
-// =====================================================
-// jblock — PRODUCTION MATERIAL (runs on the ui_list_engine engine)
-//
-// Thin domain config: SQL, status colors, card layout, NEW form. The material
-// DETAIL and EDIT both come from the shared ui_production_material_detail row
-// (single source — same material detail/edit everywhere). Cross-record
-// navigation is handled by the shared ui_record_nav host at the view root:
-// production_ref ⇄ material row, each click CLOSES the current drawer and opens
-// the target (replace, no stack).
-// =====================================================
-const { React, antd, dayjs } = ctx.libs;
-const { useState, useEffect } = React;
-const { Select, InputNumber, Modal, message } = antd;
-const ce = React.createElement;
+const { React, antd } = ctx.libs;
+const { useEffect, useState } = React;
+const { Col, Row, Spin, Typography } = antd;
+const { Text } = Typography;
+const dayjs = ctx.libs.dayjs;
 
-// shared code loader
-const _codeCache = {};
-async function loadCode(name) {
-  if (_codeCache[name]) return _codeCache[name];
-  const uid = 'code_' + name;
-  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
-  const src = (rows && rows[0] && rows[0].code) || '';
-  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
-  return _codeCache[name];
+function formatDate(value) {
+  if (!value) return null;
+  const parsed = dayjs(value);
+  return parsed.isValid() ? parsed.format('DD MMM YYYY') : null;
 }
 
-// cross-record nav channel → RecordNav host at the view root.
-const navRef = { open: null };
+function statusColor(value) {
+  const map = {
+    planning:   '#f97316',
+    cutting:    '#d97706',
+    production: '#d97706',
+    qc:         '#84cc16',
+    permak:     '#ef4444',
+    done:       '#22c55e',
+  };
+  return map[String(value || '').toLowerCase()] || '#9ca3af';
+}
 
-// ── domain config: status (inline, not modular) ──
-function statusColor(s) {
-  s = String(s || '').toLowerCase();
-  if (s === 'sent') return '#22c55e';
-  if (s === 'ready') return '#84cc16';
-  if (s === 'po' || s === 'ordered') return '#d97706';
-  if (s === 'planning' || s === 'pending') return '#f97316';
-  if (s === 'cancel' || s === 'cancelled') return '#ef4444';
+function statusBg(value) {
+  const map = {
+    planning:   '#fff7ed',
+    cutting:    '#fffbeb',
+    production: '#fffbeb',
+    qc:         '#f7fee7',
+    permak:     '#fef2f2',
+    done:       '#f0fdf4',
+  };
+  return map[String(value || '').toLowerCase()] || '#f3f4f6';
+}
+
+function statusLabel(value) {
+  const map = {
+    planning:   'Planning',
+    cutting:    'Cutting',
+    production: 'Production',
+    qc:         'QC',
+    permak:     'Permak',
+    done:       'Done',
+  };
+  return map[String(value || '').toLowerCase()] || String(value || '-');
+}
+
+function materialStatusColor(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'sent')    return '#22c55e';
+  if (s === 'ready')   return '#84cc16';
+  if (s === 'ordered') return '#f97316';
+  if (s === 'pending') return '#f97316';
   return '#9ca3af';
 }
-const statusBg = s => statusColor(s) + '1a';
-const statusLabel = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : '—';
-function isFabric(t) { return String(t || '').toLowerCase() === 'fabric'; }
 
-// ── helpers ──
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
-}
-const num = v => Number(v == null ? 0 : v);
-function uniq(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
-function fmtDateNumeric(d) { if (!d) return ''; const p = dayjs(d); return p.isValid() ? p.format('DD/MM/YYYY') : ''; }
+// ── QUANTITY-NEED LOGIC (mirrors the quantity_need column) ─────────
 const M_TO_YARD = 1.0936;
 function numVal(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
 function fmtVal(v) { const n = numVal(v); return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100); }
-function buildNeed(material, isAcc, planningRol, totalDo) {
-  const qn = material.quantity_need; const hasQty = qn !== null && qn !== undefined && qn !== '';
-  if (isAcc) { const xx = numVal(qn), yy = numVal(totalDo); return { rows: [['quantity/pcs', xx, 'pcs'], ['quantity do', yy, 'pcs']], total: ['total', xx * yy, 'pcs'] }; }
-  if (!hasQty) { const xx = numVal(planningRol), yy = numVal(material.default_content); return { rows: [['planning', xx, 'rol'], ['default 1 rol', yy, 'yard']], total: ['total', xx * yy, 'yard'] }; }
-  const xx = numVal(qn), yy = numVal(totalDo); return { rows: [['quantity/pcs', xx, 'meter'], ['quantity do', yy, 'pcs']], total: ['total', xx * yy * M_TO_YARD, 'yard'] };
-}
-function renderNeed(need) {
-  const children = need.rows.map((r, i) => ce('div', { key: 'r' + i, style: { display: 'flex', justifyContent: 'space-between', fontSize: 11 } },
-    ce('span', { style: { color: '#9ca3af' } }, r[0]), ce('span', { style: { fontWeight: 600, color: '#374151' } }, fmtVal(r[1]) + ' ' + r[2])));
-  children.push(ce('div', { key: 'total', style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, color: '#166534', borderTop: '1px solid #e2e8f0', paddingTop: 3, marginTop: 2 } },
-    ce('span', null, need.total[0]), ce('span', null, fmtVal(need.total[1]) + ' ' + need.total[2])));
-  return ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, padding: '6px 8px', background: '#fff', border: '1px solid #f0f0f0', borderRadius: 6 } }, children);
-}
-const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
-function pill(text, bg, color) { return ce('span', { style: { display: 'inline-block', padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: bg, color: color } }, text); }
 
-// ── data layer ──
-function fetchList() {
-  return runSql('pjm_list_v1',
-    "SELECT pm.id AS id, pm.status AS status, pm.shipment_date AS shipment_date, pm.quantity_need AS quantity_need, " +
-    "  pm.fk_material_details_code AS material_code, pm.fk_production_id AS production_id, " +
-    "  raw_material.type AS material_type, raw_material.default_content AS default_content, " +
-    "  production.production_ref AS production_ref, production.planning_rol AS planning_rol, " +
-    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
-    "FROM production_material pm " +
-    "JOIN production ON pm.fk_production_id = production.id " +
-    "JOIN product  ON production.fk_product_code  = product.code " +
-    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
-    "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
-    "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
-    "ORDER BY pm.id DESC");
-}
-function fetchSummaries(rows) {
-  const pmIds = rows.map(r => r.id), prodIds = uniq(rows.map(r => r.production_id));
-  if (!pmIds.length) return Promise.resolve({ out: {}, doMap: {} });
-  const pmIn = pmIds.map(x => "'" + x + "'").join(','), prodIn = prodIds.map(x => "'" + x + "'").join(',');
-  return Promise.all([
-    runSql('pjm_sum_do', "SELECT fk_production_id AS pid, COALESCE(SUM(quantity),0) AS do_q FROM production_quantity_details WHERE fk_production_id IN (" + prodIn + ") GROUP BY pid"),
-    runSql('pjm_sum_hdr', "SELECT id, fk_production_material_id AS pmid FROM material_ledger WHERE fk_production_material_id IN (" + pmIn + ")"),
-  ]).then(function(r) {
-    const doMap = {}; (r[0] || []).forEach(x => { doMap[String(x.pid)] = num(x.do_q); });
-    const hdr = r[1] || [], ledgerToPm = {}; hdr.forEach(h => { ledgerToPm[String(h.id)] = String(h.pmid); });
-    const ledgerIds = hdr.map(h => h.id).filter(Boolean);
-    if (!ledgerIds.length) return { out: {}, doMap };
-    return runSql('pjm_sum_det', "SELECT fk_material_ledger_id AS lid, COUNT(*) AS cnt, COALESCE(SUM(details),0) AS total FROM material_ledger_details WHERE fk_material_ledger_id IN (" + ledgerIds.join(',') + ") GROUP BY lid")
-      .then(function(det) {
-        const out = {}; (det || []).forEach(d => { const pm = ledgerToPm[String(d.lid)]; if (!pm) return; if (!out[pm]) out[pm] = { count: 0, total: 0 }; out[pm].count += num(d.cnt); out[pm].total += num(d.total); });
-        return { out, doMap };
-      });
-  }).catch(() => ({ out: {}, doMap: {} }));
-}
-function fetchImages() {
-  return runSql('pjm_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'")
-    .then(function(rows) {
-      if (!rows.length) return {};
-      let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return {}; }
-      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
-      if (!through || !fk || !ok) return {};
-      return runSql('pjm_imgjoin',
-        "SELECT product.code AS code, attachments.url AS url, attachments.filename AS filename FROM product " +
-        "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
-        "JOIN attachments ON attachments.id = " + through + "." + ok + " ORDER BY attachments.id ASC")
-        .then(function(irows) { const map = {}; irows.forEach(r => { if (!map[r.code]) map[r.code] = r.url || (r.filename ? '/storage/uploads/' + r.filename : ''); }); return map; });
-    }).catch(() => ({}));
-}
-function fetchExtra() {
-  return Promise.all([
-    runSql('pjm_opt_prod', "SELECT production.id AS id, production.production_ref AS ref, product.code AS pcode, product.name AS pname, konveksi.name AS kname FROM production JOIN product ON production.fk_product_code = product.code JOIN konveksi ON production.fk_konveksi_code = konveksi.code ORDER BY production.created_at DESC"),
-    runSql('pjm_opt_mat', "SELECT code FROM material_details ORDER BY code ASC"),
-  ]).then(r => ({ productions: r[0], materials: r[1] }));
-}
-
-// ── actions ──
-function deleteMaterial(id) { return ctx.api.resource('production_material').destroy({ filterByTk: id }); }
-function createMaterial(form) { return ctx.api.resource('production_material').create({ values: { fk_production_id: form.production, fk_material_details_code: form.material_code, quantity_need: form.quantity_need, status: 'planning' } }); }
-function addMaterialOut(row, helpers) {
-  loadCode('ui_material_out').then(MO => MO.openModal({ ctx, pmId: row.id, onSaved: () => { helpers.refresh(); helpers.reloadKeepOpen(); } }))
-    .catch(e => message.error('Failed: ' + ((e && e.message) || e)));
-}
-
-// ── shared material detail loader (entry from the list) ──
-const MaterialDetailLoader = function(props) {
-  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
-  useEffect(function() { loadCode('ui_production_material_detail').then(function(m) { setMod(m && m.MaterialDetailBody ? m : false); }).catch(function() { setMod(false); }); }, []);
-  const row = props.row, helpers = props.helpers;
-  function openProduction(productionId) {
-    // handoff: close THIS material detail, then open the production detail at root.
-    if (helpers && helpers.closeDetail) helpers.closeDetail();
-    if (navRef.open) navRef.open('production', productionId, helpers);
+function buildNeed(material, isAccessories, planningRol, totalDo) {
+  const qn = material.quantity_need;
+  const hasQty = qn !== null && qn !== undefined && qn !== '';
+  if (isAccessories) {
+    const xx = numVal(qn), yy = numVal(totalDo), zz = xx * yy;
+    return { rows: [['quantity/pcs', xx, 'pcs'], ['quantity do', yy, 'pcs']], total: ['total', zz, 'pcs'] };
+  } else if (!hasQty) {
+    const xx = numVal(planningRol), yy = numVal(material.default_content), zz = xx * yy;
+    return { rows: [['planning', xx, 'rol'], ['default 1 rol', yy, 'yard']], total: ['total', zz, 'yard'] };
+  } else {
+    const xx = numVal(qn), yy = numVal(totalDo), zz = xx * yy * M_TO_YARD;
+    return { rows: [['quantity/pcs', xx, 'meter'], ['quantity do', yy, 'pcs']], total: ['total', zz, 'yard'] };
   }
-  if (Mod === null) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…');
-  if (!Mod) return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, 'Could not load material detail (ui_production_material_detail).');
-  return ce(Mod.MaterialDetailBody, {
-    pmId: row.id, refreshKey: props.refreshKey,
-    onOpenProduction: openProduction,
-    onChanged: function() { if (helpers) { helpers.refresh(); helpers.reloadKeepOpen(); } },
+}
+
+function renderNeed(need) {
+  const children = need.rows.map(function (r, idx) {
+    return React.createElement('div', { key: 'r' + idx, style: { display: 'flex', justifyContent: 'space-between', fontSize: 11 } },
+      React.createElement('span', { style: { color: '#9ca3af' } }, r[0]),
+      React.createElement('span', { style: { fontWeight: 600, color: '#374151' } }, fmtVal(r[1]) + ' ' + r[2])
+    );
   });
-};
-
-// ── shared material edit loader (engine swipe-edit + detail-edit use the same) ──
-const MatEditLoader = function(props) {
-  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
-  useEffect(function() { loadCode('ui_production_material_detail').then(setMod).catch(function() { setMod(false); }); }, []);
-  if (!Mod || !Mod.MaterialEditDrawer) return null;
-  return ce(Mod.MaterialEditDrawer, { open: props.open, pmId: props.pmId, onClose: props.onClose, onSaved: props.onSaved });
-};
-
-// ── record nav host (cross-record replace navigation + edit/delete) ──
-const RecordNavHost = function() {
-  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
-  useEffect(function() { loadCode('ui_record_nav').then(setMod).catch(function() {}); }, []);
-  if (!Mod || !Mod.RecordNav) return null;
-  return ce(Mod.RecordNav, { navRef: navRef });
-};
-
-// ── card renderer ──
-function renderCard(o) {
-  const row = o.row, summary = o.summary, selectMode = o.selectMode, selected = o.selected;
-  const img = (o.imgMap && o.imgMap[row.product_code]) || '';
-  const acc = !isFabric(row.material_type), sc = statusColor(row.status);
-  const totalDo = (summary && summary.doMap && summary.doMap[String(row.production_id)]) || 0;
-  const needEl = renderNeed(buildNeed({ quantity_need: row.quantity_need, default_content: row.default_content }, acc, row.planning_rol, totalDo));
-  const out = summary && summary.out && summary.out[String(row.id)];
-  const outEl = out
-    ? ce('div', { style: { fontSize: 11, color: '#374151', display: 'flex', flexDirection: 'column', gap: 2 } },
-        ce('div', { style: { display: 'flex', justifyContent: 'space-between' } }, ce('span', { style: { color: '#9ca3af' } }, 'out'), ce('span', { style: { fontWeight: 700, color: '#166534' } }, out.count + (acc ? ' pack' : ' roll'))),
-        ce('div', { style: { display: 'flex', justifyContent: 'space-between' } }, ce('span', { style: { color: '#9ca3af' } }, 'total'), ce('span', { style: { fontWeight: 700, color: '#166534' } }, fmtVal(out.total) + (acc ? ' pcs' : ' yard'))))
-    : ce('div', { style: { fontSize: 11, color: '#cbd5e1', fontStyle: 'italic' } }, 'No material out');
-  return ce('div', { className: 'pjm-cardbody' },
-    ce('div', { className: 'pjm-col-summary' },
-      selectMode ? ce('div', { style: { width: 22, height: 22, borderRadius: 6, flexShrink: 0, border: '2px solid ' + (selected ? '#6366f1' : '#cbd5e1'), background: selected ? '#6366f1' : '#fff', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 } }, selected ? '✓' : '') : null,
-      ce('div', { style: { width: 56, height: 56, borderRadius: 10, flexShrink: 0, background: '#f3f4f6', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
-        img ? ce('img', { src: img, style: { width: '100%', height: '100%', objectFit: 'cover' } }) : ce('span', { style: { fontSize: 20, color: '#cbd5e1' } }, '🧵')),
-      ce('div', { style: { flex: 1, minWidth: 0 } },
-        ce('div', { style: { fontWeight: 700, fontSize: 14, color: '#111827', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, row.material_code || '—'),
-        ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 4 } },
-          pill(acc ? 'Acc' : 'Fabric', acc ? '#f3e8ff' : '#e0f2fe', acc ? '#a855f7' : '#0ea5e9'),
-          ce('span', { style: { background: statusBg(row.status), color: sc, border: '1px solid ' + sc + '44', borderRadius: 20, padding: '1px 8px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase' } }, statusLabel(row.status))),
-        ce('div', { style: { fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, row.production_ref || '—'),
-        ce('div', { style: { fontSize: 11, color: '#9ca3af', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, (row.product_code || '') + ' · ' + (row.product_name || '')),
-        row.shipment_date ? ce('div', { style: { fontSize: 10, color: '#9ca3af', marginTop: 3, fontWeight: 600 } }, fmtDateNumeric(row.shipment_date)) : null)),
-    ce('div', { className: 'pjm-col-need' }, needEl),
-    ce('div', { className: 'pjm-col-out' }, outEl),
-    ce('div', { className: 'pjm-col-meta' },
-      ce('div', null,
-        ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em' } }, 'Shipment'),
-        ce('div', { style: { fontSize: 12, fontWeight: 600, color: '#374151' } }, fmtDateNumeric(row.shipment_date) || '—'))));
+  children.push(
+    React.createElement('div', { key: 'total', style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, color: '#166534', borderTop: '1px solid #e2e8f0', paddingTop: 3, marginTop: 2 } },
+      React.createElement('span', null, need.total[0]),
+      React.createElement('span', null, fmtVal(need.total[1]) + ' ' + need.total[2])
+    )
+  );
+  return React.createElement('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 6, padding: '6px 8px', background: '#fff', border: '1px solid #f0f0f0', borderRadius: 6 }
+  }, children);
 }
 
-// ── new-form body ──
-function prodOptions(extra) {
-  return (extra.productions || []).map(p => ({ value: p.id, label: (p.ref || ('#' + p.id)) + ' · ' + (p.pcode || '') + ' — ' + (p.pname || '') + ' · ' + (p.kname || '') }));
-}
-function matOptions(extra) { return (extra.materials || []).map(m => ({ value: m.code, label: m.code })); }
-function renderNewBody(form, setF, extra) {
-  return [
-    ce('div', { key: 'p' }, fieldLabel('Production'),
-      ce(Select, { showSearch: true, value: form.production, onChange: v => setF('production', v), style: { width: '100%' }, placeholder: 'Search ref, product code, name, konveksi…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: prodOptions(extra) })),
-    ce('div', { key: 'm' }, fieldLabel('Material Code'),
-      ce(Select, { showSearch: true, value: form.material_code, onChange: v => setF('material_code', v), style: { width: '100%' }, placeholder: 'Search material code', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: matOptions(extra) })),
-    ce('div', { key: 'q' }, fieldLabel('Quantity Need'),
-      ce(InputNumber, { value: form.quantity_need, onChange: v => setF('quantity_need', v), style: { width: '100%' }, min: 0, placeholder: 'Quantity per pcs (pcs/meter). Leave blank for main fabric' })),
-  ];
+function capitalize(s) {
+  s = String(s || '');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-// ── per-view CSS (layout only; engine owns the swipe-frame CSS; detail/edit CSS
-//    lives in the shared ui_production_material_detail row) ──
-const VIEW_CSS =
-  ".pjm-cardbody{display:flex;gap:12px;padding:12px;align-items:center;}" +
-  ".pjm-col-summary{flex:1;min-width:0;display:flex;gap:12px;align-items:center;}" +
-  ".pjm-col-meta{flex-shrink:0;display:flex;flex-direction:column;gap:6px;align-items:flex-end;text-align:right;}" +
-  ".pjm-col-need,.pjm-col-out{display:none;}" +
-  "@media(min-width:760px){.pjm-cardbody{display:grid;grid-template-columns:minmax(0,1fr) 180px 170px 120px;gap:18px;}.pjm-col-need{display:block;}.pjm-col-out{display:block;}}";
+function renderOutLine(status, count, total, unitItem, unitTotal, shipmentDate) {
+  return React.createElement('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 6 } },
+    capitalize(status) + ': ',
+    React.createElement('span', { style: { fontWeight: 700, color: '#3b82f6' } },
+      count + ' ' + unitItem + ' (' + total + ' ' + unitTotal + ')'
+    ),
+    shipmentDate ? (' on ' + (formatDate(shipmentDate) || '—')) : ''
+  );
+}
 
-// ── CONFIG ──
-const config = {
-  title: 'Production Materials',
-  css: VIEW_CSS,
-  searchPlaceholder: 'Search material, ref, code, name…',
-  emptyText: 'No materials match this filter',
-  pageSize: 15,
+function renderOutChips(details) {
+  return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 } },
+    details.map(function (v, j) {
+      return React.createElement('span', {
+        key: j,
+        style: {
+          background: '#eff6ff', color: '#3b82f6', border: '1px solid #bfdbfe',
+          borderRadius: 4, padding: '1px 7px', fontSize: 11, fontWeight: 600
+        }
+      }, v);
+    })
+  );
+}
 
-  fetchList: fetchList,
-  fetchSummaries: fetchSummaries,
-  fetchImages: fetchImages,
-  fetchExtra: fetchExtra,
-  getImage: (row, map) => (map && map[row.product_code]) || '',
+const hostRecord =
+  (await ctx.getVar?.('ctx.record')) ||
+  (await ctx.getVar?.('ctx.popup.record')) ||
+  ctx.record ||
+  null;
 
-  searchText: r => [r.material_code, r.production_ref, r.product_code, r.product_name],
+const ProductionDetailView = function () {
+  const [loading, setLoading]       = useState(true);
+  const [detail, setDetail]         = useState(null);
+  const [fabrics, setFabrics]       = useState([]);
+  const [accessories, setAccessories] = useState([]);
+  const [sample, setSample]         = useState(null);
+  const [totalDo, setTotalDo]       = useState(0);
+  const [errorText, setErrorText]   = useState('');
 
-  mainTabs: {
-    allLabel: 'All',
-    tabs: [
-      { key: 'fabric', label: 'Fabric', color: '#0ea5e9' },
-      { key: 'accessories', label: 'Accessories', color: '#a855f7' },
-    ],
-    classify: r => isFabric(r.material_type) ? 'fabric' : 'accessories',
-  },
+  useEffect(function () {
+    let active = true;
 
-  secondaryFilters: [
-    { key: 'status', label: 'Status', kind: 'select', multi: true, default: ['planning', 'po', 'ready'], field: 'status', normalize: 'lower', optionLabel: statusLabel, placeholder: 'Any status' },
-    { key: 'production', label: 'Production', kind: 'select', field: 'production_ref', search: true },
-    { key: 'shipment', label: 'Shipment date', kind: 'dateRange', field: 'shipment_date' },
-  ],
+    async function bootstrap() {
+      if (!hostRecord?.id) {
+        setErrorText('Production record is unavailable.');
+        setLoading(false);
+        return;
+      }
 
-  sortOptions: [
-    { key: 'created_desc', label: 'Newest' },
-    { key: 'ship_asc', label: 'Shipment ↑' },
-    { key: 'ship_desc', label: 'Shipment ↓' },
-  ],
-  sortComparator: function(key) {
-    if (key === 'created_desc') return null;
-    const dir = key === 'ship_asc' ? 1 : -1;
-    return function(a, b) {
-      const av = a.shipment_date ? new Date(a.shipment_date).getTime() : (dir === 1 ? Infinity : -Infinity);
-      const bv = b.shipment_date ? new Date(b.shipment_date).getTime() : (dir === 1 ? Infinity : -Infinity);
-      return (av - bv) * dir;
-    };
-  },
+      setLoading(true);
+      setErrorText('');
 
-  renderCard: renderCard,
+      try {
+        const id = hostRecord.id;
 
-  detailTitle: r => r.material_code + ' · ' + (r.production_ref || ('#' + r.id)),
-  statusAccent: r => statusColor(r.status),
-  detailRender: (row, rk, helpers) => ce(MaterialDetailLoader, { row: row, refreshKey: rk, helpers: helpers }),
+        // 1. Main production record — plain resource GET, no raw SQL
+        const prodRes = await ctx.api.resource('production').get({ filterByTk: id });
+        const prod = prodRes?.data?.data;
+        if (!active) return;
+        if (!prod) {
+          setErrorText('No production record found.');
+          setLoading(false);
+          return;
+        }
 
-  newForm: { title: 'New Production Material', width: 480, initial: () => ({ production: null, material_code: null, quantity_need: null }),
-    validate: f => !f.production ? 'Select a production.' : (!f.material_code ? 'Select a material.' : null),
-    render: renderNewBody, submit: createMaterial, successMsg: 'Production material created.' },
-  // edit comes from the shared row, so the list swipe-edit and the detail Edit
-  // button use the exact same MaterialEditDrawer.
-  renderEditDrawer: function(api) {
-    return ce(MatEditLoader, {
-      open: !!api.open, pmId: api.row ? api.row.id : null, onClose: api.onClose,
-      onSaved: function() { api.onClose(); api.helpers.refresh(); api.helpers.reloadKeepOpen(); },
-    });
-  },
+        // 2. Product + konveksi lookups (independent REST calls — safe to parallelize)
+        const [productRes, konveksiRes] = await Promise.all([
+          prod.fk_product_code ? ctx.api.resource('product').get({ filterByTk: prod.fk_product_code }).catch(() => null) : Promise.resolve(null),
+          prod.fk_konveksi_code ? ctx.api.resource('konveksi').get({ filterByTk: prod.fk_konveksi_code }).catch(() => null) : Promise.resolve(null),
+        ]);
+        const product = productRes?.data?.data || {};
+        const konveksi = konveksiRes?.data?.data || {};
 
-  deleteRow: deleteMaterial,
-  deleteTitle: 'Delete production material?',
-  deleteLabel: row => row.material_code || ('#' + row.id),
-  bulkActions: [
-    { label: '🗑 Delete', bg: '#ef4444', color: '#fff', run: (ids, helpers) => {
-        Modal.confirm({ title: 'Delete ' + ids.length + ' material(s)?', content: 'This cannot be undone.', okText: 'Delete', okButtonProps: { danger: true },
-          onOk: () => Promise.all(ids.map(id => deleteMaterial(id))).then(() => { message.success('Deleted ' + ids.length + '.'); helpers.exitSelect(); helpers.reload(); }).catch(e => message.error('Bulk delete failed: ' + ((e && e.message) || e))) });
-      } },
-  ],
+        const mainRow = {
+          id: prod.id,
+          production_ref: prod.production_ref,
+          is_new: prod.is_new,
+          planning_rol: prod.planning_rol,
+          product_code: product.code,
+          product_name: product.name,
+          konveksi_name: konveksi.name,
+          status: prod.status,
+          est_production_start: prod.est_production_start,
+          est_production_finish: prod.est_production_finish,
+          remarks: prod.remarks,
+          marker: prod.marker,
+        };
+
+        // 3. production_material rows for this production
+        const pmRes = await ctx.api.resource('production_material').list({
+          filter: { fk_production_id: id },
+          fields: ['id', 'fk_material_details_code', 'status', 'shipment_date', 'quantity_need'],
+          pageSize: 200,
+        });
+        const pmRows = pmRes?.data?.data || [];
+
+        // 4. material_details for the referenced codes (batched, no N+1)
+        const materialCodes = [...new Set(pmRows.map(m => m.fk_material_details_code).filter(Boolean))];
+        let mdRows = [];
+        if (materialCodes.length) {
+          const mdRes = await ctx.api.resource('material_details').list({
+            filter: { code: { $in: materialCodes } },
+            fields: ['code', 'fk_material_code'],
+            pageSize: 200,
+          });
+          mdRows = mdRes?.data?.data || [];
+        }
+        const mdByCode = {};
+        mdRows.forEach(r => { mdByCode[r.code] = r; });
+
+        // 5. raw_material for the referenced codes (batched, no N+1)
+        const rawCodes = [...new Set(mdRows.map(r => r.fk_material_code).filter(Boolean))];
+        let rmRows = [];
+        if (rawCodes.length) {
+          const rmRes = await ctx.api.resource('raw_material').list({
+            filter: { code: { $in: rawCodes } },
+            fields: ['code', 'type', 'default_content'],
+            pageSize: 200,
+          });
+          rmRows = rmRes?.data?.data || [];
+        }
+        const rmByCode = {};
+        rmRows.forEach(r => { rmByCode[r.code] = r; });
+
+        const materialRows = pmRows.map(m => {
+          const md = mdByCode[m.fk_material_details_code] || {};
+          const rm = rmByCode[md.fk_material_code] || {};
+          return {
+            id: m.id,
+            material_code: m.fk_material_details_code,
+            status: m.status,
+            shipment_date: m.shipment_date,
+            quantity_need: m.quantity_need,
+            material_type: rm.type,
+            default_content: rm.default_content,
+          };
+        });
+
+        const fabricRowsRaw = materialRows.filter(m => String(m.material_type || '').toLowerCase() === 'fabric');
+        const accRowsRaw = materialRows.filter(m => String(m.material_type || '').toLowerCase() !== 'fabric');
+
+        // 6. material_ledger for ALL production_material ids in one batched call.
+        // Cancelled entries are excluded here so the totals/chips shown below only
+        // reflect active (requested/confirmed) material out — matches the exclusion
+        // rule used in ui_material_out / ui_production_material_details.
+        const allPmIds = pmRows.map(m => m.id).filter(Boolean);
+        let ledgerRows = [];
+        if (allPmIds.length) {
+          const ledgerRes = await ctx.api.resource('material_ledger').list({
+            filter: { fk_production_material_id: { $in: allPmIds } },
+            fields: ['id', 'fk_production_material_id', 'status'],
+            pageSize: 500,
+          });
+          ledgerRows = ledgerRes?.data?.data || [];
+        }
+        const activeLedgerRows = ledgerRows.filter(l => String(l.status || 'requested').toLowerCase() !== 'cancelled');
+        const ledgerIdsByPm = {};
+        activeLedgerRows.forEach(l => {
+          const key = String(l.fk_production_material_id);
+          (ledgerIdsByPm[key] = ledgerIdsByPm[key] || []).push(l.id);
+        });
+
+        // 7. material_ledger_details for ALL (active) ledger ids in one batched call
+        const allLedgerIds = activeLedgerRows.map(l => l.id).filter(Boolean);
+        let ledgerDetailRows = [];
+        if (allLedgerIds.length) {
+          const detRes = await ctx.api.resource('material_ledger_details').list({
+            filter: { fk_material_ledger_id: { $in: allLedgerIds } },
+            fields: ['details', 'fk_material_ledger_id'],
+            pageSize: 1000,
+          });
+          ledgerDetailRows = detRes?.data?.data || [];
+        }
+        const detailsByLedgerId = {};
+        ledgerDetailRows.forEach(d => {
+          const key = String(d.fk_material_ledger_id);
+          (detailsByLedgerId[key] = detailsByLedgerId[key] || []).push(d.details);
+        });
+
+        function detailsForPm(pmId) {
+          const lIds = ledgerIdsByPm[String(pmId)] || [];
+          let out = [];
+          lIds.forEach(lid => { out = out.concat(detailsByLedgerId[String(lid)] || []); });
+          return out;
+        }
+
+        const fabricsWithDetails = fabricRowsRaw.map(f => ({ ...f, yardDetails: detailsForPm(f.id) }));
+        const accRows = accRowsRaw.map(a => ({ ...a, pcsDetails: detailsForPm(a.id) }));
+
+        // 8. Sample
+        const sampleRes = await ctx.api.resource('production_sample').list({
+          filter: { fk_production_id: id },
+          fields: ['fk_sample_product_code', 'status', 'shipment_date', 'returned_date'],
+          pageSize: 5,
+        });
+        const sampleRows = sampleRes?.data?.data || [];
+
+        // 9. Total DO quantity
+        const qtyRes = await ctx.api.resource('production_quantity_details').list({
+          filter: { fk_production_id: id },
+          fields: ['quantity'],
+          pageSize: 1000,
+        });
+        const qtyRows = qtyRes?.data?.data || [];
+        const totalDoVal = qtyRows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
+
+        if (!active) return;
+        setDetail(mainRow);
+        setFabrics(fabricsWithDetails);
+        setAccessories(accRows);
+        setSample(sampleRows[0] || null);
+        setTotalDo(totalDoVal);
+
+      } catch (err) {
+        if (!active) return;
+        setErrorText(err?.message || 'Failed to load production detail.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    bootstrap();
+    return function () { active = false; };
+  }, [hostRecord?.id]);
+
+  if (loading) {
+    return React.createElement('div', { style: { padding: 80, textAlign: 'center' } },
+      React.createElement(Spin, { size: 'large' })
+    );
+  }
+  if (errorText) {
+    return React.createElement('div', { style: { padding: 24 } },
+      React.createElement(Text, { type: 'danger' }, errorText)
+    );
+  }
+
+  const d = detail;
+  const color = statusColor(d.status);
+  const bg    = statusBg(d.status);
+
+  const sectionTitle = {
+    fontSize: 11, fontWeight: 600, textTransform: 'uppercase',
+    letterSpacing: '0.08em', color: '#9ca3af', marginBottom: 12
+  };
+
+  const pill = (text, pillBg, textColor) =>
+    React.createElement('span', {
+      style: {
+        display: 'inline-block', padding: '3px 10px', borderRadius: 999,
+        fontSize: 11, fontWeight: 600, background: pillBg, color: textColor,
+        letterSpacing: '0.04em'
+      }
+    }, text);
+
+  const metaItem = (label, value) =>
+    React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+      React.createElement('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, label),
+      React.createElement('div', { style: { fontSize: 13, color: '#111827', fontWeight: 500 } }, value || '-')
+    );
+
+  const card = (children, extraStyle) =>
+    React.createElement('div', {
+      style: Object.assign({
+        borderRadius: 16, border: '1px solid #e5e7eb', background: '#fff',
+        padding: '20px 24px', height: '100%'
+      }, extraStyle || {})
+    }, children);
+
+  const matBadge = (status) => {
+    const c = materialStatusColor(status);
+    return React.createElement('span', {
+      style: {
+        display: 'inline-block', background: c + '22', color: c,
+        border: '1px solid ' + c + '66', borderRadius: 3,
+        padding: '0 6px', fontSize: 10, fontWeight: 600, lineHeight: '18px'
+      }
+    }, status || 'unknown');
+  };
+
+  const materialCard = React.createElement('div', null,
+    React.createElement('div', { style: sectionTitle }, 'Materials'),
+
+    fabrics.length > 0
+      ? React.createElement('div', { style: { marginBottom: 16 } },
+          React.createElement('div', { style: { fontSize: 11, fontWeight: 700, color: '#6b7280', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' } }, 'Fabric'),
+          fabrics.map((f, i) =>
+            React.createElement('div', {
+              key: i,
+              style: {
+                borderRadius: 8, border: '1px solid #f0f0f0', padding: '10px 12px',
+                marginBottom: 8, background: '#fafafa'
+              }
+            },
+              React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 } },
+                React.createElement('div', { style: { fontWeight: 600, fontSize: 13, color: '#111827' } }, f.material_code || '—'),
+                matBadge(f.status)
+              ),
+              renderNeed(buildNeed(f, false, d.planning_rol, totalDo)),
+              f.yardDetails.length > 0
+                ? React.createElement('div', null,
+                    renderOutLine(
+                      f.status,
+                      f.yardDetails.length,
+                      f.yardDetails.reduce((s, y) => s + Number(y || 0), 0),
+                      'rol', 'yard', f.shipment_date
+                    ),
+                    renderOutChips(f.yardDetails)
+                  )
+                : null
+            )
+          )
+        )
+      : React.createElement('div', { style: { fontSize: 12, color: '#d1d5db', marginBottom: 16, fontStyle: 'italic' } }, 'No fabric records'),
+
+    accessories.length > 0
+      ? React.createElement('div', { style: { marginBottom: 16 } },
+          React.createElement('div', { style: { fontSize: 11, fontWeight: 700, color: '#6b7280', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' } }, 'Accessories'),
+          accessories.map((a, i) =>
+            React.createElement('div', {
+              key: i,
+              style: {
+                borderRadius: 8, border: '1px solid #f0f0f0', padding: '10px 12px',
+                marginBottom: 8, background: '#fafafa'
+              }
+            },
+              React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 } },
+                React.createElement('div', { style: { fontWeight: 600, fontSize: 13, color: '#111827' } }, a.material_code || '—'),
+                matBadge(a.status)
+              ),
+              renderNeed(buildNeed(a, true, d.planning_rol, totalDo)),
+              a.pcsDetails && a.pcsDetails.length > 0
+                ? React.createElement('div', null,
+                    renderOutLine(
+                      a.status,
+                      a.pcsDetails.length,
+                      a.pcsDetails.reduce((s, p) => s + Number(p || 0), 0),
+                      'pack', 'pcs', a.shipment_date
+                    ),
+                    renderOutChips(a.pcsDetails)
+                  )
+                : null
+            )
+          )
+        )
+      : React.createElement('div', { style: { fontSize: 12, color: '#d1d5db', marginBottom: 16, fontStyle: 'italic' } }, 'No accessories records'),
+
+    React.createElement('div', null,
+      React.createElement('div', { style: { fontSize: 11, fontWeight: 700, color: '#6b7280', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' } }, 'Sample'),
+      sample
+        ? React.createElement('div', {
+            style: {
+              borderRadius: 8, border: '1px solid #f0f0f0', padding: '10px 12px', background: '#fafafa'
+            }
+          },
+            React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 } },
+              React.createElement('div', { style: { fontWeight: 600, fontSize: 13, color: '#111827' } }, sample.fk_sample_product_code || '—'),
+              matBadge(sample.status)
+            ),
+            React.createElement('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap' } },
+              sample.status && sample.status.toLowerCase() === 'sent' && sample.shipment_date
+                ? React.createElement('div', { style: { fontSize: 11, color: '#9ca3af' } },
+                    'Sent: ' + (formatDate(sample.shipment_date) || '—')
+                  )
+                : null,
+              sample.returned_date
+                ? React.createElement('div', { style: { fontSize: 11, color: '#9ca3af' } },
+                    'Returned: ' + (formatDate(sample.returned_date) || '—')
+                  )
+                : null
+            )
+          )
+        : React.createElement('div', { style: { fontSize: 12, color: '#d1d5db', fontStyle: 'italic' } }, 'No sample record')
+    )
+  );
+
+  return React.createElement('div', { style: { fontFamily: 'sans-serif', display: 'flex', flexDirection: 'column', gap: 12 } },
+
+    React.createElement('div', {
+      style: {
+        borderRadius: 16, overflow: 'hidden',
+        border: '1px solid ' + color + '55',
+        boxShadow: '0 0 0 3px ' + color + '18'
+      }
+    },
+      React.createElement('div', { style: { height: 5, background: color } }),
+      React.createElement('div', { style: { padding: '20px 24px', background: '#fff' } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 16 } },
+          React.createElement('span', { style: { fontSize: 22, fontWeight: 700, color: '#111827', letterSpacing: '-0.01em' } },
+            d.production_ref || ('#' + hostRecord.id)
+          ),
+          React.createElement('span', {
+            style: {
+              display: 'inline-block', padding: '3px 12px', borderRadius: 999,
+              fontSize: 12, fontWeight: 600, background: bg, color: color,
+              border: '1px solid ' + color + '44', letterSpacing: '0.04em'
+            }
+          }, statusLabel(d.status)),
+          d.is_new ? pill('New', '#dcfce7', '#16a34a') : pill('Repeat', '#f3f4f6', '#6b7280')
+        ),
+        React.createElement('div', {
+          style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px 24px' }
+        },
+          metaItem('Product code', d.product_code),
+          metaItem('Product name', d.product_name),
+          metaItem('Konveksi', d.konveksi_name)
+        )
+      )
+    ),
+
+    React.createElement(Row, { gutter: [12, 12] },
+      React.createElement(Col, { xs: 24, md: 10 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: sectionTitle }, 'Product info'),
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+            metaItem('Product code', d.product_code),
+            metaItem('Product name', d.product_name),
+            metaItem('Konveksi', d.konveksi_name),
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+              React.createElement('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, 'Type'),
+              d.is_new ? pill('New', '#dcfce7', '#16a34a') : pill('Repeat', '#f3f4f6', '#6b7280')
+            )
+          )
+        ))
+      ),
+      React.createElement(Col, { xs: 24, md: 14 },
+        card(materialCard)
+      )
+    ),
+
+    React.createElement(Row, { gutter: [12, 12] },
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: sectionTitle }, 'Marker'),
+          d.marker
+            ? React.createElement('div', {style: { fontSize: 13, color: '#374151', lineHeight: 1.8 }, dangerouslySetInnerHTML: { __html: d.marker }})
+            : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: 40, color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No marker')
+        ))
+      ),
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: sectionTitle }, 'Remarks'),
+          d.remarks
+            ? React.createElement('div', {style: { fontSize: 13, color: '#374151', lineHeight: 1.8 },dangerouslySetInnerHTML: { __html: d.remarks }})
+            : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: 40, color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No remarks')
+        ))
+      )
+    )
+  );
 };
 
-// ── root: engine list + record nav host sibling ──
-const Root = function() {
-  const sLV = useState(null); const LV = sLV[0]; const setLV = sLV[1];
-  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
-  useEffect(function() {
-    loadCode('ui_list_engine').then(function(M) { setLV(function() { return M.createListView(config); }); })
-      .catch(function(e) { setErr((e && e.message) || String(e)); });
-  }, []);
-  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load ui_list_engine: ' + err);
-  if (!LV) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…');
-  return ce('div', null, ce(LV), ce(RecordNavHost, null));
-};
-
-ctx.render(ce(Root));
+ctx.render(React.createElement(ProductionDetailView));
