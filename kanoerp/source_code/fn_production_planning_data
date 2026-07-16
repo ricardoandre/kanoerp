@@ -1,0 +1,140 @@
+// fn_production_planning_data — shared query + grouping logic for all
+// Production Planning Report views.
+// EXPORTS: fetchKonveksiList(ctx), fetchRawRows(ctx, filter),
+//          buildGroups(rawRows, bucketBy), buildMatrixFromGroups(groups),
+//          fmtDate(dateStr)
+// Depends on: none.
+
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+
+async function fetchKonveksiList(ctx) {
+  return runSql(ctx, 'ppr_konveksi_list', 'SELECT code, name FROM konveksi ORDER BY name ASC');
+}
+
+// filter: { start: 'YYYY-MM-DD'|null, konveksiCode: string|null }
+async function fetchRawRows(ctx, filter) {
+  let where = 'fk_konveksi_code = konveksi.code AND fk_product_code = product.code';
+
+  if (filter && filter.start) {
+    where += " AND (production.est_production_start >= '" + filter.start + "' OR production.est_production_start IS NULL)";
+  }
+  if (filter && filter.konveksiCode) {
+    where += " AND konveksi.code = '" + filter.konveksiCode + "'";
+  }
+
+  // Inner query: one row per production. model_key falls back to product.code
+  // when product.model is blank/NULL, so un-modeled products still group sanely.
+  // Outer query: SUMs quantity across productions sharing the same
+  // konveksi + date + model_key — this is what merges duplicate lines like
+  // "O35Cassia (300)" + "O35Cassia (200)" into a single "O35Cassia (500)".
+  const sql =
+    'SELECT konveksi_code, konveksi_name, est_production_start, model_key, SUM(prod_qty) AS total_qty ' +
+    'FROM ( ' +
+    '  SELECT konveksi.code AS konveksi_code, konveksi.name AS konveksi_name, ' +
+    '    production.est_production_start AS est_production_start, ' +
+    "    COALESCE(NULLIF(TRIM(product.model), ''), product.code) AS model_key, " +
+    '    production.id AS production_id, ' +
+    '    COALESCE((SELECT SUM(quantity) FROM production_quantity_details WHERE fk_production_id = production.id), 0) AS prod_qty ' +
+    '  FROM production, konveksi, product ' +
+    '  WHERE ' + where + ' ' +
+    '  GROUP BY konveksi.code, konveksi.name, production.est_production_start, model_key, production.id ' +
+    ') AS t ' +
+    'GROUP BY konveksi_code, konveksi_name, est_production_start, model_key';
+
+  return runSql(ctx, 'ppr_raw_data', sql);
+}
+
+// dayjs is already in module scope (bound by new Function('React','antd','dayjs','ctx', src))
+function weekInfo(dateStr) {
+  if (!dateStr) return { key: 'Unplanned', label: 'Unplanned', sortVal: -Infinity };
+  const m = dayjs(dateStr);
+  if (!(m && m.isValid && m.isValid())) return { key: 'Unplanned', label: 'Unplanned', sortVal: -Infinity };
+  const dow = m.day();
+  const back = (dow === 0) ? 6 : (dow - 1);
+  const monday = m.subtract(back, 'day');
+  const sunday = monday.add(6, 'day');
+  const wkNum = Math.floor((monday.date() - 1) / 7) + 1;
+  const label = 'Wk' + wkNum + ' ' + monday.format('MMM') + ': ' +
+    monday.format('DD/MM/YYYY') + ' - ' + sunday.format('DD/MM/YYYY');
+  return { key: monday.format('YYYY-MM-DD'), label, sortVal: monday.valueOf() };
+}
+
+function dateInfo(dateStr) {
+  if (!dateStr) return { key: 'Unplanned', label: 'Unplanned', sortVal: -Infinity };
+  const m = dayjs(dateStr);
+  if (!(m && m.isValid && m.isValid())) return { key: 'Unplanned', label: 'Unplanned', sortVal: -Infinity };
+  return { key: m.format('YYYY-MM-DD'), label: m.format('DD/MM/YYYY'), sortVal: m.valueOf() };
+}
+
+function fmtDate(dateStr) {
+  if (!dateStr) return 'Unplanned';
+  const m = dayjs(dateStr);
+  return (m && m.isValid && m.isValid()) ? m.format('DD/MM/YYYY') : dateStr;
+}
+
+// Merge duplicate model_key rows that land in the same bucket (a bucket can
+// span several raw dates when bucketBy === 'week').
+function mergeModels(rows) {
+  const order = [];
+  const sums = {};
+  (rows || []).forEach(r => {
+    const k = r.model_key;
+    if (!(k in sums)) { sums[k] = 0; order.push(k); }
+    sums[k] += Number(r.total_qty) || 0;
+  });
+  return order.map(k => ({ model: k, qty: sums[k] }));
+}
+
+// Groups: konveksi -> buckets (week or date) -> merged model list
+function buildGroups(rawRows, bucketBy) {
+  const byKonv = {};
+
+  (rawRows || []).forEach(row => {
+    const konv = row.konveksi_name;
+    if (!byKonv[konv]) byKonv[konv] = { code: row.konveksi_code, buckets: {} };
+    const bi = (bucketBy === 'week') ? weekInfo(row.est_production_start) : dateInfo(row.est_production_start);
+    const buckets = byKonv[konv].buckets;
+    if (!buckets[bi.key]) buckets[bi.key] = { key: bi.key, label: bi.label, sortVal: bi.sortVal, rows: [] };
+    buckets[bi.key].rows.push(row);
+  });
+
+  return Object.keys(byKonv).map(konv => {
+    const entry = byKonv[konv];
+    const bucketList = Object.keys(entry.buckets).map(k => {
+      const b = entry.buckets[k];
+      const models = mergeModels(b.rows);
+      const total = models.reduce((s, m) => s + m.qty, 0);
+      return { key: b.key, label: b.label, sortVal: b.sortVal, total, models };
+    });
+    bucketList.sort((a, b) => a.sortVal - b.sortVal);
+    return { konveksi: konv, konveksiCode: entry.code, buckets: bucketList };
+  }).sort((a, b) => a.konveksi.localeCompare(b.konveksi));
+}
+
+// Reshapes groups into a konveksi x bucket matrix for the table view
+function buildMatrixFromGroups(groups) {
+  const bucketMap = {};
+  const cellIndex = {};
+  groups.forEach(g => {
+    g.buckets.forEach(b => {
+      if (!bucketMap[b.key]) bucketMap[b.key] = { key: b.key, label: b.label, sortVal: b.sortVal };
+      cellIndex[b.key + '|' + g.konveksi] = b;
+    });
+  });
+  const bucketList = Object.keys(bucketMap).map(k => bucketMap[k]);
+  bucketList.sort((a, b) => a.sortVal - b.sortVal);
+
+  return {
+    konveksiList: groups.map(g => g.konveksi),
+    bucketList,
+    getCell: (bucketKey, konv) => cellIndex[bucketKey + '|' + konv] || null
+  };
+}
+
+return { fetchKonveksiList, fetchRawRows, buildGroups, buildMatrixFromGroups, fmtDate };
