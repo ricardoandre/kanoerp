@@ -1,0 +1,780 @@
+// =====================================================
+// jblock — FACEBOOK ADS MONTHLY REPORT
+//
+// Combines three existing report patterns into one:
+//   (1) Overview's account-wide monthly trend — last 6 months, fixed
+//       metric set (no checkbox picker), chart + summary table.
+//   (2) Structure's objective classification (fn.resolveObjective) applied
+//       to a flat campaign list scoped to ONE reporting month, grouped
+//       reach -> atc -> purchase -> other, sorted by spend within group.
+//       "Results"/"Cost per Result" meaning swaps per objective — see
+//       resultsForObjective() below.
+//   (3) Details/Creative report's image-join pattern, applied to ALL ads
+//       under the account for the reporting month, grouped by their
+//       PARENT CAMPAIGN's objective (ads have no objective of their own),
+//       sorted by spend within group.
+//
+// Filter surface: Account (single-select) + Month (single month picker).
+// Picking month M sets periods[0] (Section 1's most recent trend column)
+// AND the exact since/until window for Sections 2 & 3 to M.
+//
+// ASSUMPTIONS (flagged for Andre, see chat) — fix here if wrong:
+//   - Cost/Results for objective=purchase is spend/revenue (literal read
+//     of "Results = Purchase Amt"), NOT spend/purchase-count. That's a
+//     different number than the existing Cost/Purchase column.
+//   - objective='other' rows show '—' for Results/Cost/Results — no
+//     metric was specified for that bucket.
+//
+// Shared logic/UI lives in source_code rows (fn_fbads_data,
+// ui_fbads_controls) — same pattern as Overview/Structure/Details.
+//
+// NOTE (2026-07): loadCode and every fetcher converted from raw ctx.sql/
+// fn.runSql to ctx.api.resource() — ctx.sql.save() is admin/root-gated and
+// silently fails for non-admin roles (see README §3). Section 1's trend
+// fetcher still needs computed-period bucketing (12-month span) — same
+// approach as the other 3 FB Ads reports (raw rows paginated via
+// fetchAllRows, bucketed via computePeriodKey). Sections 2/3's fetchers
+// scope to a single month window, so they just aggregate all matching rows
+// in JS with no bucketing needed. "MAX(name)" lookups simplified to "any
+// non-null value" since these fields are constant per entity. Do not
+// revert any of this to raw SQL.
+// =====================================================
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Spin, Button, Select, DatePicker } = antd;
+const ce = React.createElement;
+const TREND_PERIOD_COUNT = 12; // Account Overview — 1-year view
+// Section 1 only: fn.buildPeriods('monthly') labels periods as "1-30 Jun
+// 2026" (shared across every report that uses monthly grouping, so not
+// changed there to avoid affecting Structure/Details). Section 1 wants the
+// shorter "June 2026" instead — period.key is always that month's first day
+// (YYYY-MM-01), so this just reformats it locally for display here.
+function monthLabel(period) { return dayjs(period.key).format('MMMM YYYY'); }
+const TREND_METRICS = ['spend', 'reach', 'atc', 'revenue', 'roas']; // Section 1 chart — fixed, no picker
+// Local, self-contained coloring helpers — NOT dependent on fn_fbads_data,
+// since this file can't see that module's source. green = current > previous
+// (used for growth-style metrics: Spend, Reach, Purchase Amt, and Sections
+// 2/3's "Results" column vs last month), red = current < previous, no color
+// if either side is missing or they're equal. Cost-style metrics (ROAS,
+// Cost/ATC, Cost/Reach, and Sections 2/3's "Cost/Results") keep using
+// fn.targetColorFromValue (vs a fixed target) as before — untouched here.
+const COLOR_GOOD = '#16a34a';
+const COLOR_BAD = '#dc2626';
+function trendColor(cur, prev) {
+  if (cur == null || prev == null) return null;
+  if (cur > prev) return COLOR_GOOD;
+  if (cur < prev) return COLOR_BAD;
+  return null;
+}
+// ── shared code loader (README §3) ──
+let fn = null, ui = null;
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// Paginates a ctx.api.resource(collection).list() call until a short page
+// comes back — used since these fetchers need every matching row.
+async function fetchAllRows(collection, opts) {
+  const pageSize = 500;
+  let page = 1;
+  let out = [];
+  while (true) {
+    const res = await ctx.api.resource(collection).list(Object.assign({}, opts, { page: page, pageSize: pageSize })).catch(() => null);
+    const rows = (res && res.data && res.data.data) || [];
+    out = out.concat(rows);
+    if (rows.length < pageSize) break;
+    page++;
+  }
+  return out;
+}
+
+// Reproduces fn.periodKeyExpr('monthly')'s bucketing (first-of-month) in JS
+// — only Section 1's 12-month trend fetch needs this; Sections 2/3 already
+// scope to a single month so they aggregate everything into one bucket.
+function computeMonthKey(dateStr) {
+  return dayjs(dateStr).startOf('month').format('YYYY-MM-DD');
+}
+
+// =====================================================
+// ── shared table style helpers (used by all 3 sections) ──
+// =====================================================
+function thStyle(left, extra) {
+  const base = { textAlign: left ? 'left' : 'right', padding: '8px 10px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb', fontWeight: 600, fontSize: 11, color: '#374151', whiteSpace: 'nowrap' };
+  if (left) { base.position = 'sticky'; base.left = 0; base.zIndex = 3; base.boxShadow = '2px 0 4px -2px rgba(0,0,0,0.08)'; }
+  return Object.assign(base, extra || {});
+}
+function tdStyle(left, extra) {
+  const base = { textAlign: left ? 'left' : 'right', padding: '6px 10px', borderBottom: '1px solid #f3f4f6', fontWeight: left ? 600 : 400, color: left ? '#111827' : '#374151', fontSize: 12, verticalAlign: 'middle' };
+  if (left) { base.position = 'sticky'; base.left = 0; base.zIndex = 2; base.boxShadow = '2px 0 4px -2px rgba(0,0,0,0.08)'; base.background = '#fff'; }
+  return Object.assign(base, extra || {});
+}
+// leadColSpan = columns before "Results" (e.g. just Campaign name, or
+// image+identity+status+spend for the creative table); trailColSpan =
+// columns after "Effectiveness" (0 if it's the last column). Splitting the
+// divider bar into cells this way lets resultsLabel/effLabel sit directly
+// under the Results/Effectiveness column headers instead of trailing off
+// after the group name.
+function groupHeaderRow(label, leadColSpan, resultsLabel, effLabel, trailColSpan) {
+  const cellStyle = { padding: '8px 10px', background: '#eef2ff', fontWeight: 700, fontSize: 12, color: '#3730a3', borderBottom: '1px solid #e0e7ff' };
+  const cells = [
+    ce('td', { key: 'lead', colSpan: leadColSpan, style: Object.assign({ position: 'sticky', left: 0 }, cellStyle) }, label),
+    ce('td', { key: 'res', style: Object.assign({ fontWeight: 400, textAlign: 'right' }, cellStyle) }, resultsLabel || ''),
+    ce('td', { key: 'eff', style: Object.assign({ fontWeight: 400, textAlign: 'right' }, cellStyle) }, effLabel || ''),
+  ];
+  if (trailColSpan > 0) cells.push(ce('td', { key: 'trail', colSpan: trailColSpan, style: cellStyle }, ''));
+  return ce('tr', { key: 'grp_' + label }, cells);
+}
+// Main value AND the note beneath it share the same color (when there is
+// one) — reinforces the direction instead of leaving the headline number
+// neutral while only the small note carries meaning.
+function valueWithNote(valueText, note) {
+  const color = note && note.color;
+  return ce('div', { style: { textAlign: 'right' } },
+    ce('div', { style: color ? { color: color, fontWeight: 700 } : null }, valueText),
+    note ? ce('div', { style: { fontSize: 10, color: color || '#9ca3af', fontWeight: color ? 700 : 400, marginTop: 1 } }, note.text) : null);
+}
+const OBJ_ORDER = ['reach', 'atc', 'purchase', 'other'];
+const OBJ_GROUP_LABEL = { reach: 'Reach', atc: 'ATC', purchase: 'Purchase', other: 'Other' };
+function groupByObjective(rows) {
+  const buckets = { reach: [], atc: [], purchase: [], other: [] };
+  rows.forEach(function (r) { (buckets[r.objective] || buckets.other).push(r); });
+  Object.keys(buckets).forEach(function (k) { buckets[k].sort(function (a, b) { return b.spend - a.spend; }); });
+  return buckets;
+}
+// Compact "vs last month" note — arrow + percent + the actual last-month
+// value in parens (formatted with fmtFn, matching whatever the main value
+// uses — money/count/ratio), WITH color: for a growth-style metric (Spend,
+// Reach, ATC, Purchase Amt, ROAS) higher is better so ↑=green/↓=red; for a
+// cost-style metric (Cost/Reach, Cost/ATC) it's the opposite, ↓=green/↑=red.
+// Pass higherIsBetter accordingly. Returns null when there's nothing
+// sensible to compare — no prior-month row, or prior value is exactly 0
+// with nothing meaningful to compute a percent change from.
+function trendInfo(cur, prev, higherIsBetter, fmtFn) {
+  if (cur == null || prev == null) return null;
+  if (prev === 0) {
+    if (cur === 0) return null;
+    const isUp = cur > 0;
+    return { text: (isUp ? '↑ new' : '↓ new') + ' (' + fmtFn(prev) + ')', color: (isUp === higherIsBetter) ? COLOR_GOOD : COLOR_BAD };
+  }
+  const pct = ((cur - prev) / Math.abs(prev)) * 100;
+  if (pct === 0) return { text: '→ flat (' + fmtFn(prev) + ')', color: null };
+  const isUp = pct > 0;
+  return { text: (isUp ? '↑ ' : '↓ ') + Math.abs(pct).toFixed(1) + '% (' + fmtFn(prev) + ')', color: (isUp === higherIsBetter) ? COLOR_GOOD : COLOR_BAD };
+}
+// What "Results" and "Effectiveness" mean per objective — short labels only,
+// rendered directly under those columns in each objective's group-header
+// row (see groupHeaderRow), not as a separate explanatory paragraph.
+const RESULT_META = {
+  reach: { result: 'Reach', eff: 'Cost/Reach' },
+  atc: { result: 'ATC', eff: 'Cost/ATC' },
+  purchase: { result: 'Purchase Amt', eff: 'ROAS' },
+  other: { result: '—', eff: '—' },
+};
+function resultValueForObjective(objective, row) {
+  if (objective === 'reach') return row.reachMissing ? null : row.reach;
+  if (objective === 'atc') return row.atc;
+  if (objective === 'purchase') return row.revenue;
+  return null;
+}
+// "Effectiveness" — Reach/ATC: Cost/Reach & Cost/ATC (lower is better).
+// Purchase: ROAS = Revenue ÷ Spend (higher is better).
+function effectivenessValueForObjective(objective, row) {
+  if (objective === 'reach') return row.reachMissing ? null : fn.safeDiv(row.spend, row.reach);
+  if (objective === 'atc') return fn.safeDiv(row.spend, row.atc);
+  if (objective === 'purchase') return fn.safeDiv(row.revenue, row.spend);
+  return null;
+}
+// prevRow is the same-shape row for last month (or null if the campaign/ad
+// didn't run last month at all) — powers the "vs last month" trend note
+// under each value, colored per that metric's higher/lower-is-better sense.
+function resultsForObjective(objective, row, prevRow) {
+  const meta = RESULT_META[objective] || RESULT_META.other;
+  if (objective === 'other') return { label: meta.result, valueText: '—', valueNote: null, costText: '—', costNote: null };
+  const resultVal = resultValueForObjective(objective, row);
+  if (resultVal == null) return { label: meta.result, valueText: '—', valueNote: null, costText: '—', costNote: null };
+  const effVal = effectivenessValueForObjective(objective, row);
+  const prevOk = prevRow && !(objective === 'reach' && prevRow.reachMissing);
+  const prevResultVal = prevOk ? resultValueForObjective(objective, prevRow) : null;
+  const prevEffVal = prevOk ? effectivenessValueForObjective(objective, prevRow) : null;
+  const valueFmt = objective === 'purchase' ? fn.fmtMoney : fn.fmtNum;
+  const effFmt = objective === 'atc' ? fn.fmtMoney : fn.fmtRatio; // reach's Cost/Reach and purchase's ROAS are both plain ratios
+  const effHigherIsBetter = objective === 'purchase'; // ROAS: higher better; Cost/Reach & Cost/ATC: lower better
+  return {
+    label: meta.result,
+    valueText: valueFmt(resultVal), valueNote: trendInfo(resultVal, prevResultVal, true, valueFmt),
+    costText: effFmt(effVal), costNote: trendInfo(effVal, prevEffVal, effHigherIsBetter, effFmt),
+  };
+}
+// =====================================================
+// ── SECTION 1 — account trend (last 12 months), fixed metrics ──
+// =====================================================
+function fetchAccountTotalsAgg(periods, account) {
+  const since = periods[periods.length - 1].start, until = periods[0].end;
+  const filter = { date: { $gte: since.format('YYYY-MM-DD'), $lte: until.format('YYYY-MM-DD') } };
+  if (account) filter.account = account;
+  return fetchAllRows('campaigns_insights', {
+    filter: filter,
+    fields: ['date', 'spend', 'atc', 'purchase', 'revenue'],
+  }).then(function (rows) {
+    const sums = {};
+    periods.forEach(function (p) { sums[p.key] = { period_key: p.key, spend: 0, atc: 0, purchase: 0, revenue: 0 }; });
+    rows.forEach(function (r) {
+      if (!r.date) return;
+      const key = computeMonthKey(r.date);
+      if (!sums[key]) return;
+      const s = sums[key];
+      s.spend += fn.num(r.spend); s.atc += fn.num(r.atc);
+      s.purchase += fn.num(r.purchase); s.revenue += fn.num(r.revenue);
+    });
+    return Object.values(sums);
+  });
+}
+function fetchAccountPeriodReach(periods, account) {
+  const periodKeys = periods.map(function (p) { return p.key; });
+  const filter = { entity_type: 'account', period_type: 'month', period_start: { $in: periodKeys } };
+  if (account) filter.account = account;
+  return fetchAllRows('fb_ads_period_data', {
+    filter: filter,
+    fields: ['period_start', 'reach', 'impression'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const key = r.period_start;
+      if (!sums[key]) sums[key] = { period_key: key, reach: 0, impressions: 0 };
+      sums[key].reach += fn.num(r.reach);
+      sums[key].impressions += fn.num(r.impression);
+    });
+    return Object.values(sums);
+  });
+}
+function buildOverallMap(totalsRows, periods) {
+  const periodKeys = new Set(periods.map(function (p) { return p.key; }));
+  const overall = {};
+  totalsRows.forEach(function (r) {
+    if (!periodKeys.has(r.period_key)) return;
+    overall[r.period_key] = {
+      period_key: r.period_key, spend: fn.num(r.spend), atc: fn.num(r.atc),
+      purchase: fn.num(r.purchase), revenue: fn.num(r.revenue),
+      reach: 0, impressions: 0, reachMissing: true,
+    };
+  });
+  return overall;
+}
+function applyAccountReach(overallMap, reachRows) {
+  reachRows.forEach(function (r) {
+    if (overallMap[r.period_key]) {
+      overallMap[r.period_key].reach = fn.num(r.reach);
+      overallMap[r.period_key].impressions = fn.num(r.impressions);
+      overallMap[r.period_key].reachMissing = false;
+    }
+  });
+}
+function metricRows(fn_) {
+  return [
+    { key: 'spend', label: 'Total Spend', fmt: fn_.fmtMoney, calc: r => r.spend },
+    { key: 'reach', label: 'Total Reach', fmt: fn_.fmtNum, calc: r => r.reach, dependsOnReach: true },
+    { key: 'cost_reach', label: 'Cost / Reach', fmt: fn_.fmtRatio, calc: r => fn_.safeDiv(r.spend, r.reach), dependsOnReach: true },
+    { key: 'atc', label: 'ATC', fmt: fn_.fmtNum, calc: r => r.atc },
+    { key: 'cost_atc', label: 'Cost / ATC', fmt: fn_.fmtMoney, calc: r => fn_.safeDiv(r.spend, r.atc) },
+    { key: 'purchase', label: 'Purchase', fmt: fn_.fmtNum, calc: r => r.purchase },
+    { key: 'cost_purchase', label: 'Cost / Purchase', fmt: fn_.fmtMoney, calc: r => fn_.safeDiv(r.spend, r.purchase) },
+    { key: 'revenue', label: 'Purchase Amt', fmt: fn_.fmtMoney, calc: r => r.revenue },
+    { key: 'roas', label: 'ROAS', fmt: fn_.fmtRatio, calc: r => fn_.safeDiv(r.revenue, r.spend) },
+  ];
+}
+const LINE_COLORS = ['#6366f1', '#f59e0b', '#22c55e', '#ef4444', '#0ea5e9'];
+function TrendChart(props) {
+  const periods = props.periods, getRow = props.getRow, METRIC_ROWS = props.metricRows, selected = props.selected;
+  const orderedPeriods = periods.slice().reverse();
+  const W = 800, H = 240, PAD = 40;
+  const stepX = orderedPeriods.length > 1 ? (W - PAD * 2) / (orderedPeriods.length - 1) : 0;
+  const series = selected.map(function (key, si) {
+    const mr = METRIC_ROWS.find(function (m) { return m.key === key; });
+    if (!mr) return null;
+    const values = orderedPeriods.map(function (p) { return fn.num(mr.calc(getRow(p.key) || {})); });
+    const maxV = Math.max.apply(null, values.concat([1]));
+    const pts = values.map(function (v, i) { return { x: PAD + i * stepX, y: H - PAD - (maxV > 0 ? (v / maxV) * (H - PAD * 2) : 0) }; });
+    return { key: key, label: mr.label, color: LINE_COLORS[si % LINE_COLORS.length], pts: pts };
+  }).filter(Boolean);
+  return ce('div', { style: { marginBottom: 24 } },
+    ce('svg', { width: '100%', viewBox: '0 0 ' + W + ' ' + H, style: { maxWidth: W } },
+      ce('line', { x1: PAD, y1: H - PAD, x2: W - PAD, y2: H - PAD, stroke: '#e5e7eb' }),
+      orderedPeriods.map(function (p, i) { return ce('text', { key: p.key, x: PAD + i * stepX, y: H - PAD + 16, fontSize: 10, textAnchor: 'middle', fill: '#9ca3af' }, monthLabel(p)); }),
+      series.map(function (s) {
+        const pathD = s.pts.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ',' + p.y; }).join(' ');
+        return ce('g', { key: s.key }, ce('path', { d: pathD, fill: 'none', stroke: s.color, strokeWidth: 2 }),
+          s.pts.map(function (p, i) { return ce('circle', { key: i, cx: p.x, cy: p.y, r: 3, fill: s.color }); }));
+      })),
+    ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 6 } },
+      series.map(function (s) { return ce('div', { key: s.key, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+        ce('span', { style: { width: 10, height: 10, borderRadius: 5, background: s.color, display: 'inline-block' } }), s.label); })));
+}
+function SummaryTable(props) {
+  const periods = props.periods, getRow = props.getRow, targetRules = props.targetRules, METRIC_ROWS = props.metricRows;
+  function roasColor(row) { return fn.targetColorFromValue(fn.safeDiv(row.revenue, row.spend), row.spend, targetRules.roas); }
+  // Total Spend / Total Reach / Purchase Amt — colored vs the previous
+  // period (periods[i+1], since periods[0] is the most recent). ROAS keeps
+  // its existing target-based coloring below; everything else (ATC,
+  // Cost/ATC, Purchase count, Cost/Purchase, Cost/Reach) stays uncolored.
+  const TREND_COLORED_KEYS = ['spend', 'reach', 'revenue'];
+  const rows = METRIC_ROWS.map(function (mr, i) {
+    const rowBg = i % 2 ? '#fafafa' : '#fff';
+    const cells = periods.map(function (p, pi) {
+      const row = getRow(p.key) || {};
+      if (mr.dependsOnReach && row.reachMissing) return ce('td', { key: p.key, style: tdStyle(false, { color: '#d1d5db' }) }, '—');
+      let color = null;
+      if (mr.key === 'roas') {
+        color = roasColor(row);
+      } else if (TREND_COLORED_KEYS.indexOf(mr.key) !== -1) {
+        const prevPeriod = periods[pi + 1];
+        const prevRow = prevPeriod ? getRow(prevPeriod.key) : null;
+        if (prevRow && !(mr.dependsOnReach && prevRow.reachMissing)) color = trendColor(mr.calc(row), mr.calc(prevRow));
+      }
+      return ce('td', { key: p.key, style: tdStyle(false, color ? { color: color, fontWeight: 700 } : {}) }, mr.fmt(mr.calc(row)));
+    });
+    return ce('tr', { key: mr.key, style: { background: rowBg } }, ce('td', { style: tdStyle(true, { background: rowBg }) }, mr.label), cells);
+  });
+  return ce('div', { style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', tableLayout: 'fixed', fontSize: 12 } },
+      ce('colgroup', null, ce('col', { style: { width: 160 } }), periods.map(function (p) { return ce('col', { key: p.key, style: { width: 130 } }); })),
+      ce('thead', null, ce('tr', null, ce('th', { style: thStyle(true) }, 'Metric'), periods.map(function (p) { return ce('th', { key: p.key, style: thStyle(false) }, monthLabel(p)); }))),
+      ce('tbody', null, rows)));
+}
+// =====================================================
+// ── SECTION 2 — campaign list, reporting month only ──
+// =====================================================
+function fetchCampaignsMonthAgg(since, until, account) {
+  const filter = { date: { $gte: since.format('YYYY-MM-DD'), $lte: until.format('YYYY-MM-DD') } };
+  if (account) filter.account = account;
+  return fetchAllRows('campaigns_insights', {
+    filter: filter,
+    fields: ['campaign_id', 'campaign_name', 'spend', 'atc', 'purchase', 'revenue', 'impressions'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const id = r.campaign_id;
+      if (id == null) return;
+      if (!sums[id]) sums[id] = { campaign_id: id, campaign_name: r.campaign_name, spend: 0, atc: 0, purchase: 0, revenue: 0, impressions: 0 };
+      if (r.campaign_name != null && sums[id].campaign_name == null) sums[id].campaign_name = r.campaign_name;
+      sums[id].spend += fn.num(r.spend); sums[id].atc += fn.num(r.atc);
+      sums[id].purchase += fn.num(r.purchase); sums[id].revenue += fn.num(r.revenue);
+      sums[id].impressions += fn.num(r.impressions);
+    });
+    return Object.values(sums);
+  });
+}
+function fetchCampaignMonthReach(periodStart, campaignIds) {
+  if (!campaignIds.length) return Promise.resolve([]);
+  return fetchAllRows('fb_ads_period_data', {
+    filter: { entity_type: 'campaign', period_type: 'month', period_start: periodStart.format('YYYY-MM-DD'), entity_id: { $in: campaignIds.map(String) } },
+    fields: ['entity_id', 'reach'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const id = String(r.entity_id);
+      sums[id] = (sums[id] || 0) + fn.num(r.reach);
+    });
+    return Object.keys(sums).map(function (id) { return { entity_id: id, reach: sums[id] }; });
+  });
+}
+// Shared between Section 2 (Campaigns) and Section 3 (Creatives) — same
+// metric set, same order, in both tables.
+const METRIC_COLS = [
+  { key: 'reach', label: 'Reach', fmt: v => fn.fmtNum(v) },
+  { key: 'cost_reach', label: 'Cost/Reach', fmt: v => fn.fmtRatio(v) },
+  { key: 'atc', label: 'ATC', fmt: v => fn.fmtNum(v) },
+  { key: 'cost_atc', label: 'Cost/ATC', fmt: v => fn.fmtMoney(v) },
+  { key: 'purchase', label: 'Purchase', fmt: v => fn.fmtNum(v) },
+  { key: 'cost_purchase', label: 'Cost/Purchase', fmt: v => fn.fmtMoney(v) },
+  { key: 'revenue', label: 'Purchase Amt', fmt: v => fn.fmtMoney(v) },
+  { key: 'roas', label: 'ROAS', fmt: v => fn.fmtRatio(v) },
+  { key: 'frequency', label: 'Frequency', fmt: v => fn.fmtRatio(v) },
+];
+// r needs: spend, reach, reachMissing, atc, purchase, revenue, impressions.
+function metricCellVals(r) {
+  return {
+    reach: r.reachMissing ? null : r.reach,
+    cost_reach: r.reachMissing ? null : fn.safeDiv(r.spend, r.reach),
+    atc: r.atc, cost_atc: fn.safeDiv(r.spend, r.atc),
+    purchase: r.purchase, cost_purchase: fn.safeDiv(r.spend, r.purchase),
+    revenue: r.revenue, roas: fn.safeDiv(r.revenue, r.spend),
+    frequency: r.reachMissing ? null : fn.safeDiv(r.impressions, r.reach),
+  };
+}
+// Section 2 only — one "Total" row per objective bucket, right after that
+// bucket's campaigns. Only Spend/Results/Effectiveness are aggregated (as
+// asked); every other metric column shows "—" rather than a sum, since
+// those weren't requested and summing Reach/Frequency across campaigns
+// would double-count overlapping audiences anyway. Effectiveness is
+// recomputed from the bucket's totals (spend÷reach etc), not averaged from
+// each campaign's individual ratio — the mathematically correct way to
+// aggregate a ratio.
+function bucketTotalRow(objective, bucketRows) {
+  if (objective === 'other' || !bucketRows.length) return null;
+  const totalSpend = bucketRows.reduce(function (s, r) { return s + r.spend; }, 0);
+  let resultVal = 0, effVal = 0;
+  if (objective === 'reach') {
+    const totalReach = bucketRows.reduce(function (s, r) { return s + (r.reachMissing ? 0 : r.reach); }, 0);
+    resultVal = totalReach; effVal = fn.safeDiv(totalSpend, totalReach);
+  } else if (objective === 'atc') {
+    const totalAtc = bucketRows.reduce(function (s, r) { return s + r.atc; }, 0);
+    resultVal = totalAtc; effVal = fn.safeDiv(totalSpend, totalAtc);
+  } else if (objective === 'purchase') {
+    const totalRevenue = bucketRows.reduce(function (s, r) { return s + r.revenue; }, 0);
+    resultVal = totalRevenue; effVal = fn.safeDiv(totalRevenue, totalSpend);
+  }
+  const valueFmt = objective === 'purchase' ? fn.fmtMoney : fn.fmtNum;
+  const effFmt = objective === 'atc' ? fn.fmtMoney : fn.fmtRatio;
+  return ce('tr', { key: 'total_' + objective, style: { background: '#f9fafb' } },
+    ce('td', { style: tdStyle(true, { background: '#f9fafb', borderTop: '2px solid #e5e7eb' }) }, 'Total'),
+    ce('td', { style: tdStyle(false, { borderTop: '2px solid #e5e7eb' }) }, fn.fmtMoney(totalSpend)),
+    ce('td', { style: tdStyle(false, { borderTop: '2px solid #e5e7eb' }) }, valueFmt(resultVal)),
+    ce('td', { style: tdStyle(false, { borderTop: '2px solid #e5e7eb' }) }, effFmt(effVal)),
+    METRIC_COLS.map(function (c) { return ce('td', { key: c.key, style: tdStyle(false, { borderTop: '2px solid #e5e7eb' }) }, '—'); }));
+}
+function CampaignTable(props) {
+  const rows = props.rows;
+  const buckets = groupByObjective(rows);
+  const colCount = 4 + METRIC_COLS.length; // name + Spend + Results + Effectiveness + rest
+  function bucketRows(objective) {
+    return buckets[objective].map(function (r) {
+      const res = resultsForObjective(objective, r, r.prevMonth);
+      const spendNote = r.prevMonth ? trendInfo(r.spend, r.prevMonth.spend, true, fn.fmtMoney) : null; // Spend: more = green, same convention as Results
+      const cellVals = metricCellVals(r);
+      return ce('tr', { key: r.campaign_id },
+        ce('td', { style: tdStyle(true) }, ui.badge(objective), ui.objectiveMetaBadge(r.objectiveInfo), r.campaign_name || r.campaign_id),
+        ce('td', { style: tdStyle(false) }, valueWithNote(fn.fmtMoney(r.spend), spendNote)),
+        ce('td', { style: tdStyle(false) }, valueWithNote(res.valueText, res.valueNote)),
+        ce('td', { style: tdStyle(false) }, valueWithNote(res.costText, res.costNote)),
+        METRIC_COLS.map(function (c) {
+          const v = cellVals[c.key];
+          return ce('td', { key: c.key, style: tdStyle(false) }, v == null ? '—' : c.fmt(v));
+        }));
+    });
+  }
+  const bodyRows = [];
+  OBJ_ORDER.forEach(function (objective) {
+    if (!buckets[objective].length) return;
+    const meta = RESULT_META[objective];
+    // leadColSpan = Campaign + Spend (2); trailColSpan = the METRIC_COLS after Effectiveness
+    bodyRows.push(groupHeaderRow(OBJ_GROUP_LABEL[objective] + ' (' + buckets[objective].length + ')', 2, objective === 'other' ? null : meta.result, objective === 'other' ? null : meta.eff, METRIC_COLS.length));
+    bodyRows.push.apply(bodyRows, bucketRows(objective));
+    const totalRow = bucketTotalRow(objective, buckets[objective]);
+    if (totalRow) bodyRows.push(totalRow);
+  });
+  return ce('div', { style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', fontSize: 12 } },
+      ce('thead', null, ce('tr', null,
+        ce('th', { style: thStyle(true) }, 'Campaign'),
+        ce('th', { style: thStyle(false) }, 'Spend'),
+        ce('th', { style: thStyle(false) }, 'Results'),
+        ce('th', { style: thStyle(false) }, 'Effectiveness'),
+        METRIC_COLS.map(function (c) { return ce('th', { key: c.key, style: thStyle(false) }, c.label); }))),
+      ce('tbody', null, bodyRows)));
+}
+// =====================================================
+// ── SECTION 3 — creatives, reporting month only, grouped by PARENT
+// campaign's objective ──
+// =====================================================
+function fetchAdsetIdentityLookup(campaignIds) {
+  if (!campaignIds.length) return Promise.resolve([]);
+  return fetchAllRows('adsets_insights', {
+    filter: { campaign_id: { $in: campaignIds } },
+    fields: ['adset_id', 'adset_name'],
+  }).then(function (rows) {
+    const map = {};
+    rows.forEach(function (r) {
+      if (r.adset_id == null) return;
+      if (r.adset_name != null && map[r.adset_id] == null) map[r.adset_id] = r.adset_name;
+    });
+    return Object.keys(map).map(function (id) { return { adset_id: id, adset_name: map[id] }; });
+  });
+}
+function fetchAdsMonthAgg(since, until, campaignIds) {
+  if (!campaignIds.length) return Promise.resolve([]);
+  return fetchAllRows('ads_insights', {
+    filter: {
+      campaign_id: { $in: campaignIds },
+      date: { $gte: since.format('YYYY-MM-DD'), $lte: until.format('YYYY-MM-DD') },
+    },
+    fields: ['ad_id', 'ad_name', 'adset_id', 'campaign_id', 'spend', 'atc', 'purchase', 'revenue', 'impressions'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const id = r.ad_id;
+      if (id == null) return;
+      if (!sums[id]) sums[id] = { ad_id: id, ad_name: r.ad_name, adset_id: r.adset_id, campaign_id: r.campaign_id, spend: 0, atc: 0, purchase: 0, revenue: 0, impressions: 0 };
+      if (r.ad_name != null && sums[id].ad_name == null) sums[id].ad_name = r.ad_name;
+      if (r.adset_id != null && sums[id].adset_id == null) sums[id].adset_id = r.adset_id;
+      if (r.campaign_id != null && sums[id].campaign_id == null) sums[id].campaign_id = r.campaign_id;
+      sums[id].spend += fn.num(r.spend); sums[id].atc += fn.num(r.atc);
+      sums[id].purchase += fn.num(r.purchase); sums[id].revenue += fn.num(r.revenue);
+      sums[id].impressions += fn.num(r.impressions);
+    });
+    return Object.values(sums);
+  });
+}
+function fetchAdMonthReach(periodStart, adIds) {
+  if (!adIds.length) return Promise.resolve([]);
+  return fetchAllRows('fb_ads_period_data', {
+    filter: { entity_type: 'ad', period_type: 'month', period_start: periodStart.format('YYYY-MM-DD'), entity_id: { $in: adIds.map(String) } },
+    fields: ['entity_id', 'reach'],
+  }).then(function (rows) {
+    const sums = {};
+    rows.forEach(function (r) {
+      const id = String(r.entity_id);
+      sums[id] = (sums[id] || 0) + fn.num(r.reach);
+    });
+    return Object.keys(sums).map(function (id) { return { entity_id: id, reach: sums[id] }; });
+  });
+}
+async function fetchCreativeImages() {
+  try {
+    const rows = await fetchAllRows('ads_creative', { fields: ['ad_id'], appends: ['image'] });
+    const map = {};
+    rows.forEach(function (r) {
+      const img = r.image;
+      const imgRow = Array.isArray(img) ? img[0] : img;
+      if (!imgRow) return;
+      map[r.ad_id] = imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
+    });
+    return map;
+  } catch (e) { return {}; }
+}
+// Section 3 only wants a plain Active/Paused distinction — the shared
+// ui.statusBadge renders FB's raw effective_status verbatim (PAUSED,
+// CAMPAIGN_PAUSED, ADSET_PAUSED, ARCHIVED, DISAPPROVED, etc), which is more
+// detail than wanted here. Anything that isn't exactly ACTIVE shows as
+// "Paused"; no badge at all if status hasn't synced yet.
+function simpleStatusBadge(status) {
+  if (!status) return null;
+  const isActive = status === 'ACTIVE';
+  const color = isActive ? '#16a34a' : '#9ca3af';
+  return ce('span', { style: { display: 'inline-block', padding: '1px 8px', borderRadius: 999, fontSize: 10, fontWeight: 700, background: color + '20', color: color } }, isActive ? 'Active' : 'Paused');
+}
+// Section 3 only wants the cost/ratio columns, not the raw counts (Reach,
+// ATC, Purchase, Purchase Amt) or Frequency — those stay exclusive to
+// Section 2. Filtering (not reordering) METRIC_COLS keeps both tables using
+// the exact same definitions/formatting for the columns they share.
+const CREATIVE_TRAILING_COLS = METRIC_COLS.filter(function (c) {
+  return ['cost_reach', 'cost_atc', 'cost_purchase', 'roas'].indexOf(c.key) !== -1;
+});
+function CreativeTable(props) {
+  const rows = props.rows;
+  const buckets = groupByObjective(rows);
+  const bodyRows = [];
+  OBJ_ORDER.forEach(function (objective) {
+    if (!buckets[objective].length) return;
+    const meta = RESULT_META[objective];
+    // leadColSpan=4 (image, identity, status, spend); trailColSpan = CREATIVE_TRAILING_COLS after Effectiveness
+    bodyRows.push(groupHeaderRow(OBJ_GROUP_LABEL[objective] + ' (' + buckets[objective].length + ')', 4, objective === 'other' ? null : meta.result, objective === 'other' ? null : meta.eff, CREATIVE_TRAILING_COLS.length));
+    buckets[objective].forEach(function (r) {
+      const res = resultsForObjective(objective, r, r.prevMonth);
+      const spendNote = r.prevMonth ? trendInfo(r.spend, r.prevMonth.spend, true, fn.fmtMoney) : null; // Spend: more = green, same convention as Results
+      const cellVals = metricCellVals(r);
+      bodyRows.push(ce('tr', { key: r.ad_id },
+        ce('td', { style: tdStyle(true) },
+          r.image ? ce('img', { src: r.image, style: { width: 44, height: 44, objectFit: 'cover', borderRadius: 6, display: 'block' } })
+                  : ce('div', { style: { width: 44, height: 44, background: '#f3f4f6', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, color: '#d1d5db' } }, '🎨')),
+        ce('td', { style: tdStyle(false, { textAlign: 'left' }) },
+          ce('div', { style: { fontWeight: 700, color: '#111827' } }, r.ad_name || r.ad_id),
+          ce('div', { style: { fontSize: 11, color: '#6b7280' } }, 'Adset: ' + (r.adset_name || '—')),
+          ce('div', { style: { fontSize: 11, color: '#9ca3af' } }, 'Campaign: ' + (r.campaign_name || '—'))),
+        ce('td', { style: tdStyle(false, { textAlign: 'left' }) }, simpleStatusBadge(r.fbStatus)),
+        ce('td', { style: tdStyle(false) }, valueWithNote(fn.fmtMoney(r.spend), spendNote)),
+        ce('td', { style: tdStyle(false) }, valueWithNote(res.valueText, res.valueNote)),
+        ce('td', { style: tdStyle(false) }, valueWithNote(res.costText, res.costNote)),
+        CREATIVE_TRAILING_COLS.map(function (c) {
+          const v = cellVals[c.key];
+          return ce('td', { key: c.key, style: tdStyle(false) }, v == null ? '—' : c.fmt(v));
+        })));
+    });
+  });
+  return ce('div', { style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', fontSize: 12 } },
+      ce('colgroup', null,
+        ce('col', { style: { width: 60 } }), ce('col', { style: { width: 220 } }), ce('col', { style: { width: 90 } }),
+        ce('col', { style: { width: 110 } }), ce('col', { style: { width: 120 } }), ce('col', { style: { width: 120 } }),
+        CREATIVE_TRAILING_COLS.map(function (c) { return ce('col', { key: c.key, style: { width: 110 } }); })),
+      ce('thead', null, ce('tr', null,
+        ce('th', { style: thStyle(true) }, ''),
+        ce('th', { style: thStyle(false, { textAlign: 'left' }) }, 'Creative / Adset / Campaign'),
+        ce('th', { style: thStyle(false, { textAlign: 'left' }) }, 'Status'),
+        ce('th', { style: thStyle(false) }, 'Spend'),
+        ce('th', { style: thStyle(false) }, 'Results'),
+        ce('th', { style: thStyle(false) }, 'Effectiveness'),
+        CREATIVE_TRAILING_COLS.map(function (c) { return ce('th', { key: c.key, style: thStyle(false) }, c.label); }))),
+      ce('tbody', null, bodyRows)));
+}
+// =====================================================
+// ── ROOT ──
+// =====================================================
+const Root = function () {
+  const sReady = useState(false); const ready = sReady[0]; const setReady = sReady[1];
+  const sLoadErr = useState(null); const loadErr = sLoadErr[0]; const setLoadErr = sLoadErr[1];
+  const sMonth = useState(dayjs().subtract(1, 'month').startOf('month')); const month = sMonth[0]; const setMonth = sMonth[1];
+  const sAvailableAccounts = useState([]); const availableAccounts = sAvailableAccounts[0]; const setAvailableAccounts = sAvailableAccounts[1];
+  const sSelectedAccount = useState(null); const selectedAccount = sSelectedAccount[0]; const setSelectedAccount = sSelectedAccount[1];
+  const sTargetRules = useState(null); const targetRules = sTargetRules[0]; const setTargetRules = sTargetRules[1];
+  const sLoading = useState(true); const loading = sLoading[0]; const setLoading = sLoading[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+  const sPeriods = useState(null); const periods = sPeriods[0]; const setPeriods = sPeriods[1];
+  const sOverall = useState(null); const overall = sOverall[0]; const setOverall = sOverall[1];
+  const sCampaignRows = useState(null); const campaignRows = sCampaignRows[0]; const setCampaignRows = sCampaignRows[1];
+  const sCreativeRows = useState(null); const creativeRows = sCreativeRows[0]; const setCreativeRows = sCreativeRows[1];
+  function generate(monthParam, account) {
+    setLoading(true); setErr(null);
+    const anchor = monthParam.startOf('month').add(1, 'month'); // buildPeriods('monthly') treats anchor as "today"
+    const p = fn.buildPeriods('monthly', TREND_PERIOD_COUNT, anchor);
+    const reportingPeriod = p[0];
+    const prevPeriod = p[1]; // one month before reportingPeriod — powers the "vs last month" trend notes in Sections 2 & 3
+    Promise.all([
+      fetchAccountTotalsAgg(p, account),
+      fetchAccountPeriodReach(p, account),
+      fetchCampaignsMonthAgg(reportingPeriod.start, reportingPeriod.end, account),
+      fetchCampaignsMonthAgg(prevPeriod.start, prevPeriod.end, account), // account-scoped, doesn't need campaignIds yet
+    ])
+      .then(function (res) {
+        const totalsRows = res[0], reachRows = res[1], campBaseRows = res[2], prevCampBaseRows = res[3];
+        const overallMap = buildOverallMap(totalsRows, p);
+        applyAccountReach(overallMap, reachRows);
+        setPeriods(p); setOverall(overallMap);
+        const campaignIds = campBaseRows.map(function (r) { return r.campaign_id; });
+        const prevCampBaseMap = {}; prevCampBaseRows.forEach(function (r) { prevCampBaseMap[r.campaign_id] = r; });
+        return Promise.all([
+          fetchCampaignMonthReach(reportingPeriod.start, campaignIds),
+          fetchCampaignMonthReach(prevPeriod.start, campaignIds),
+          fn.fetchObjectiveMap(ctx, campaignIds),
+          fetchAdsetIdentityLookup(campaignIds),
+          fetchAdsMonthAgg(reportingPeriod.start, reportingPeriod.end, campaignIds),
+          fetchAdsMonthAgg(prevPeriod.start, prevPeriod.end, campaignIds), // same campaign scope, prior month
+          fetchCreativeImages(),
+        ]).then(function (res2) {
+          const campReachRows = res2[0], prevCampReachRows = res2[1], objectiveMap = res2[2],
+                adsetIdentity = res2[3], adBaseRows = res2[4], prevAdBaseRows = res2[5], images = res2[6];
+          const campReachMap = {}; campReachRows.forEach(function (r) { campReachMap[r.entity_id] = fn.num(r.reach); });
+          const prevCampReachMap = {}; prevCampReachRows.forEach(function (r) { prevCampReachMap[r.entity_id] = fn.num(r.reach); });
+          // Per-campaign "last month" lookup — null if the campaign has no
+          // row at all last month (didn't exist / didn't run), which the
+          // tables render as no trend note for that row ("—" isn't shown, the note is simply omitted).
+          const prevCampaignLookup = {};
+          campaignIds.forEach(function (id) {
+            const pr = prevCampBaseMap[id];
+            if (!pr) { prevCampaignLookup[id] = null; return; }
+            const hasReach = prevCampReachMap.hasOwnProperty(id);
+            prevCampaignLookup[id] = {
+              spend: fn.num(pr.spend), atc: fn.num(pr.atc), purchase: fn.num(pr.purchase), revenue: fn.num(pr.revenue),
+              reach: hasReach ? prevCampReachMap[id] : 0, reachMissing: !hasReach,
+            };
+          });
+          const campNameMap = {};
+          const finalCampaignRows = campBaseRows.map(function (r) {
+            campNameMap[r.campaign_id] = r.campaign_name;
+            const objectiveInfo = fn.resolveObjective(objectiveMap[r.campaign_id], r.campaign_name);
+            const hasReach = campReachMap.hasOwnProperty(r.campaign_id);
+            return {
+              campaign_id: r.campaign_id, campaign_name: r.campaign_name,
+              objective: objectiveInfo.objective, objectiveInfo: objectiveInfo,
+              spend: fn.num(r.spend), atc: fn.num(r.atc), purchase: fn.num(r.purchase), revenue: fn.num(r.revenue),
+              impressions: fn.num(r.impressions),
+              reach: hasReach ? campReachMap[r.campaign_id] : 0, reachMissing: !hasReach,
+              prevMonth: prevCampaignLookup[r.campaign_id],
+            };
+          });
+          setCampaignRows(finalCampaignRows);
+          const adsetNameMap = {}; adsetIdentity.forEach(function (a) { adsetNameMap[a.adset_id] = a.adset_name; });
+          const adIds = adBaseRows.map(function (r) { return r.ad_id; });
+          const prevAdIds = prevAdBaseRows.map(function (r) { return r.ad_id; });
+          const prevAdBaseMap = {}; prevAdBaseRows.forEach(function (r) { prevAdBaseMap[r.ad_id] = r; });
+          return Promise.all([
+            fetchAdMonthReach(reportingPeriod.start, adIds),
+            fetchAdMonthReach(prevPeriod.start, prevAdIds),
+            fn.fetchStatusMap(ctx, 'ad', adIds),
+          ])
+            .then(function (res3) {
+              const adReachRows = res3[0], prevAdReachRows = res3[1], adStatusMap = res3[2];
+              const adReachMap = {}; adReachRows.forEach(function (r) { adReachMap[r.entity_id] = fn.num(r.reach); });
+              const prevAdReachMap = {}; prevAdReachRows.forEach(function (r) { prevAdReachMap[r.entity_id] = fn.num(r.reach); });
+              const prevAdLookup = {};
+              adIds.forEach(function (id) {
+                const pr = prevAdBaseMap[id];
+                if (!pr) { prevAdLookup[id] = null; return; }
+                const hasReach = prevAdReachMap.hasOwnProperty(id);
+                prevAdLookup[id] = {
+                  spend: fn.num(pr.spend), atc: fn.num(pr.atc), purchase: fn.num(pr.purchase), revenue: fn.num(pr.revenue),
+                  reach: hasReach ? prevAdReachMap[id] : 0, reachMissing: !hasReach,
+                };
+              });
+              const finalAdRows = adBaseRows.map(function (r) {
+                const objectiveInfo = fn.resolveObjective(objectiveMap[r.campaign_id], campNameMap[r.campaign_id]);
+                const hasReach = adReachMap.hasOwnProperty(r.ad_id);
+                return {
+                  ad_id: r.ad_id, ad_name: r.ad_name, adset_name: adsetNameMap[r.adset_id] || '—', campaign_name: campNameMap[r.campaign_id] || '—',
+                  objective: objectiveInfo.objective,
+                  spend: fn.num(r.spend), atc: fn.num(r.atc), purchase: fn.num(r.purchase), revenue: fn.num(r.revenue),
+                  impressions: fn.num(r.impressions),
+                  reach: hasReach ? adReachMap[r.ad_id] : 0, reachMissing: !hasReach,
+                  image: images[r.ad_id] || '', fbStatus: adStatusMap[r.ad_id] || null,
+                  prevMonth: prevAdLookup[r.ad_id],
+                };
+              });
+              setCreativeRows(finalAdRows);
+              setLoading(false);
+            });
+        });
+      })
+      .catch(function (e) { setErr((e && e.message) || String(e)); setLoading(false); });
+  }
+  function handleAccountChange(account) { setSelectedAccount(account); generate(month, account); }
+  function handleMonthChange(d) { if (!d) return; const m = d.startOf('month'); setMonth(m); generate(m, selectedAccount); }
+  function handleReload() { generate(month, selectedAccount); }
+  useEffect(function () {
+    Promise.all([loadCode('fn_fbads_data'), loadCode('ui_fbads_controls')])
+      .then(function (mods) { fn = mods[0]; ui = mods[1]; setSelectedAccount(fn.DEFAULT_ACCOUNT); setReady(true); })
+      .catch(function (e) { setLoadErr((e && e.message) || String(e)); });
+  }, []);
+  useEffect(function () {
+    if (!ready) return;
+    generate(month, selectedAccount);
+    fn.fetchAccountList(ctx).then(function (rows) { setAvailableAccounts(rows.map(function (r) { return r.account; })); }).catch(function () {});
+    fn.fetchTargetRules(ctx).then(function (rules) { setTargetRules(rules); });
+  }, [ready]);
+  if (loadErr) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load shared FB Ads modules: ' + loadErr);
+  if (!ready || !targetRules) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading…'));
+  const METRIC_ROWS = metricRows(fn);
+  const filterBar = ce('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', padding: '14px 20px', background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 8 } },
+    ui.Field('Account', ce(Select, { value: selectedAccount, onChange: handleAccountChange, style: { width: 200 }, placeholder: 'All accounts', allowClear: true, options: availableAccounts.map(function (a) { return { label: a, value: a }; }) })),
+    ui.Field('Month', ce(DatePicker, { picker: 'month', value: month, onChange: handleMonthChange, allowClear: false, disabledDate: function (d) { return d && d > dayjs().endOf('month'); } })),
+    ui.Field('', ce(Button, { onClick: handleReload, style: { borderColor: '#0891b2', color: '#0891b2' } }, loading ? 'Refreshing…' : '↻ Refresh')));
+  if (err) return ce('div', { style: { padding: 16 } }, filterBar, ce('div', { style: { color: '#ef4444', marginTop: 16 } }, 'Failed to load report: ' + err));
+  if (loading || !periods || !overall) return ce('div', { style: { padding: 16 } }, filterBar, ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, ce(Spin), ce('div', { style: { marginTop: 8 } }, 'Loading…')));
+  const missingReachPeriods = periods.filter(function (p) { const r = overall[p.key]; return !r || r.reachMissing; }).map(function (p) { return monthLabel(p); });
+  return ce('div', { style: { padding: 16 } },
+    ce('div', { style: { fontSize: 18, fontWeight: 700, marginBottom: 4 } }, 'Facebook Ads — Monthly Report'),
+    ce('div', { style: { fontSize: 13, color: '#6b7280', marginBottom: 4 } }, 'Reporting month: ' + month.format('MMMM YYYY') + ' · ' + (selectedAccount || 'All accounts')),
+    ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 12 } },
+      'Targets — Cost/ATC < ' + fn.fmtMoney(targetRules.cost_atc.target) + ', Cost/Reach < ' + fn.fmtRatio(targetRules.cost_reach.target) +
+        ', ROAS > ' + fn.fmtRatio(targetRules.roas.target) + ', Cost/Purchase < ' + fn.fmtMoney(targetRules.cost_purchase.target) + ' (edit in fb_ads_target)'),
+    ce('div', { style: { marginBottom: 16 } }, filterBar),
+    missingReachPeriods.length > 0 && ce('div', { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', marginBottom: 16, background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 6, fontSize: 12, color: '#9a3412' } },
+      ce('span', { style: { width: 8, height: 8, borderRadius: 4, background: '#f97316', flexShrink: 0 } }),
+      'No account-level reach data for ' + missingReachPeriods.join(', ') + ' — showing "—" instead of a derived number.'),
+    ce('div', { style: { fontWeight: 700, fontSize: 14, marginBottom: 8 } }, '1. Account Overview — last ' + TREND_PERIOD_COUNT + ' months'),
+    ce(TrendChart, { periods: periods, getRow: function (k) { return overall[k]; }, selected: TREND_METRICS, metricRows: METRIC_ROWS }),
+    ce(SummaryTable, { periods: periods, getRow: function (k) { return overall[k]; }, targetRules: targetRules, metricRows: METRIC_ROWS }),
+    ce('div', { style: { fontWeight: 700, fontSize: 14, marginTop: 32, marginBottom: 8 } }, '2. Campaigns — ' + month.format('MMMM YYYY')),
+    campaignRows ? ce(CampaignTable, { rows: campaignRows }) : null,
+    ce('div', { style: { fontWeight: 700, fontSize: 14, marginTop: 32, marginBottom: 8 } }, '3. Creatives — ' + month.format('MMMM YYYY')),
+    creativeRows ? ce(CreativeTable, { rows: creativeRows }) : null);
+};
+ctx.render(ce(Root));
