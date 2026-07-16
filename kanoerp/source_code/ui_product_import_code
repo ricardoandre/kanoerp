@@ -1,0 +1,330 @@
+// ui_product_import_code — bulk CREATE of new product rows via Excel-style paste grid.
+// Columns: Code, Main Fabric Code (must match an existing material_details.code).
+// This tool ONLY creates products. If a pasted code already exists in `product`,
+// that row is flagged as an error and is never touched/updated by this tool.
+// Input:  openModal({ ctx, onSaved })
+// Depends on: none.
+// NOTE: validated against targeted `WHERE code IN (...)` lookups scoped to the pasted
+// batch, not a full-table preload — product/material_details can be large tables.
+
+const { useState } = React;
+const { Modal } = antd;
+const ce = React.createElement;
+
+// ===== canonical SQL helper =====
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+
+function escapeSqlString(str) {
+  return String(str).replace(/'/g, "''");
+}
+
+async function fetchExistingCodes(ctx, table, codes) {
+  const unique = Array.from(new Set(codes.filter(Boolean)));
+  if (!unique.length) return [];
+  const inList = unique.map(function (c) { return "'" + escapeSqlString(c) + "'"; }).join(',');
+  const uid = 'pci_' + table + '_' + unique.length + '_' + Date.now();
+  const rows = await runSql(ctx, uid, "SELECT code FROM " + table + " WHERE code IN (" + inList + ")");
+  return rows.map(function (r) { return String(r.code || '').trim(); }).filter(Boolean);
+}
+
+// ===== paste grid =====
+function emptyRow() { return { code: '', fabric: '' }; }
+function makeInitialRows(n) {
+  const arr = [];
+  for (let i = 0; i < n; i++) arr.push(emptyRow());
+  return arr;
+}
+
+const STATUS_META = {
+  ready: { color: '#22c55e', label: 'Ready to create' },
+  product_exists: { color: '#ef4444', label: 'Product already exists' },
+  fabric_not_found: { color: '#ef4444', label: 'Fabric code not found' },
+};
+
+function deriveRow(row, existingProductSet, materialByLower) {
+  const code = row.code.trim();
+  const fabricRaw = row.fabric.trim();
+  if (!code) return null;
+
+  if (existingProductSet.has(code.toLowerCase())) {
+    return { code: code, status: 'product_exists' };
+  }
+  if (!fabricRaw) {
+    return { code: code, status: 'ready', fabricCode: null };
+  }
+  const material = materialByLower[fabricRaw.toLowerCase()];
+  if (!material) {
+    return { code: code, status: 'fabric_not_found', fabricInput: fabricRaw };
+  }
+  return { code: code, status: 'ready', fabricCode: material };
+}
+
+function PasteGrid(props) {
+  const rows = props.rows;
+  const setRows = props.setRows;
+  const derived = props.derived;
+
+  function updateCell(rowIndex, field, value) {
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      next[rowIndex][field] = value;
+      const last = next[next.length - 1];
+      if (last.code !== '' || last.fabric !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+
+  function handlePaste(e, rowIndex, colIndex) {
+    const text = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+    if (!text) return;
+    e.preventDefault();
+    const lines = text.replace(/\r/g, '').split('\n').filter(function (l, i, arr) { return !(i === arr.length - 1 && l === ''); });
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      lines.forEach(function (line, li) {
+        const cells = line.split('\t');
+        const targetRow = rowIndex + li;
+        while (next.length <= targetRow) next.push(emptyRow());
+        cells.forEach(function (cellVal, ci) {
+          const targetCol = colIndex + ci;
+          const val = cellVal.trim();
+          if (targetCol === 0) next[targetRow].code = val;
+          else if (targetCol === 1) next[targetRow].fabric = val;
+        });
+      });
+      const last = next[next.length - 1];
+      if (last.code !== '' || last.fabric !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+
+  function removeRow(rowIndex) {
+    setRows(function (prev) {
+      const next = prev.filter(function (_, i) { return i !== rowIndex; });
+      return next.length ? next : [emptyRow()];
+    });
+  }
+
+  return ce('div', { style: { border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
+    ce('div', { style: { display: 'grid', gridTemplateColumns: '32px 1.2fr 1.2fr 1.6fr 28px', background: '#fafafa', borderBottom: '2px solid #e8e8e8', fontSize: 11, fontWeight: 600, color: '#555' } },
+      ce('div', { style: { padding: '6px 4px' } }, '#'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Product Code'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Main Fabric Code'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Status'),
+      ce('div', null)
+    ),
+    ce('div', { style: { maxHeight: 420, overflowY: 'auto' } },
+      rows.map(function (row, i) {
+        const d = derived && derived[i];
+        const meta = d ? STATUS_META[d.status] : null;
+
+        return ce('div', {
+          key: i,
+          style: { display: 'grid', gridTemplateColumns: '32px 1.2fr 1.2fr 1.6fr 28px', borderBottom: '1px solid #f0f0f0', alignItems: 'flex-start' }
+        },
+          ce('div', { style: { padding: '6px 4px', fontSize: 11, color: '#aaa' } }, i + 1),
+          ce('input', {
+            value: row.code,
+            onChange: function (e) { updateCell(i, 'code', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 0); },
+            placeholder: 'e.g. O280067',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box' }
+          }),
+          ce('input', {
+            value: row.fabric,
+            onChange: function (e) { updateCell(i, 'fabric', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 1); },
+            placeholder: 'e.g. FAB-001',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box' }
+          }),
+          ce('div', { style: { padding: '6px 8px' } },
+            !d ? null :
+            d.status === 'ready'
+              ? ce('div', { style: { fontSize: 11 } },
+                  ce('span', { style: { fontWeight: 600, color: meta.color } }, meta.label),
+                  ce('div', { style: { color: '#94a3b8' } }, d.fabricCode ? ('fabric: ' + d.fabricCode) : 'no fabric set')
+                )
+              : d.status === 'fabric_not_found'
+                ? ce('div', { style: { fontSize: 11 } },
+                    ce('span', { style: { fontWeight: 600, color: meta.color } }, meta.label),
+                    ce('div', { style: { color: '#94a3b8' } }, '"' + d.fabricInput + '" not in material_details')
+                  )
+                : ce('span', { style: { fontSize: 11, color: meta ? meta.color : '#ccc' } }, meta ? meta.label : '')
+          ),
+          (row.code !== '' || row.fabric !== '')
+            ? ce('button', { onClick: function () { removeRow(i); }, style: { border: 'none', background: 'none', color: '#ccc', cursor: 'pointer', fontSize: 11, marginTop: 6 } }, '✕')
+            : ce('div', null)
+        );
+      })
+    )
+  );
+}
+
+function ValidationSummary(props) {
+  const counts = props.counts;
+  const errorCount = counts.product_exists + counts.fabric_not_found;
+  const bg = errorCount > 0 ? '#fef2f2' : '#f0fdf4';
+  const border = errorCount > 0 ? '#fca5a5' : '#86efac';
+  const titleColor = errorCount > 0 ? '#b91c1c' : '#166534';
+
+  const parts = [];
+  if (counts.ready) parts.push(counts.ready + ' ready to create');
+  if (counts.product_exists) parts.push(counts.product_exists + ' already exist');
+  if (counts.fabric_not_found) parts.push(counts.fabric_not_found + ' fabric not found');
+
+  return ce('div', { style: { background: bg, border: '1px solid ' + border, borderRadius: 4, padding: '8px 12px', marginBottom: 10, fontSize: 12 } },
+    ce('div', { style: { fontWeight: 700, color: titleColor, marginBottom: 2 } },
+      errorCount > 0 ? (errorCount + ' row(s) need attention') : 'All rows ready'
+    ),
+    ce('div', { style: { color: '#64748b' } }, parts.join(' · '))
+  );
+}
+
+function ImportContent(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+
+  const [rows, setRows] = useState(makeInitialRows(15));
+  const [derived, setDerived] = useState(null);
+  const [validating, setValidating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [validateErr, setValidateErr] = useState(null);
+
+  function handleClose() { Modal.destroyAll(); }
+
+  function activeRows() {
+    return rows.filter(function (r) { return r.code.trim() !== '' || r.fabric.trim() !== ''; });
+  }
+
+  async function handleValidate() {
+    const active = activeRows();
+    if (!active.length) { ctx.message.warning('Paste or enter at least one row.'); return; }
+    setValidating(true);
+    setValidateErr(null);
+    try {
+      const codes = rows.map(function (r) { return r.code.trim(); }).filter(Boolean);
+      const fabricInputs = rows.map(function (r) { return r.fabric.trim(); }).filter(Boolean);
+
+      const [existingProductCodes, existingMaterialCodes] = await Promise.all([
+        fetchExistingCodes(ctx, 'product', codes),
+        fetchExistingCodes(ctx, 'material_details', fabricInputs),
+      ]);
+
+      const existingProductSet = new Set(existingProductCodes.map(function (c) { return c.toLowerCase(); }));
+      const materialByLower = {};
+      existingMaterialCodes.forEach(function (c) { materialByLower[c.toLowerCase()] = c; });
+
+      const next = rows.map(function (row) { return deriveRow(row, existingProductSet, materialByLower); });
+      setDerived(next);
+    } catch (e) {
+      setValidateErr((e && e.message) || 'Validation failed');
+    }
+    setValidating(false);
+  }
+
+  const counts = { ready: 0, product_exists: 0, fabric_not_found: 0 };
+  if (derived) derived.forEach(function (d) { if (d && counts.hasOwnProperty(d.status)) counts[d.status]++; });
+
+  function buildSaveList() {
+    if (!derived) return [];
+    return derived.filter(function (d) { return d && d.status === 'ready'; });
+  }
+
+  async function handleSave() {
+    const toSave = buildSaveList();
+    if (!toSave.length) { ctx.message.warning('Validate first — no rows ready to create.'); return; }
+
+    setSaving(true);
+    let ok = 0;
+    const failed = [];
+    try {
+      for (const item of toSave) {
+        try {
+          const values = { code: item.code };
+          if (item.fabricCode) values.main_fabric = { code: item.fabricCode };
+          await ctx.api.resource('product').create({ values: values });
+          ok++;
+        } catch (rowErr) {
+          console.error('Create error:', item.code, rowErr);
+          failed.push(item.code);
+        }
+      }
+
+      Modal.destroyAll();
+      ctx.notification.success({
+        message: 'Product Import Complete',
+        description: ok + ' product(s) created' + (failed.length ? ('. ' + failed.length + ' failed: ' + failed.join(', ')) : '.'),
+        duration: 8,
+      });
+      if (onSaved) onSaved();
+    } catch (e) {
+      console.error('Save error:', e);
+      setSaving(false);
+      ctx.message.error('Failed to save: ' + (e.message || 'unknown error'));
+    }
+  }
+
+  const readyCount = buildSaveList().length;
+  const activeCount = activeRows().length;
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+
+    ce('div', { style: { marginBottom: 8, fontSize: 11, color: '#94a3b8' } },
+      'Paste from Excel: two columns (Product Code, Main Fabric Code). Fabric Code is optional — leave it blank to create the product without one. If provided, it must match an existing material_details.code exactly. This tool only creates new products — codes that already exist will be flagged as errors, not updated.'
+    ),
+
+    ce(PasteGrid, {
+      rows: rows,
+      setRows: function (fn) { setDerived(null); setRows(fn); },
+      derived: derived,
+    }),
+
+    validateErr ? ce('div', { style: { fontSize: 12, color: '#dc2626', marginBottom: 10 } }, validateErr) : null,
+    derived ? ce(ValidationSummary, { counts: counts }) : null,
+
+    ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '12px 0' } },
+      ce('span', { style: { fontSize: 12, color: '#888' } },
+        derived ? (readyCount + ' of ' + activeCount + ' row(s) ready') : (activeCount + ' row(s) entered')
+      ),
+      ce('button', {
+        onClick: handleValidate, disabled: validating || !activeCount,
+        style: { padding: '5px 14px', fontSize: 12, cursor: (validating || !activeCount) ? 'not-allowed' : 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }
+      }, validating ? 'Validating…' : 'Validate')
+    ),
+
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, borderTop: '1px solid #eee', paddingTop: 12 } },
+      ce('button', { onClick: handleClose, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Cancel'),
+      ce('button', {
+        onClick: handleSave, disabled: saving || !derived || !readyCount,
+        style: { padding: '5px 16px', fontSize: 12, cursor: (saving || !derived || !readyCount) ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 4, fontWeight: 600, color: '#fff', background: (saving || !derived || !readyCount) ? '#d9d9d9' : '#22c55e' }
+      }, saving ? 'Saving…' : ('Create ' + readyCount + ' Product(s)'))
+    ),
+
+    ce('div', { style: { height: 20 } })
+  );
+}
+
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+
+  Modal.confirm({
+    title: 'Import Product Codes',
+    width: 700,
+    icon: null,
+    content: ce(ImportContent, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal };
