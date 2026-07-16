@@ -1,0 +1,206 @@
+// ui_production_planning_report — shared UI for all 3 Production Planning
+// Report call sites.
+// EXPORTS: createComponent(ctx, { mode: 'week'|'date'|'matrix' }) -> Promise<Component>
+//   Caller must await createComponent, then ctx.render(React.createElement(Comp)).
+// Depends on: fn_production_planning_data.
+
+const ce = React.createElement;
+const { useState, useEffect } = React;
+const { DatePicker, Select, Modal } = antd;
+
+const _codeCache = {};
+function loadCode(ctx, name) {
+  if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
+  const uid = 'code_' + name;
+  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
+    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(rows => {
+      const src = (rows && rows[0] && rows[0].code) || '';
+      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+      return _codeCache[name];
+    });
+}
+
+function Style() {
+  const css =
+    '.ppr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-top:16px;align-items:start;}' +
+    '.ppr-card{border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:#fff;}' +
+    '.ppr-head{padding:8px 12px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:14px;color:#1f2937;}' +
+    '.ppr-body{padding:4px 12px 8px;}' +
+    '.ppr-bucket{padding:8px 0;border-top:1px solid #f1f5f9;}' +
+    '.ppr-bucket:first-child{border-top:none;}' +
+    '.ppr-bucket-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:3px;}' +
+    '.ppr-bucket-label{font-weight:600;font-size:13px;color:#334155;flex:1;}' +
+    '.ppr-bucket-total{font-weight:600;font-size:13px;color:#475569;white-space:nowrap;}' +
+    '.ppr-model{font-size:12px;color:#64748b;padding-left:10px;line-height:1.5;}' +
+    '.ppr-filterbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;}' +
+    '.ppr-filterlabel{font-weight:500;white-space:nowrap;}' +
+    '.ppr-status{margin:4px 0;padding:8px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#4b5563;}' +
+    '.ppr-matrix-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:16px;border:1px solid #e5e7eb;border-radius:8px;}' +
+    '.ppr-matrix-table{border-collapse:separate;border-spacing:0;width:auto;min-width:100%;}' +
+    '.ppr-matrix-table th,.ppr-matrix-table td{border-bottom:1px solid #e5e7eb;border-right:1px solid #e5e7eb;padding:10px;vertical-align:top;text-align:left;}' +
+    '.ppr-matrix-table tr:last-child td{border-bottom:none;}' +
+    '.ppr-matrix-table th:last-child,.ppr-matrix-table td:last-child{border-right:none;}' +
+    '.ppr-matrix-table th{background:#fafafa;font-weight:600;white-space:nowrap;}' +
+    '.ppr-matrix-table tbody tr:nth-child(even){background:#fbfcfd;}' +
+    '.ppr-matrix-data{min-width:110px;}' +
+   '.ppr-matrix-sticky{position:sticky;left:0;z-index:1;background:#fff;box-shadow:2px 0 0 #e5e7eb;white-space:nowrap;vertical-align:top;}' +
+    '.ppr-matrix-table thead .ppr-matrix-sticky{z-index:2;background:#fafafa;}' +
+    '.ppr-matrix-total{font-weight:700;font-size:14px;color:#1f2937;}' +
+   '.ppr-matrix-empty{color:#cbd5e1;}' +
+   '.ppr-matrix-data{min-width:190px;vertical-align:top;}' +
+   '.ppr-matrix-modellist{margin-top:4px;max-height:220px;overflow-y:auto;padding-right:2px;}' +
+   '.ppr-matrix-modelrow{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#475569;padding:2px 0;border-top:1px solid #f1f5f9;}' +
+   '.ppr-matrix-modelrow:first-child{border-top:none;}' +
+   '.ppr-matrix-modelname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+   '.ppr-matrix-modelqty{font-weight:600;white-space:nowrap;}' +
+    '@media (max-width:640px){' +
+      '.ppr-grid{grid-template-columns:1fr;gap:10px;}' +
+      '.ppr-matrix-table th,.ppr-matrix-table td{padding:7px;font-size:12px;}' +
+      '.ppr-matrix-data{min-width:90px;}' +
+    '}';
+  return ce('style', null, css);
+}
+
+function FilterBar(props) {
+  return ce('div', null,
+    ce('div', { className: 'ppr-filterbar' },
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        ce('div', { className: 'ppr-filterlabel' }, 'Start After:'),
+        ce(DatePicker, { onChange: props.onDateChange, defaultValue: dayjs(props.today) })
+      ),
+      ce('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        ce('div', { className: 'ppr-filterlabel' }, 'Konveksi:'),
+        ce(Select, {
+          allowClear: true,
+          placeholder: 'All konveksi',
+          style: { minWidth: 180 },
+          value: props.selectedKonveksi,
+          onChange: props.onKonveksiChange,
+          options: props.konveksiList.map(k => ({ value: k.code, label: k.name }))
+        })
+      )
+    ),
+    ce('div', { className: 'ppr-status' }, props.statusText)
+  );
+}
+
+function KonveksiCard(props) {
+  const group = props.group;
+  return ce('div', { className: 'ppr-card' },
+    ce('div', { className: 'ppr-head' }, group.konveksi),
+    ce('div', { className: 'ppr-body' },
+      group.buckets.map((b, j) =>
+        ce('div', { key: j, className: 'ppr-bucket' },
+          ce('div', { className: 'ppr-bucket-row' },
+            ce('span', { className: 'ppr-bucket-label' }, b.label),
+            ce('span', { className: 'ppr-bucket-total' }, 'Total ' + b.total)
+          ),
+          b.models.map((m, k) => ce('div', { key: k, className: 'ppr-model' }, m.model + ' (' + m.qty + ')'))
+        )
+      )
+    )
+  );
+}
+
+function MatrixTable(props) {
+  const view = props.view;
+
+  return ce('div', { className: 'ppr-matrix-wrap' },
+    ce('table', { className: 'ppr-matrix-table' },
+      ce('thead', null,
+        ce('tr', null,
+          ce('th', { className: 'ppr-matrix-sticky' }, 'Week'),
+          view.konveksiList.map((k, i) => ce('th', { key: i, className: 'ppr-matrix-data' }, k))
+        )
+      ),
+      ce('tbody', null,
+        view.bucketList.map((bucket, i) =>
+          ce('tr', { key: i },
+            ce('td', { className: 'ppr-matrix-sticky' }, bucket.label),
+            view.konveksiList.map((konv, j) => {
+              const cell = view.getCell(bucket.key, konv);
+              if (!cell || !cell.total) {
+                return ce('td', { key: j, className: 'ppr-matrix-data ppr-matrix-empty' }, '–');
+              }
+              return ce('td', { key: j, className: 'ppr-matrix-data' },
+                ce('div', { className: 'ppr-matrix-total' }, 'Total ' + cell.total),
+                ce('div', { className: 'ppr-matrix-modellist' },
+                  cell.models.map((m, k) =>
+                    ce('div', { key: k, className: 'ppr-matrix-modelrow' },
+                      ce('span', { className: 'ppr-matrix-modelname' }, m.model),
+                      ce('span', { className: 'ppr-matrix-modelqty' }, m.qty)
+                    )
+                  )
+                )
+              );
+            })
+          )
+        )
+      )
+    )
+  );
+}
+
+async function createComponent(ctx, opts) {
+  const mode = (opts && opts.mode) || 'date'; // 'week' | 'date' | 'matrix'
+  const bucketBy = (mode === 'date') ? 'date' : 'week';
+  const fn = await loadCode(ctx, 'fn_production_planning_data');
+
+  return function Comp() {
+    const today = new Date().toISOString().split('T')[0];
+    const dR = useState([]); const rawRows = dR[0]; const setRawRows = dR[1];
+    const dK = useState([]); const konveksiList = dK[0]; const setKonveksiList = dK[1];
+    const dSel = useState(null); const selectedKonveksi = dSel[0]; const setSelectedKonveksi = dSel[1];
+    const dF = useState({ start: today }); const filter = dF[0]; const setFilter = dF[1];
+    const dT = useState('Filter est production start from ' + today); const statusText = dT[0]; const setStatusText = dT[1];
+
+    useEffect(() => {
+      fn.fetchKonveksiList(ctx).then(res => setKonveksiList(res || []));
+    }, []);
+
+    useEffect(() => {
+      fn.fetchRawRows(ctx, filter).then(res => setRawRows(res || []));
+    }, [filter]);
+
+    const handleDateChange = (date) => {
+      if (!date) { setStatusText('No date selected'); setFilter({ start: null, konveksiCode: selectedKonveksi }); return; }
+      const start = date.format('YYYY-MM-DD');
+      setStatusText('Filter est production start from ' + start);
+      setFilter({ start, konveksiCode: selectedKonveksi });
+    };
+
+    const handleKonveksiChange = (value) => {
+      setSelectedKonveksi(value || null);
+      setFilter(prev => ({ start: prev ? prev.start : null, konveksiCode: value || null }));
+    };
+
+    const groups = fn.buildGroups(rawRows, bucketBy);
+    const hasData = rawRows && rawRows.length > 0;
+    const konvName = selectedKonveksi
+      ? (konveksiList.find(k => k.code === selectedKonveksi) || {}).name
+      : null;
+
+    return ce('div', { style: { padding: 12, background: 'white', borderRadius: 8 } },
+      ce(Style),
+      ce('div', { style: { fontSize: 16, fontWeight: 600, marginBottom: 12 } }, 'Production Planning Report'),
+      ce(FilterBar, {
+        today,
+        statusText: statusText + (konvName ? ' \u00B7 Konveksi: ' + konvName : ' \u00B7 All konveksi'),
+        selectedKonveksi,
+        konveksiList,
+        onDateChange: handleDateChange,
+        onKonveksiChange: handleKonveksiChange
+      }),
+      !hasData
+        ? ce('div', { style: { marginTop: 16, color: '#9ca3af' } }, 'No data')
+        : (mode === 'matrix'
+            ? ce(MatrixTable, { view: fn.buildMatrixFromGroups(groups), mode })
+            : ce('div', { className: 'ppr-grid' }, groups.map((g, i) => ce(KonveksiCard, { key: i, group: g })))
+          ),
+      ce('div', { style: { height: 40 } })
+    );
+  };
+}
+
+return { createComponent };
