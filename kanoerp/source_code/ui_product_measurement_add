@@ -1,0 +1,329 @@
+// ui_product_measurement — New Product Measurement modal (spreadsheet-style entry).
+//
+// Stored as a `source_code` row named 'ui_product_measurement'.
+// Called from a JSAction (e.g. act_product_measurement) — NOT a jblock — so
+// this uses the proven Modal.confirm() pattern (see ui_material_out), not
+// Drawer/ctx.render, which needs a page host a JSAction doesn't have.
+//
+// EXPORTS (contract):
+//   openModal({ ctx, onSaved })
+//     Opens instantly; content fetches its own data. Flow: enter a name ->
+//     pick 1+ products -> fetches every product_variant for those products
+//     (joined to sku_option for the size label) and requires the SAME set of
+//     sizes across all selected products (otherwise blocks with an explicit
+//     mismatch report). Once sizes match, renders a spreadsheet-style grid —
+//     one row per size, one column per product_measurement numeric field.
+//     Save creates ONE product_measurement row per size and links it
+//     (fk_product_measurement_id) to the matching product_variant row of
+//     EVERY selected product for that size — sizes are shared across
+//     products by design, not duplicated per product.
+//
+// ctx is threaded as an explicit parameter throughout (never captured at
+// compile time), so this module stays reusable across hosts (JSAction today,
+// any future jblock/list-engine "new" wiring later) — per architecture rule.
+//
+// Depends on: none.
+const { useState, useEffect, useMemo } = React;
+const { Modal, Select, Input, InputNumber, Spin, Alert, Table, Checkbox } = antd;
+const ce = React.createElement;
+
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+function esc(s) { return String(s == null ? '' : s).replace(/'/g, "''"); }
+const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
+
+// ── belongsTo relation resolution (same pattern as ui_production_edit) ──
+const _relsCache = {};
+function getRels(ctx, collection) {
+  if (_relsCache[collection]) return Promise.resolve(_relsCache[collection]);
+  return runSql(ctx, 'pms_rels_' + collection,
+    "SELECT name, CAST(options AS CHAR) AS options FROM fields WHERE collection_name='" + collection + "' AND type='belongsTo'"
+  ).then(function(rows) {
+    const byFk = {};
+    (rows || []).forEach(function(r) {
+      let opt = {}; try { opt = JSON.parse(r.options || '{}'); } catch (e) {}
+      if (opt.foreignKey) byFk[opt.foreignKey] = { field: r.name, targetKey: opt.targetKey || 'id' };
+    });
+    _relsCache[collection] = byFk;
+    return byFk;
+  }).catch(function() { _relsCache[collection] = {}; return {}; });
+}
+function assocFragment(rels, fkColumn, value) {
+  const rel = rels[fkColumn];
+  const out = {};
+  if (rel && value != null) { out[rel.field] = {}; out[rel.field][rel.targetKey] = value; }
+  else { out[fkColumn] = value; }
+  return out;
+}
+
+function fetchProductOptions(ctx) {
+  return runSql(ctx, 'pms_opt_prod', "SELECT code, name FROM product ORDER BY name ASC");
+}
+
+function fetchVariantsForProducts(ctx, codes) {
+  if (!codes.length) return Promise.resolve([]);
+  const inList = codes.map(c => "'" + esc(c) + "'").join(',');
+  return runSql(ctx, 'pms_variants',
+    "SELECT pv.id AS id, pv.fk_product_code AS product_code, pv.fk_sku_option_id AS sku_id, " +
+    "  sku_option.display AS sku_display, sku_option.sort AS sku_sort, pv.fk_product_measurement_id AS measurement_id " +
+    "FROM product_variant pv JOIN sku_option ON pv.fk_sku_option_id = sku_option.id " +
+    "WHERE pv.fk_product_code IN (" + inList + ") ORDER BY sku_option.sort ASC");
+}
+
+// ── measurement fields (schema columns) — order + label matches the size chart ──
+const MEASURE_FIELDS = [
+  { key: 'bust',              label: 'Lr. Dada (Bust)' },
+  { key: 'shoulder',          label: 'Bahu (Shoulder)' },
+  { key: 'waist',             label: 'Ling. Pinggang (Waist)' },
+  { key: 'hips',              label: 'Ling. Pinggul (Hips)' },
+  { key: 'length',            label: 'Panjang (Length)' },
+  { key: 'length2',           label: 'Panjang2 (Length 2)' },
+  { key: 'bottom_hole',       label: 'Ling. Bawah (Bottom)' },
+  { key: 'neck',              label: 'Ling. Leher (Neck)' },
+  { key: 'arm_hole',          label: 'Ling. Ketiak (Arm Hole)' },
+  { key: 'bottom_sleeve',     label: 'Lr Lengan (Btm Sleeve)' },
+  { key: 'mid_sleeve',        label: 'Pangkal Lengan (Mid Sleeve)' },
+  { key: 'sleeve_length',     label: 'Pj Lengan (Sleeve Len)' },
+  { key: 'thigh',             label: 'Lr Paha (Thigh)' },
+  { key: 'est_main_fabric',   label: 'Est Bahan (Fabric)' },
+  { key: 'est_furing',        label: 'Est Furing' },
+  { key: 'est_main_fabric_2', label: 'Est Bahan 2' },
+];
+
+// Columns in paste order — must match the size chart's left-to-right column
+// order so a copy from Excel lands in the right fields. 'remarks' (Notes) is
+// last and text, not numeric.
+const PASTE_COLUMNS = MEASURE_FIELDS.concat([{ key: 'remarks', label: 'Notes', isText: true }]);
+
+// ── same-variant validation across selected products ──
+function checkVariantMatch(rows) {
+  const byProduct = {};
+  rows.forEach(r => { (byProduct[r.product_code] = byProduct[r.product_code] || []).push(r); });
+  const productCodes = Object.keys(byProduct);
+  const norm = arr => arr.map(x => x.sku_id).slice().sort((a, b) => a - b).join(',');
+  if (productCodes.length < 2) return { ok: true, byProduct, productCodes };
+  const base = norm(byProduct[productCodes[0]]);
+  const mismatched = productCodes.filter(pc => norm(byProduct[pc]) !== base);
+  return { ok: mismatched.length === 0, byProduct, productCodes, mismatched };
+}
+
+const PMS_CSS =
+  ".pms-grid-wrap .ant-table-thead>tr>th{font-size:10px;white-space:normal;line-height:1.25;padding:6px 6px;}" +
+  ".pms-grid-wrap .ant-table-tbody>tr>td{padding:4px 6px;}";
+const PmsStyles = () => ce('style', null, PMS_CSS);
+
+async function createProductMeasurement(ctx, form) {
+  const pmRels = await getRels(ctx, 'product_variant');
+  const createdIds = [];
+  for (const row of form.gridRows) {
+    const values = Object.assign({ name: form.name, remarks: row.remarks || '' }, row.values);
+    const res = await ctx.api.resource('product_measurement').create({ values });
+    const newId = (res && res.data && res.data.data && res.data.data.id) || (res && res.data && res.data.id);
+    if (!newId) throw new Error('Failed to create measurement for ' + row.sku_display);
+    const pvIds = form.variantRows.filter(v => v.sku_id === row.sku_id).map(v => v.id);
+    for (const pvId of pvIds) {
+      const v = {};
+      Object.assign(v, assocFragment(pmRels, 'fk_product_measurement_id', newId));
+      await ctx.api.resource('product_variant').update({ filterByTk: pvId, values: v });
+    }
+    createdIds.push(newId);
+  }
+  return createdIds;
+}
+
+// =====================================================
+// MODAL CONTENT (mounted inside Modal.confirm — manages its own state,
+// closes itself via Modal.destroyAll(), same convention as ui_material_out)
+// =====================================================
+function ProductMeasurementContent(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+
+  const sName = useState('');       const name = sName[0];           const setName = sName[1];
+  const sOpts = useState([]);       const prodOpts = sOpts[0];       const setProdOpts = sOpts[1];
+  const sSel = useState([]);        const selected = sSel[0];        const setSelected = sSel[1];
+  const sLoadingV = useState(false);const loadingVariants = sLoadingV[0]; const setLoadingV = sLoadingV[1];
+  const sVariants = useState([]);   const variantRows = sVariants[0];const setVariants = sVariants[1];
+  const sGrid = useState([]);       const gridRows = sGrid[0];       const setGridRows = sGrid[1];
+  const sOverwrite = useState(false); const overwriteOk = sOverwrite[0]; const setOverwriteOk = sOverwrite[1];
+  const sBusy = useState(false);    const busy = sBusy[0];           const setBusy = sBusy[1];
+  const sActive = useState(null);   const activeCell = sActive[0];   const setActiveCell = sActive[1]; // {skuId, colKey} — paste anchor
+
+  useEffect(function() { fetchProductOptions(ctx).then(setProdOpts).catch(() => {}); }, []);
+
+  useEffect(function() {
+    if (!selected.length) { setVariants([]); setGridRows([]); return; }
+    setLoadingV(true);
+    fetchVariantsForProducts(ctx, selected).then(function(rows) {
+      setVariants(rows);
+      const match = checkVariantMatch(rows);
+      if (match.ok) {
+        const seen = {}; const sizes = [];
+        rows.forEach(r => { if (!seen[r.sku_id]) { seen[r.sku_id] = 1; sizes.push(r); } });
+        sizes.sort((a, b) => a.sku_sort - b.sku_sort);
+        setGridRows(sizes.map(s => ({
+          sku_id: s.sku_id, sku_display: s.sku_display, remarks: '',
+          values: MEASURE_FIELDS.reduce((acc, f) => { acc[f.key] = null; return acc; }, {}),
+        })));
+      } else {
+        setGridRows([]);
+      }
+    }).catch(function(e) { ctx.message.error('Failed to load variants: ' + ((e && e.message) || e)); })
+      .finally(function() { setLoadingV(false); });
+  }, [selected]);
+
+  const match = useMemo(() => checkVariantMatch(variantRows), [variantRows]);
+  const overwriteCount = useMemo(() => variantRows.filter(v => v.measurement_id != null).length, [variantRows]);
+
+  function setCell(skuId, key, val) {
+    setGridRows(prev => prev.map(r => r.sku_id === skuId ? Object.assign({}, r, { values: Object.assign({}, r.values, { [key]: val }) }) : r));
+  }
+  function setRemark(skuId, val) {
+    setGridRows(prev => prev.map(r => r.sku_id === skuId ? Object.assign({}, r, { remarks: val }) : r));
+  }
+  function handleClose() { Modal.destroyAll(); }
+
+  // ── Excel/xls paste: click a cell to anchor, then Ctrl+V. Fills right/down
+  // from the anchor using PASTE_COLUMNS' order — matches the size chart's
+  // column order (size rows x measurement columns), same shape as pasting
+  // into Excel itself. Blank pasted cells leave the existing value untouched. ──
+  function applyPastedGrid(text, anchorRowIdx, anchorColIdx) {
+    const lines = text.replace(/\r/g, '').split('\n');
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (!lines.length) return;
+    setGridRows(prev => {
+      const next = prev.map(r => Object.assign({}, r, { values: Object.assign({}, r.values) }));
+      lines.forEach(function(line, r) {
+        const rowIdx = anchorRowIdx + r;
+        if (rowIdx < 0 || rowIdx >= next.length) return;
+        const cells = line.split('\t');
+        cells.forEach(function(cell, c) {
+          const colIdx = anchorColIdx + c;
+          if (colIdx < 0 || colIdx >= PASTE_COLUMNS.length) return;
+          const trimmed = cell.trim();
+          if (trimmed === '') return;
+          const col = PASTE_COLUMNS[colIdx];
+          if (col.isText) { next[rowIdx].remarks = trimmed; return; }
+          const num = parseFloat(trimmed.replace(',', '.'));
+          if (!isNaN(num)) next[rowIdx].values[col.key] = num;
+        });
+      });
+      return next;
+    });
+  }
+  function handleGridPaste(e) {
+    if (!activeCell) return; // no cell focused yet — let the browser do its default thing
+    const text = e.clipboardData && e.clipboardData.getData ? e.clipboardData.getData('text/plain') : '';
+    if (!text) return;
+    e.preventDefault();
+    const rowIdx = gridRows.findIndex(r => r.sku_id === activeCell.skuId);
+    const colIdx = PASTE_COLUMNS.findIndex(f => f.key === activeCell.colKey);
+    if (rowIdx === -1 || colIdx === -1) return;
+    applyPastedGrid(text, rowIdx, colIdx);
+    ctx.message.success('Pasted.');
+  }
+
+  async function handleSave() {
+    if (!name || !name.trim()) return ctx.message.warning('Enter a name.');
+    if (!selected.length) return ctx.message.warning('Select at least one product.');
+    if (!match.ok) return ctx.message.warning('Selected products have different variants — fix the selection first.');
+    if (!gridRows.length) return ctx.message.warning('No sizes to fill in.');
+    if (overwriteCount > 0 && !overwriteOk) return ctx.message.warning('Confirm the overwrite checkbox — some variants already have a measurement linked.');
+    setBusy(true);
+    try {
+      const ids = await createProductMeasurement(ctx, { name: name.trim(), gridRows, variantRows });
+      Modal.destroyAll();
+      ctx.notification.success({
+        message: 'Product Measurement Created',
+        description: 'Created ' + ids.length + ' measurement row(s), linked to ' + variantRows.length + ' variant(s) across ' + selected.length + ' product(s).',
+        duration: 6,
+      });
+      if (onSaved) onSaved();
+    } catch (e) {
+      setBusy(false);
+      ctx.message.error('Save failed: ' + ((e && e.message) || e));
+    }
+  }
+
+  const productLabel = code => { const p = prodOpts.find(x => x.code === code); return (p && p.name) ? (code + ' — ' + p.name) : code; };
+
+  const mismatchBody = !match.ok ? ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+    ce('div', null, "Selected products don't share the same set of sizes:"),
+    match.mismatched.map(pc => {
+      const sizes = (match.byProduct[pc] || []).slice().sort((a, b) => a.sku_sort - b.sku_sort).map(v => v.sku_display).join(', ');
+      return ce('div', { key: pc, style: { fontSize: 12 } }, ce('b', null, productLabel(pc)), ': ', sizes || '—');
+    }),
+    ce('div', { style: { fontSize: 12, color: '#6b7280' } }, 'Deselect the odd one(s) out, or align their sizes in Production Variant first.')
+  ) : null;
+
+  const gridColumns = [
+    { title: 'Size', dataIndex: 'sku_display', key: 'sku_display', fixed: 'left', width: 70,
+      render: v => ce('span', { style: { fontWeight: 700 } }, v) },
+  ].concat(MEASURE_FIELDS.map(f => ({
+    title: f.label, dataIndex: ['values', f.key], key: f.key, width: 96,
+    render: (v, record) => ce(InputNumber, {
+      size: 'small', value: record.values[f.key], onChange: val => setCell(record.sku_id, f.key, val), style: { width: '100%' }, min: 0,
+      onFocus: () => setActiveCell({ skuId: record.sku_id, colKey: f.key }),
+    }),
+  }))).concat([
+    { title: 'Notes', dataIndex: 'remarks', key: 'remarks', width: 140,
+      render: (v, record) => ce(Input, {
+        size: 'small', value: record.remarks, onChange: e => setRemark(record.sku_id, e.target.value), placeholder: 'e.g. rib 21cm/5 baju',
+        onFocus: () => setActiveCell({ skuId: record.sku_id, colKey: 'remarks' }),
+      }) },
+  ]);
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+    ce(PmsStyles, null),
+    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+      ce('div', null, fieldLabel('Name'), ce(Input, { value: name, onChange: e => setName(e.target.value), placeholder: 'e.g. O420001/02/03/04' })),
+      ce('div', null, fieldLabel('Products'),
+        ce(Select, { mode: 'multiple', showSearch: true, value: selected, onChange: setSelected, style: { width: '100%' },
+          placeholder: 'Select 1 or more products', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()),
+          options: prodOpts.map(p => ({ value: p.code, label: p.code + ' — ' + (p.name || '') })) })),
+
+      loadingVariants ? ce('div', { style: { textAlign: 'center', padding: 20 } }, ce(Spin, null)) : null,
+
+      (!loadingVariants && !match.ok) ? ce(Alert, { type: 'error', showIcon: true, message: 'Variant mismatch', description: mismatchBody }) : null,
+
+      (!loadingVariants && overwriteCount > 0) ? ce(Alert, { type: 'warning', showIcon: true,
+        message: overwriteCount + ' selected variant(s) already have a measurement linked.',
+        description: ce(Checkbox, { checked: overwriteOk, onChange: e => setOverwriteOk(e.target.checked) }, 'I understand saving will overwrite those links.') }) : null,
+
+      (!loadingVariants && match.ok && gridRows.length > 0) ? ce('div', { className: 'pms-grid-wrap', onPaste: handleGridPaste },
+        fieldLabel('Measurements (per size)'),
+        ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 6 } }, 'Tip: click a cell, then paste (Ctrl/Cmd+V) a block copied from Excel — it fills across sizes and columns from that cell, in the same left-to-right order as the columns below.'),
+        ce(Table, { size: 'small', dataSource: gridRows, columns: gridColumns, rowKey: 'sku_id', pagination: false, scroll: { x: 1700 } })
+      ) : null,
+
+      ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 6, borderTop: '1px solid #f1f5f9' } },
+        ce('button', { onClick: handleClose, style: { padding: '6px 16px', fontSize: 13, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 6, background: '#fff' } }, 'Cancel'),
+        ce('button', { onClick: handleSave, disabled: busy, style: { padding: '6px 20px', fontSize: 13, fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 6, color: '#fff', background: busy ? '#c7c9d9' : '#4f46e5' } }, busy ? 'Saving…' : 'Save'))
+    )
+  );
+}
+
+// ===== entry point: opens modal immediately, content fetches inside =====
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+
+  Modal.confirm({
+    title: 'New Product Measurement',
+    width: 1040,
+    icon: null,
+    content: ce(ProductMeasurementContent, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal };
