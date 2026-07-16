@@ -1,0 +1,467 @@
+var React = ctx.React;
+var useState = React.useState;
+var useEffect = React.useEffect;
+var useRef = React.useRef;
+var useCallback = React.useCallback;
+var createElement = React.createElement;
+
+var { Select, Modal, Input } = ctx.antd;
+
+function getSql() { return ctx.sql; }
+
+var CONFIG = {
+  uid_canvas:  'canvas_list',
+  uid_samples: 'canvas_samples',
+  uid_cols:    'canvas_collist',
+};
+
+function runSql(uid, sql) {
+  var s = getSql();
+  if (!s) return Promise.resolve([]);
+  return s.save({ uid: uid, sql: sql, dataSourceKey: 'main' })
+    .catch(function(){})
+    .then(function() {
+      return s.runById(uid, { type: 'selectRows', dataSourceKey: 'main' });
+    })
+    .then(function(r) { return r || []; });
+}
+
+function execSql(uid, sql) {
+  var s = getSql();
+  if (!s) return Promise.resolve(null);
+  return s.save({ uid: uid, sql: sql, dataSourceKey: 'main' })
+    .catch(function(){})
+    .then(function() {
+      return s.runById(uid, { type: 'exec', dataSourceKey: 'main' });
+    });
+}
+
+function buildImgUrl(filename, url) {
+  if (url) return url;
+  if (filename) return window.location.origin + '/storage/uploads/' + filename;
+  return '';
+}
+
+function saveLayout(canvasId, items) {
+  var val = JSON.stringify(items.map(function(it) {
+    return { id: it.id, x: it.x, y: it.y, w: it.w, h: it.h, z: it.z || 1 };
+  }));
+  var escaped = val.replace(/'/g, "''");
+  return execSql('canvas_save_' + canvasId,
+    "UPDATE canvas SET layout = '" + escaped + "' WHERE id = " + canvasId
+  );
+}
+
+function loadLayout(canvasId) {
+  return runSql('canvas_load_' + canvasId,
+    "SELECT CAST(layout AS CHAR) AS layout FROM canvas WHERE id = " + canvasId
+  ).then(function(rows) {
+    if (!rows || !rows.length || !rows[0].layout) return null;
+    try { return JSON.parse(rows[0].layout); } catch(e) { return null; }
+  });
+}
+
+// Canvas dimensions
+var CANVAS_W = 4000;
+var CANVAS_H = 2000;
+var TRAY_X   = 20; // tray column on the LEFT
+var TRAY_COL_W = 240; // width reserved for tray
+var THUMB_W  = 200;
+var THUMB_H  = 250;
+
+var _zCounter = 10;
+function nextZ() { return ++_zCounter; }
+
+// ── IMAGE TILE (drag + resize on canvas) ──────────────────────
+var ImageTile = function(props) {
+  var item      = props.item;
+  var onUpdate  = props.onUpdate;
+  var onFocus   = props.onFocus;
+  var isFocused = props.isFocused;
+  var dragging  = useRef(false);
+  var resizing  = useRef(false);
+  var start     = useRef({});
+
+  var onDragDown = function(e) {
+    if (e.target.dataset.resize) return;
+    e.stopPropagation();
+    e.preventDefault();
+    dragging.current = true;
+    var newZ = nextZ();
+    start.current = { mx: e.clientX, my: e.clientY, ox: item.x, oy: item.y };
+    onFocus(item.id);
+    onUpdate(item.id, { z: newZ });
+
+    function onMove(ev) {
+      if (!dragging.current) return;
+      onUpdate(item.id, {
+        x: Math.max(0, start.current.ox + (ev.clientX - start.current.mx)),
+        y: Math.max(0, start.current.oy + (ev.clientY - start.current.my)),
+      });
+    }
+    function onUp() {
+      dragging.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  var onResizeDown = function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    resizing.current = true;
+    start.current = { mx: e.clientX, my: e.clientY, ow: item.w, oh: item.h };
+
+    function onMove(ev) {
+      if (!resizing.current) return;
+      onUpdate(item.id, {
+        w: Math.max(80, start.current.ow + (ev.clientX - start.current.mx)),
+        h: Math.max(80, start.current.oh + (ev.clientY - start.current.my)),
+      });
+    }
+    function onUp() {
+      resizing.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  return createElement('div', {
+    onMouseDown: onDragDown,
+    style: {
+      position: 'absolute',
+      left: item.x, top: item.y,
+      width: item.w, height: item.h,
+      cursor: 'grab', userSelect: 'none',
+      borderRadius: 4, overflow: 'hidden',
+      background: '#e8e4df',
+      boxShadow: isFocused
+        ? '0 0 0 2px #6366f1, 0 8px 24px rgba(0,0,0,0.2)'
+        : '0 2px 8px rgba(0,0,0,0.12)',
+      zIndex: item.z || 1,
+    }
+  },
+    createElement('img', {
+      src: item.img_url, draggable: false,
+      style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block', pointerEvents: 'none' },
+    }),
+    createElement('div', {
+      style: {
+        position: 'absolute', bottom: 0, left: 0, right: 0,
+        background: 'linear-gradient(transparent, rgba(0,0,0,0.55))',
+        color: '#fff', fontSize: 9, padding: '14px 5px 4px',
+        pointerEvents: 'none', lineHeight: 1.3,
+      }
+    }, item.name),
+    // Resize handle
+    createElement('div', {
+      'data-resize': '1',
+      onMouseDown: onResizeDown,
+      style: {
+        position: 'absolute', bottom: 0, right: 0,
+        width: 20, height: 20, cursor: 'nwse-resize',
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end', padding: 4,
+      }
+    },
+      createElement('div', { style: { width: 8, height: 8, pointerEvents: 'none', borderRight: '2px solid rgba(255,255,255,0.8)', borderBottom: '2px solid rgba(255,255,255,0.8)' } })
+    )
+  );
+};
+
+// ── MAIN COMPONENT ─────────────────────────────────────────────
+var Comp = function() {
+  var sc = useState([]);    var canvasList     = sc[0];    var setCanvasList     = sc[1];
+  var ss = useState(null);  var selectedCanvas = ss[0];    var setSelectedCanvas = ss[1];
+  var si = useState([]);    var items          = si[0];    var setItems          = si[1];
+  var sl = useState(false); var loading        = sl[0];    var setLoading        = sl[1];
+  var sf = useState(null);  var focused        = sf[0];    var setFocused        = sf[1];
+  var sv = useState(false); var saved          = sv[0];    var setSaved          = sv[1];
+  var sm = useState(false); var showModal      = sm[0];    var setShowModal      = sm[1];
+  var sn = useState('');    var newName        = sn[0];    var setNewName        = sn[1];
+  var sc2 = useState('');   var newColId       = sc2[0];   var setNewColId       = sc2[1];  var scl = useState([]);   var collections    = scl[0];   var setCollections    = scl[1];
+
+  useEffect(function() {
+    runSql(CONFIG.uid_canvas,
+      "SELECT canvas.id AS id, canvas.name AS name, canvas.fk_collection_id AS fk_collection_id FROM canvas WHERE canvas.archive IS NULL OR canvas.archive = FALSE OR canvas.archive = 0 ORDER BY canvas.name ASC"
+    ).then(function(rows) { setCanvasList(rows); });
+    runSql(CONFIG.uid_cols,
+      "SELECT id, name FROM collection ORDER BY name ASC"
+    ).then(function(rows) { setCollections(rows); });
+  }, []);
+
+  useEffect(function() {
+    if (!selectedCanvas) return;
+    setLoading(true);
+    setItems([]);
+
+    var canvas = canvasList.find(function(c) { return String(c.id) === String(selectedCanvas); });
+    if (!canvas) { setLoading(false); return; }
+
+    runSql(CONFIG.uid_samples + '_' + canvas.fk_collection_id,
+      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
+      "attachments.url AS img_url, attachments.filename AS img_filename " +
+      "FROM sample, t_wda3bnmr9c9, attachments " +
+      "WHERE sample.fk_collection_id = " + canvas.fk_collection_id + " " +
+      "AND t_wda3bnmr9c9.f_57nmxuosclw = sample.id " +
+      "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+      "AND sample.status <> 'cancel' " +
+      "ORDER BY sample.name ASC, attachments.id ASC"
+    ).then(function(rows) {
+      var seen = {};
+      var samples = [];
+      rows.forEach(function(r) {
+        var sid = String(r.id);
+        if (!seen[sid]) {
+          seen[sid] = true;
+          samples.push({ id: sid, name: r.name, status: r.status, img_url: buildImgUrl(r.img_filename, r.img_url) });
+        }
+      });
+
+      loadLayout(selectedCanvas).then(function(saved_layout) {
+        var layoutMap = {};
+        if (saved_layout) {
+          saved_layout.forEach(function(l) { layoutMap[String(l.id)] = l; });
+        }
+
+        // Position: use saved if exists, else stack on right tray column
+        var trayIndex = 0;
+        var positioned = samples.map(function(s) {
+          var pos = layoutMap[String(s.id)];
+          if (pos) {
+            return Object.assign({}, s, { x: pos.x, y: pos.y, w: pos.w, h: pos.h, z: pos.z || 1 });
+          } else {
+            var tx = TRAY_X;
+            var ty = 20 + trayIndex * (THUMB_H + 12);
+            trayIndex++;
+            return Object.assign({}, s, { x: tx, y: ty, w: THUMB_W, h: THUMB_H, z: trayIndex });
+          }
+        });
+
+        setItems(positioned);
+        setLoading(false);
+      });
+    });
+  }, [selectedCanvas]);
+
+  var handleUpdate = useCallback(function(id, patch) {
+    setItems(function(prev) {
+      return prev.map(function(it) { return it.id === id ? Object.assign({}, it, patch) : it; });
+    });
+    setSaved(false);
+  }, []);
+
+  function handleSave() {
+    if (!selectedCanvas) return;
+    saveLayout(selectedCanvas, items).then(function() {
+      setSaved(true);
+      setTimeout(function() { setSaved(false); }, 2000);
+    });
+  }
+
+  function handleResetTray() {
+    setItems(function(prev) {
+      return prev.map(function(it, i) {
+        return Object.assign({}, it, {
+          x: TRAY_X,
+          y: 20 + i * (THUMB_H + 12),
+          w: THUMB_W, h: THUMB_H, z: i + 1,
+        });
+      });
+    });
+    setSaved(false);
+  }
+
+  function handleArchive() {
+    if (!selectedCanvas) return;
+    Modal.confirm({
+      title: 'Archive Canvas',
+      content: 'This canvas will be hidden from the list. Continue?',
+      okText: 'Archive',
+      okButtonProps: { danger: true },
+      onOk: function() {
+        var sql = "UPDATE canvas SET archive = TRUE WHERE id = " + selectedCanvas;
+        console.log('Archiving:', sql);
+        execSql('canvas_archive_' + selectedCanvas, sql)
+        .then(function(res) {
+          console.log('Archive result:', JSON.stringify(res));
+          return runSql('canvas_list_reload',
+            "SELECT canvas.id AS id, canvas.name AS name, canvas.fk_collection_id AS fk_collection_id FROM canvas WHERE canvas.archive IS NULL OR canvas.archive = FALSE OR canvas.archive = 0 ORDER BY canvas.name ASC"
+          );
+        }).then(function(rows) {
+          setCanvasList(rows);
+          setSelectedCanvas(null);
+          setItems([]);
+        }).catch(function(e) { console.error('Archive error:', e); });
+      }
+    });
+  }
+
+  function handleCreateCanvas() {
+    try {
+      const popupUid = ctx.model.uid + '-2';
+      ctx.openView(popupUid, { mode: 'drawer', title: 'New Canvas', size: 'large' });
+    } catch(e) {
+      console.error('openView error:', e);
+    }
+  }
+
+  return createElement('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui,sans-serif' }
+  },
+
+    // New canvas modal
+    createElement(Modal, {
+      title: 'New Canvas',
+      open: showModal,
+      onCancel: function() { setShowModal(false); },
+      onOk: handleCreateCanvas,
+      okText: 'Create',
+    },
+      createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, paddingTop: 8 } },
+        createElement('div', null,
+          createElement('div', { style: { fontSize: 12, color: '#6b7280', marginBottom: 4 } }, 'Canvas name'),
+          createElement(Input, {
+            value: newName,
+            onChange: function(e) { setNewName(e.target.value); },
+            placeholder: 'e.g. Inkano Floral Season 1',
+          })
+        ),
+        createElement('div', null,
+          createElement('div', { style: { fontSize: 12, color: '#6b7280', marginBottom: 4 } }, 'Collection'),
+          createElement(Select, {
+            value: newColId || undefined,
+            onChange: function(v) { setNewColId(v); },
+            placeholder: 'Select collection…',
+            style: { width: '100%' },
+            options: collections.map(function(c) { return { value: String(c.id), label: c.name }; }),
+          })
+        )
+      )
+    ),
+
+    // Toolbar
+    createElement('div', {
+      style: {
+        display: 'flex', alignItems: 'center', gap: 10,
+        padding: '8px 16px', background: '#fff',
+        borderBottom: '1px solid #e8e4df', flexShrink: 0,
+        boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+      }
+    },
+      createElement('span', { style: { fontSize: 13, fontWeight: 700, color: '#1e293b' } }, '🎨 Canvas'),
+      createElement(Select, {
+        value: selectedCanvas,
+        onChange: function(v) { setSelectedCanvas(v); setSaved(false); },
+        placeholder: 'Select a canvas…',
+        style: { minWidth: 200 },
+        options: canvasList.map(function(c) { return { value: String(c.id), label: c.name }; }),
+      }),
+      createElement('span', { style: { fontSize: 11, color: '#9ca3af' } },
+        selectedCanvas ? items.length + ' samples · drag to arrange · tray on right' : ''
+      ),
+      createElement('div', { style: { flex: 1 } }),
+      selectedCanvas ? createElement('button', {
+        onClick: handleResetTray,
+        style: { padding: '5px 12px', fontSize: 11, cursor: 'pointer', border: '1px solid #e2e8f0', borderRadius: 5, background: '#fff', color: '#64748b' }
+      }, 'Reset to Tray') : null,
+      selectedCanvas ? createElement('button', {
+        onClick: handleArchive,
+        style: { padding: '5px 12px', fontSize: 11, cursor: 'pointer', border: '1px solid #fca5a5', borderRadius: 5, background: '#fef2f2', color: '#ef4444' }
+      }, 'Archive') : null,
+      selectedCanvas ? createElement('button', {
+        onClick: handleSave,
+        style: {
+          padding: '5px 14px', fontSize: 11, cursor: 'pointer', border: 'none',
+          borderRadius: 5, fontWeight: 700, color: '#fff',
+          background: saved ? '#22c55e' : '#6366f1', transition: 'background 0.3s',
+        }
+      }, saved ? '✓ Saved' : 'Save Layout') : null,
+      createElement('button', {
+        onClick: function() {
+          try {
+            var popupUid = ctx.model.uid + '-1';
+            ctx.openView(popupUid, { mode: 'drawer', title: 'New Canvas', size: 'middle' });
+
+            // Poll for new canvases every 1.5s for up to 30s
+            var currentIds = new Set(canvasList.map(function(c) { return String(c.id); }));
+            var attempts = 0;
+            var maxAttempts = 20;
+
+            var interval = setInterval(function() {
+              attempts++;
+              if (attempts > maxAttempts) { clearInterval(interval); return; }
+
+              var pollUid = 'canvas_poll_' + Date.now();
+              runSql(pollUid,
+                "SELECT canvas.id AS id, canvas.name AS name, canvas.fk_collection_id AS fk_collection_id FROM canvas WHERE canvas.archive IS NULL OR canvas.archive = FALSE OR canvas.archive = 0 ORDER BY canvas.name ASC"
+              ).then(function(rows) {
+                var hasNew = rows.some(function(r) { return !currentIds.has(String(r.id)); });
+                if (hasNew) {
+                  clearInterval(interval);
+                  setCanvasList(rows);
+                }
+              });
+            }, 1500);
+          } catch(e) { console.error(e); }
+        },
+        style: { padding: '5px 12px', fontSize: 11, cursor: 'pointer', border: '1px solid #6366f1', borderRadius: 5, background: '#eef2ff', color: '#6366f1', fontWeight: 600 }
+      }, '+ New Canvas')
+    ),
+
+    // Canvas
+    createElement('div', {
+      onClick: function() { setFocused(null); },
+      style: {
+        flex: 1, overflow: 'auto',
+        background: '#f7f5f2',
+        backgroundImage: 'radial-gradient(circle, #d8d3cd 1px, transparent 1px)',
+        backgroundSize: '28px 28px',
+      }
+    },
+      createElement('div', { style: { position: 'relative', width: CANVAS_W, height: CANVAS_H } },
+
+        // Tray divider line on the LEFT
+        selectedCanvas
+          ? createElement('div', {
+              style: {
+                position: 'absolute', left: TRAY_COL_W, top: 0, bottom: 0,
+                width: 1, borderLeft: '1px dashed #c8c3bc',
+                pointerEvents: 'none',
+              }
+            },
+              createElement('div', {
+                style: {
+                  position: 'sticky', top: 12,
+                  fontSize: 9, color: '#b8b3ac', fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.1em',
+                  writingMode: 'vertical-rl', paddingLeft: 4,
+                }
+              }, 'Tray ↑ drag to canvas →')
+            )
+          : null,
+
+        loading
+          ? createElement('div', { style: { position: 'absolute', top: '40%', left: '45%', color: '#9ca3af', fontSize: 13 } }, 'Loading…')
+          : !selectedCanvas
+            ? createElement('div', { style: { position: 'absolute', top: '40%', left: '45%', transform: 'translate(-50%,-50%)', color: '#c8c3bc', fontSize: 14, textAlign: 'center' } },
+                createElement('div', { style: { fontSize: 36, marginBottom: 8 } }, '🎨'),
+                'Select a canvas to begin'
+              )
+            : items.map(function(item) {
+                return createElement(ImageTile, {
+                  key: item.id, item: item,
+                  isFocused: focused === item.id,
+                  onUpdate: handleUpdate,
+                  onFocus: setFocused,
+                });
+              })
+      )
+    )
+  );
+};
+
+ctx.render(createElement(Comp));
