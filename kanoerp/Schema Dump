@@ -1,5 +1,5 @@
-SCHEMA DUMP — generated 2026-07-16T14:58:07.056Z
-Collections found: 48 (all collections)
+SCHEMA DUMP — generated 2026-07-17T00:39:20.305Z
+Collections found: 50 (all collections)
 
 ### roles  ("Roles")  — 10 rows
   primaryKey: name
@@ -105,6 +105,7 @@ Collections found: 48 (all collections)
   primaryKey: code, template: general
   - code: string (input)
   - fk_main_fabric_code: string (input)
+  - fk_product_measurement_id: bigInt (integer)
   - createdAt: date (createdAt)
   - createdBy: belongsTo (createdBy)  [target=users, foreignKey=createdById]
   - updatedAt: date (updatedAt)
@@ -377,6 +378,7 @@ Collections found: 48 (all collections)
   - qc_remarks: text (richText)
   - qc_measurements: belongsToMany (attachment)  [target=attachments, foreignKey=f_wnbcpw37yq1, sourceKey=id, through=t_a2gz5x7s49p, otherKey=f_t6lqaeit2jw]
   - sample_qc_check: hasMany (o2m)  [target=sample_qc_check, foreignKey=fk_sample_variant_id, sourceKey=id]
+  - image: belongsToMany (attachment)  [target=attachments, foreignKey=f_9uw8zn7ipd2, sourceKey=id, through=t_hq2tyo4911x, otherKey=f_bv8dcij84et]
 
 ### sample_comment  ("Sample Comment")  — 114 rows
   primaryKey: id, template: general
@@ -429,7 +431,7 @@ Collections found: 48 (all collections)
   - category: string (input)
   - create_date: date (datetime)
 
-### ads_insights  ("Ads Insights")  — 63860 rows
+### ads_insights  ("Ads Insights")  — 63922 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - ad_id: string (input)
@@ -456,7 +458,7 @@ Collections found: 48 (all collections)
   - spend: decimal (number)
   - account: string (input)
 
-### adsets_insights  ("Adsets Insights")  — 12971 rows
+### adsets_insights  ("Adsets Insights")  — 12996 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -481,7 +483,7 @@ Collections found: 48 (all collections)
   - spend: decimal (number)
   - account: string (input)
 
-### campaigns_insights  ("Campaigns Insights")  — 5399 rows
+### campaigns_insights  ("Campaigns Insights")  — 5413 rows
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - createdAt: date (createdAt)
@@ -661,11 +663,11 @@ Collections found: 48 (all collections)
   primaryKey: id, template: general
   - id: snowflakeId (snowflakeId)
   - fk_store_id: bigInt (integer)
-  - fk_product_code: string (input)
+  - fk_product_variant_id: bigInt (integer)
   - store: belongsTo (obo)  [target=store, foreignKey=fk_store_id]
-  - product_code: belongsTo (obo)  [target=product, foreignKey=fk_product_code]
   - quantity: bigInt (integer)
   - transaction_date: dateOnly (date)
+  - product_variant: belongsTo (obo)  [target=product_variant, foreignKey=fk_product_variant_id]
 
 ### store_sales  ("Store Sales")  — 0 rows
   primaryKey: id, template: general
@@ -689,3 +691,34 @@ Collections found: 48 (all collections)
   - code: string (input)
   - web_price: double (number)
   - marketplace_price: double (number)
+
+### product_measurement_variant  ("Product Measurement Variant")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - fk_sku_option_id: bigInt (integer)
+  - fk_product_measurement_variant_id: bigInt (integer)
+  - sku_option: belongsTo (obo)  [target=sku_option, foreignKey=fk_sku_option_id]
+  - bust: double (number)
+  - shoulder: double (number)
+  - waist: double (number)
+  - hips: double (number)
+  - length: double (number)
+  - length2: double (number)
+  - bottom_hole: double (number)
+  - neck: double (number)
+  - arm_hole: double (number)
+  - bottom_sleeve: double (number)
+  - mid_sleeve: double (number)
+  - sleeve_length: double (number)
+  - thigh: double (number)
+  - est_main_fabric: double (number)
+  - est_main_fabric_2: double (number)
+  - est_furing: double (number)
+
+### product_measurement  ("Product Measurement")  — 0 rows
+  primaryKey: id, template: general
+  - id: snowflakeId (snowflakeId)
+  - name: string (input)
+  - product: hasMany (o2m)  [target=product, foreignKey=fk_product_measurement_id, sourceKey=id]
+  - product_measurement_variant: hasMany (o2m)  [target=product_measurement_variant, foreignKey=fk_product_measurement_variant_id, sourceKey=id]
+  - remarks: text (richText)
