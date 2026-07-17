@@ -196,13 +196,36 @@ field names aren't predictable from the collection name (§4.1).
   collection permissions, no admin "warm-up" step required.
 
   **Converted so far (2026-07):** `ui_production_material_detail.js` (all three
-  tabs), `ui_material_out.js`, and `loadCode`'s own internal `source_code` lookup
-  (used in every `act_*.js` shell — see the fixed snippet above).
+  tabs) and `loadCode`'s own internal `source_code` lookup (used in every
+  `act_*.js` shell — see the fixed snippet above).
+
+  **Correction (2026-07-17) — `ui_material_out.js` was NOT actually converted,
+  despite previously being listed here.** The live/mirrored file as of today was
+  still on the raw-SQL `runSql`, with `ctx.sql.save()` gated behind
+  `ctx.flowSettingsEnabled`. Symptom: clicking "Material Out" from the native
+  `production_material` table (JSAction shell `act_material_out`) threw
+  `Cannot read properties of null (reading 'sql')` — consistent with this bug's
+  mechanism: the dynamic per-record uid (`pm_out_lookup_<id>`) was never
+  registered because the gated `.save()` never fired, so `runById` executed
+  against an unregistered uid.
+
+  **Interim fix applied today:** removed the `ctx.flowSettingsEnabled` gate so
+  `.save()` always fires unconditionally (matching `loadCode`'s pattern).
+  **Confirmed this resolves the crash for the admin/root session it was tested
+  on.** This is *not* the real fix, though — it just makes `.save()` actually
+  attempt registration every time; it does nothing for the underlying
+  admin-only-SQL-execution gate. `ui_material_out.js` should be treated as
+  **still unconverted** and moved back into the list below — the proper fix
+  (rewrite `fetchSummary`/`runSql` in that file to use `ctx.api.resource()`
+  instead of `ctx.sql`, per the "only real fix" above) is still pending, and a
+  non-admin user opening a `production_material` record for the first time via
+  Material Out will likely still hit the silent-failure version of this bug
+  until that conversion happens.
 
   **NOT yet audited/converted — assume broken for non-admin roles until
-  checked:** `ui_production_edit.js`, `ui_prepare_fabric.js`,
-  `ui_list_engine.js`, `ui_record_nav.js`, all three importers
-  (`ui_import_material_details`, `ui_import_product_main_material`,
+  checked:** `ui_material_out.js` (see correction above), `ui_production_edit.js`,
+  `ui_prepare_fabric.js`, `ui_list_engine.js`, `ui_record_nav.js`, all three
+  importers (`ui_import_material_details`, `ui_import_product_main_material`,
   `ui_import_product_material`), `view_production_result`, `fn_fbads_data`
   (and everything built on it — all 3 FB Ads jblocks). **Also unaudited: every
   §13 workstream** (bulk image upload, measurement, product detail view,
@@ -277,7 +300,11 @@ reason not fully understood — copy the pattern anyway). Both calls swallow
 errors. **Remember: this whole pattern is admin-gated (§3) — use it only for
 admin-only tooling (dev tools, schema dump) or reads that genuinely need raw
 SQL; use `ctx.api.resource` for anything a normal production/warehouse role
-needs to run.**
+needs to run.** **2026-07-17 confirmed case:** `ui_material_out.js` had the
+`.save()` call gated behind `ctx.flowSettingsEnabled` and hit `Cannot read
+properties of null (reading 'sql')` when triggered from a JSAction on a native
+table — see §3's correction for the full mechanism and why the real fix there
+is still pending.
 
 ### 4.3 `ctx` surface — confirmed members only
 
@@ -411,7 +438,7 @@ A new table under active design, not yet in the schema dump — see §13.7.
 | `ui_production_material_detail.js` | Material detail + edit drawer. |
 | `ui_record_nav.js` | Cross-record replace-navigation host; mount one per view root. |
 | `ui_prepare_fabric.js` | Prepare-fabric modal + hand-built PDF. `buildFabricPdf` = future `lib_pdf` candidate. |
-| `ui_material_out.js` | Material-out modal. Exports `openModal({ctx,pmId,onSaved})`, `fetchSummary`, `renderSummary`, `isAccType`. |
+| `ui_material_out.js` | Material-out modal. Exports `openModal({ctx,pmId,onSaved})` — **now ASYNC as of 2026-07-17**, fetches the summary via `fetchSummary` *before* opening `Modal.confirm` (same fetch-then-open shape as `ui_prepare_fabric`), rather than lazy-fetching inside a component that mounts after the modal opens. Also exports `fetchSummary`, `renderSummary`, `renderDetails`, `cancelLedger`, `isAccType`. **Still on raw `ctx.sql`, not yet converted to `ctx.api`** — see §3's admin-gating correction; today's fix only ungated `runSql`'s `.save()` call, it didn't do the real `ctx.api` conversion. |
 | `ui_match_production` | Match-production module. Exports `openMatchModal`/`fetchMatchData`/`applyMatches`. **No JSAction shell yet — deferred.** |
 | `ui_import_material_details` | Bulk-CREATE `material_details` from CSV. Create-only, no overwrite. |
 | `ui_import_product_main_material` | Bulk-import `product.fk_main_fabric_code` from CSV. Full classify/preview/opt-in-overwrite flow. |
