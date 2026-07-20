@@ -182,75 +182,107 @@ function createListView(config) {
   }
 
   // ── new / edit drawer shells ──
-  function FormDrawer(p) {
-    const isEdit = p.mode === 'edit';
-    const spec = isEdit ? config.editForm : config.newForm;
-    const sL = useState(!!isEdit); const loading = sL[0]; const setLoading = sL[1];
-    const sB = useState(false); const busy = sB[0]; const setBusy = sB[1];
-    const sf = useState({}); const form = sf[0]; const setForm = sf[1];
-    const se = useState({}); const errs = se[0]; const setErrs = se[1];
-    useEffect(function() {
-      if (!p.open) return;
-      setErrs({});
-      if (isEdit && spec.load) { setLoading(true); Promise.resolve(spec.load(p.row)).then(f => { setForm(f || {}); setLoading(false); }).catch(e => { message.error('Load failed: ' + ((e && e.message) || e)); setLoading(false); }); }
-      else { setForm(spec.initial ? spec.initial() : {}); setLoading(false); }
-    }, [p.open, p.row && getId(p.row)]);
-    function setF(k, v) { setForm(prev => Object.assign({}, prev, { [k]: v })); }
-    function submit() {
-      const err = spec.validate ? spec.validate(form) : null;
-      if (err) return message.warning(err);
-      setBusy(true);
-      const action = isEdit ? spec.submit(getId(p.row), form) : spec.submit(form);
-      Promise.resolve(action).then(() => { message.success(spec.successMsg || (isEdit ? 'Saved.' : 'Created.')); p.onDone(); })
-        .catch(e => message.error((isEdit ? 'Update' : 'Create') + ' failed: ' + ((e && e.message) || e)))
-        .finally(() => setBusy(false));
-    }
-    return ce(Drawer, {
-      open: p.open, title: spec.title || (isEdit ? 'Edit' : 'New'), width: spec.width || 540, placement: 'right', onClose: p.onClose,
-      rootClassName: isEdit ? 'kano-edit-drawer' : undefined, zIndex: isEdit ? 1100 : undefined,
-      footer: ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-        ce('button', { onClick: p.onClose, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
-        ce('button', { onClick: submit, disabled: busy || loading, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 20px', fontSize: 13, fontWeight: 700, cursor: (busy || loading) ? 'not-allowed' : 'pointer', opacity: (busy || loading) ? 0.6 : 1 } }, busy ? 'Saving…' : (isEdit ? 'Save changes' : 'Create'))),
-    }, loading ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null))
-      : ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } }, spec.render(form, setF, p.extra || {}, errs, setErrs)));
+function FormDrawer(p) {
+  const isEdit = p.mode === 'edit';
+  const spec = isEdit ? config.editForm : config.newForm;
+  const sL = useState(!!isEdit); const loading = sL[0]; const setLoading = sL[1];
+  const sB = useState(false); const busy = sB[0]; const setBusy = sB[1];
+  const sf = useState({}); const form = sf[0]; const setForm = sf[1];
+  const se = useState({}); const errs = se[0]; const setErrs = se[1];
+  useEffect(function() {
+    if (!p.open) return;
+    setErrs({});
+    if (isEdit && spec.load) { setLoading(true); Promise.resolve(spec.load(p.row)).then(f => { setForm(f || {}); setLoading(false); }).catch(e => { message.error('Load failed: ' + ((e && e.message) || e)); setLoading(false); }); }
+    else { setForm(spec.initial ? spec.initial() : {}); setLoading(false); }
+  }, [p.open, p.row && getId(p.row)]);
+  function setF(k, v) { setForm(prev => Object.assign({}, prev, { [k]: v })); }
+  function submit() {
+    const err = spec.validate ? spec.validate(form) : null;
+    if (err) return message.warning(err);
+    setBusy(true);
+    const action = isEdit ? spec.submit(getId(p.row), form) : spec.submit(form);
+    Promise.resolve(action).then(() => { message.success(spec.successMsg || (isEdit ? 'Saved.' : 'Created.')); p.onDone(); })
+      .catch(e => message.error((isEdit ? 'Update' : 'Create') + ' failed: ' + ((e && e.message) || e)))
+      .finally(() => setBusy(false));
   }
+ 
+  const footerNode = ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+    ce('button', { onClick: p.onClose, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
+    ce('button', { onClick: submit, disabled: busy || loading, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 20px', fontSize: 13, fontWeight: 700, cursor: (busy || loading) ? 'not-allowed' : 'pointer', opacity: (busy || loading) ? 0.6 : 1 } }, busy ? 'Saving…' : (isEdit ? 'Save changes' : 'Create')));
+  const bodyNode = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } }, spec.render(form, setF, p.extra || {}, errs, setErrs));
+ 
+  if (config.DrawerShell) {
+    return ce(config.DrawerShell, {
+      open: p.open, onClose: p.onClose,
+      title: spec.title || (isEdit ? 'Edit' : 'New'),
+      width: spec.width || 540, placement: 'right',
+      rootClassName: isEdit ? 'kano-edit-drawer' : undefined, zIndex: isEdit ? 1100 : undefined,
+      loading: loading, footer: footerNode,
+    }, bodyNode);
+  }
+ 
+  // fallback — unchanged from before
+  return ce(Drawer, {
+    open: p.open, title: spec.title || (isEdit ? 'Edit' : 'New'), width: spec.width || 540, placement: 'right', onClose: p.onClose,
+    rootClassName: isEdit ? 'kano-edit-drawer' : undefined, zIndex: isEdit ? 1100 : undefined,
+    footer: footerNode,
+  }, loading ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null)) : bodyNode);
+}
 
   // ── detail drawer ──
-  function DetailDrawer(p) {
-    const row = p.row;
-    const sO = useState(0); const openIdx = sO[0]; const setOpenIdx = sO[1];
-    useEffect(function() { setOpenIdx(0); }, [row && getId(row)]);
-    function toggle(i) { setOpenIdx(openIdx === i ? -1 : i); }
-    const sections = row ? (config.detailSections || []) : [];
-    const accent = (row && config.statusAccent) ? config.statusAccent(row) : '#9ca3af';
-    const iconBtn = { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 8, height: 30, padding: '0 10px', fontSize: 13, color: '#475569', cursor: 'pointer' };
-    const allActions = config.detailActions || [];
-    const headerActions = allActions.filter(a => !a.menu);
-    const menuActions = allActions.filter(a => a.menu);
-    const overflowMenu = {
-      items: menuActions.map((a, i) => ({ key: 'act_' + i, label: a.label })).concat([{ key: 'delete', danger: true, label: '🗑  Delete' }]),
-      onClick: e => {
-        if (e.key === 'delete') { if (row) p.onDelete(row); return; }
-        const a = menuActions[Number(String(e.key).slice(4))];
-        if (a && row) a.run(row, p.helpers);
-      },
-    };
-    return ce(Drawer, {
-      open: !!row, placement: 'right', rootClassName: 'kano-detail-drawer',
+function DetailDrawer(p) {
+  const row = p.row;
+  const sO = useState(0); const openIdx = sO[0]; const setOpenIdx = sO[1];
+  useEffect(function() { setOpenIdx(0); }, [row && getId(row)]);
+  function toggle(i) { setOpenIdx(openIdx === i ? -1 : i); }
+  const sections = row ? (config.detailSections || []) : [];
+  const accent = (row && config.statusAccent) ? config.statusAccent(row) : '#9ca3af';
+  const iconBtn = { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 8, height: 30, padding: '0 10px', fontSize: 13, color: '#475569', cursor: 'pointer' };
+  const allActions = config.detailActions || [];
+  const headerActions = allActions.filter(a => !a.menu);
+  const menuActions = allActions.filter(a => a.menu);
+  const overflowMenu = {
+    items: menuActions.map((a, i) => ({ key: 'act_' + i, label: a.label })).concat([{ key: 'delete', danger: true, label: '🗑  Delete' }]),
+    onClick: e => {
+      if (e.key === 'delete') { if (row) p.onDelete(row); return; }
+      const a = menuActions[Number(String(e.key).slice(4))];
+      if (a && row) a.run(row, p.helpers);
+    },
+  };
+ 
+  const innerContent = row ? ce('div', { style: { fontFamily: "'Segoe UI', sans-serif" } },
+    config.detailRender
+      ? config.detailRender(row, p.refreshKey, p.helpers)
+      : sections.map((s, i) => ce(AccordionItem, { key: i, title: s.title, open: openIdx === i, onToggle: () => toggle(i) }, s.render(row, p.refreshKey, p.helpers))),
+    ce('div', { style: { height: 120 } })) : null;
+ 
+  const headerExtraNode = row ? ce('div', { style: { display: 'flex', gap: 6 } },
+    headerActions.map((a, i) => ce('button', { key: i, onClick: () => a.run(row, p.helpers), style: Object.assign({}, iconBtn, { fontWeight: 600, color: a.color || '#166534', borderColor: a.borderColor || '#bbf7d0', background: a.bg || '#f0fdf4' }) }, a.label)),
+    ce('button', { onClick: () => p.onEdit(row), style: Object.assign({}, iconBtn, { fontWeight: 600, color: '#4f46e5', borderColor: '#c7d2fe', background: '#eef2ff' }) }, '✏️ Edit'),
+    ce(Dropdown, { menu: overflowMenu, trigger: ['click'], placement: 'bottomRight' },
+      ce('button', { style: Object.assign({}, iconBtn, { width: 34, padding: 0, fontSize: 16 }) }, '⋯'))
+  ) : null;
+ 
+  if (config.DrawerShell) {
+    return ce(config.DrawerShell, {
+      open: !!row, onClose: p.onClose,
       title: row ? (config.detailTitle ? config.detailTitle(row) : ('#' + getId(row))) : '',
-      onClose: p.onClose,
-      extra: row ? ce('div', { style: { display: 'flex', gap: 6 } },
-        headerActions.map((a, i) => ce('button', { key: i, onClick: () => a.run(row, p.helpers), style: Object.assign({}, iconBtn, { fontWeight: 600, color: a.color || '#166534', borderColor: a.borderColor || '#bbf7d0', background: a.bg || '#f0fdf4' }) }, a.label)),
-        ce('button', { onClick: () => p.onEdit(row), style: Object.assign({}, iconBtn, { fontWeight: 600, color: '#4f46e5', borderColor: '#c7d2fe', background: '#eef2ff' }) }, '✏️ Edit'),
-        ce(Dropdown, { menu: overflowMenu, trigger: ['click'], placement: 'bottomRight' },
-          ce('button', { style: Object.assign({}, iconBtn, { width: 34, padding: 0, fontSize: 16 }) }, '⋯'))) : null,
-    }, row ? ce('div', { style: { fontFamily: "'Segoe UI', sans-serif" } },
-      ce('div', { style: { height: 4, borderRadius: 999, background: accent, marginBottom: 6, opacity: 0.85 } }),
-      config.detailRender
-        ? config.detailRender(row, p.refreshKey, p.helpers)
-        : sections.map((s, i) => ce(AccordionItem, { key: i, title: s.title, open: openIdx === i, onToggle: () => toggle(i) }, s.render(row, p.refreshKey, p.helpers))),
-      ce('div', { style: { height: 120 } })) : null);
+      placement: 'right', rootClassName: 'kano-detail-drawer',
+      accentColor: row ? accent : null,
+      extra: headerExtraNode,
+    }, innerContent);
   }
+ 
+  // fallback — unchanged from before
+  return ce(Drawer, {
+    open: !!row, placement: 'right', rootClassName: 'kano-detail-drawer',
+    title: row ? (config.detailTitle ? config.detailTitle(row) : ('#' + getId(row))) : '',
+    onClose: p.onClose,
+    extra: headerExtraNode,
+  }, row ? ce('div', { style: { fontFamily: "'Segoe UI', sans-serif" } },
+    ce('div', { style: { height: 4, borderRadius: 999, background: accent, marginBottom: 6, opacity: 0.85 } }),
+    innerContent) : null);
+}
 
   // ── root ──
   return function ListView() {
