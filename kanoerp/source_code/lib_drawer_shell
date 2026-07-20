@@ -1,0 +1,70 @@
+// lib_drawer_shell — shared Drawer chrome: explicit close button (not
+// reliant on antd's default, which is unverified in this environment),
+// consistent header/footer/accent-bar layout, and an explicit `loading`
+// state so callers can mount the Drawer immediately (open toggled from the
+// very first click) instead of returning null while data loads — mounting
+// already-open with no prior closed state is why a Drawer can "snap" into
+// view instead of sliding in, which reads like a popup.
+//
+// Stored as a `source_code` row named 'lib_drawer_shell'.
+// Loaded via loadCode(ctx, 'lib_drawer_shell'); compiled with
+//   new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
+//
+// EXPORTS (contract):
+//   DrawerShell({ open, onClose, title, extra, accentColor, width,
+//                 placement, rootClassName, zIndex, footer, loading, children })
+//     - open/onClose: standard antd Drawer open control. Keep this component
+//       MOUNTED across state changes (toggle `open`, don't conditionally
+//       render the whole DrawerShell) so the slide transition works.
+//     - title: string or node, left side of the header.
+//     - extra: optional node (or array of nodes) — caller's own header
+//       action buttons/dropdowns, rendered before the close ×. DrawerShell
+//       doesn't model button semantics itself, just lays it out.
+//     - accentColor: optional hex — thin strip rendered just under the
+//       header, above the (scrollable) body. Omit for none.
+//     - footer: optional node — rendered in the Drawer's footer bar.
+//       Automatically hidden while `loading` is true.
+//     - loading: bool — shows a centered Spin instead of children, and
+//       hides footer. Lets callers mount the Drawer immediately (with the
+//       real open state) and swap in real content once data is ready,
+//       instead of returning null before first mount.
+//
+// Depends on: none.
+// =====================================================
+const { Drawer, Spin } = antd;
+const ce = React.createElement;
+
+function DrawerShell(props) {
+  const closeBtn = ce('button', {
+    onClick: props.onClose, title: 'Close',
+    style: {
+      border: '1px solid #e2e8f0', background: '#fff', borderRadius: 8,
+      width: 30, height: 30, padding: 0, display: 'flex', alignItems: 'center',
+      justifyContent: 'center', fontSize: 15, color: '#475569', cursor: 'pointer',
+    },
+  }, '\u00D7');
+
+  return ce(Drawer, {
+    open: props.open,
+    onClose: props.onClose,
+    closable: false,
+    title: props.title,
+    extra: ce('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } }, props.extra || null, closeBtn),
+    width: props.width || 480,
+    placement: props.placement || 'right',
+    rootClassName: props.rootClassName,
+    zIndex: props.zIndex,
+    footer: (!props.loading && props.footer) ? props.footer : undefined,
+  },
+    ce('div', null,
+      props.accentColor
+        ? ce('div', { style: { height: 4, borderRadius: 999, background: props.accentColor, marginBottom: 6, opacity: 0.85 } })
+        : null,
+      props.loading
+        ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null))
+        : props.children
+    )
+  );
+}
+
+return { DrawerShell };
