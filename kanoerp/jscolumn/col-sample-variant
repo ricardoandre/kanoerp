@@ -1,0 +1,67 @@
+const sample_id = ctx.record?.id ?? "";
+
+if (!sample_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+const uid = "sv_list_" + sample_id;
+const sql =
+  "SELECT sample_variant.status AS status, sample_variant.fk_fabric_code AS fabric_code " +
+  "FROM sample_variant " +
+  "WHERE sample_variant.fk_sample_variant_id = " + sample_id + " " +
+  "ORDER BY sample_variant.id ASC";
+
+const STATUS_COLOR = {
+  sewing:   '#d97706',
+  qc:       '#84cc16',
+  approval: '#84cc16',
+  done:     '#22c55e',
+  cancel:   '#ef4444',
+};
+
+const STATUS_LABEL = {
+  sewing:   'Sewing',
+  qc:       'QC',
+  approval: 'Approval',
+  done:     'Done',
+  cancel:   'Cancel',
+};
+
+ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(rows) {
+    rows = rows || [];
+
+    if (!rows.length) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">—</span>';
+      return;
+    }
+
+    var html = '<div style="font-family:system-ui,sans-serif;font-size:11px;display:flex;flex-direction:column;gap:3px;">';
+
+    rows.forEach(function(row) {
+      var status = String(row.status || '').toLowerCase();
+      var color  = STATUS_COLOR[status] || '#9ca3af';
+      var label  = STATUS_LABEL[status] || (row.status || '—');
+      var fabric = row.fabric_code || '—';
+
+      html +=
+        '<div style="padding:3px 0;border-bottom:1px solid #f5f5f5;">' +
+          '<span style="' +
+            'display:inline-block;background:' + color + '22;color:' + color + ';' +
+            'border:1px solid ' + color + '55;border-radius:3px;' +
+            'padding:0 5px;font-size:9px;font-weight:700;' +
+          '">' + label + '</span>' +
+          '<div style="font-size:11px;color:#374151;margin-top:2px;">' + fabric + '</div>' +
+        '</div>';
+    });
+
+    html += '</div>';
+    ctx.element.innerHTML = html;
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
