@@ -1,0 +1,44 @@
+const _codeCache = {};
+async function loadCode(ctx, name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const { React, antd, dayjs } = ctx.libs;
+
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = res?.data?.data || [];
+  const src = (rows[0] && rows[0].code) || '';
+
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// --- single production record ---
+const record = ctx.record;
+if (!record || !record.id) { ctx.message.warning('No production record found.'); return; }
+
+// REVERTED to the simple design: only ONE Modal.confirm call per click,
+// made by PM.openModal() itself (already correct — it has the header/close
+// button from the standardization pass, and MarkerContent handles its own
+// internal "Loading…" while fetchSummary resolves). Two earlier attempts to
+// show a second, separate loading modal and swap it for the real one both
+// broke closing/interactivity (.update() didn't reliably preserve config;
+// destroy-then-recreate briefly overlapped two modal instances — stacked
+// masks, dead clicks). Not worth the fragility for a cosmetic gap. A
+// lightweight toast (not a second modal, so nothing to conflict with)
+// covers the brief wait while this module itself loads instead.
+const hideLoading = ctx.message.loading('Opening marker…', 0);
+try {
+  const PM = await loadCode(ctx, 'ui_production_addmarker');
+  if (!PM || !PM.openModal) {
+    ctx.message.error('Marker module loaded but openModal was not found.');
+    return;
+  }
+  await PM.openModal({ ctx: ctx, productionId: record.id, onSaved: () => { if (ctx.resource?.refresh) ctx.resource.refresh(); } });
+} catch (e) {
+  ctx.message.error('Failed to load marker: ' + ((e && e.message) || e));
+} finally {
+  hideLoading();
+}
