@@ -1,0 +1,630 @@
+// jblock — STOCK TRACKING
+//
+// Controls: Store (required), Last Month (anchor, defaults to current
+// month), Trailing Period (free numeric input, months, default 6). All
+// three sit on one row, non-wrapping, so Trailing Period never drops to
+// its own line on a normal desktop width.
+//
+// GROUPED table: one row per PRODUCT+CONDITION (a colored, bold subtotal
+// row — e.g. "O230001 Midnight Blue Spire"), immediately followed by one
+// row per VARIANT/size under that product+condition (e.g. "O230001XS",
+// "O230001S", "O230001M" …), so every size reads together instead of
+// being interleaved with other products' or conditions' sizes.
+// "condition" (good / minor_defect) lives on each store_sales /
+// stock_ledger transaction row, NOT on product_variant — the same
+// physical size can have both good and minor_defect transactions, and
+// those are reconstructed as two fully independent stock/sales histories
+// and treated as two separate "products" throughout this report, never
+// netted together. A product with history in both conditions appears as
+// TWO separate group rows further down the list, using the SAME label
+// text — they're told apart by product-row COLOR only (indigo for
+// 'good', orange for 'minor_defect'), no text suffix. Groups are sorted
+// by their own Total Sales (sum across the trailing window, summed
+// across all that group's variants) descending — fixed sort, not
+// toggleable. Within a group, variants are sorted by the sku's sort order
+// (XS → S → M → L → XL, whatever `sku_option.sort` says), not by sales.
+// Variant rows underneath a product row are plain/zebra-striped and
+// slightly indented.
+//
+// MOBILE-FRIENDLY ITEM COLUMN: on a product (group) row, the code and
+// name are stacked on two lines instead of run together on one truncated
+// line — code on top (bold), full product name wrapped underneath it
+// (smaller, normal-weight, wraps onto as many lines as it needs rather
+// than ellipsis-truncating). This trades row height for column width: the
+// Item column no longer needs to be wide enough to fit "CODE Name" on a
+// single line, so it can stay narrow (see ITEM_COL_MAX_WIDTH) and leave
+// more of a narrow/mobile viewport for the actual Start/Sales/Restock
+// numbers, which is the data people are there to read. Variant sub-rows
+// are unaffected — their label is already just "CODE+SIZE" with no name,
+// so they stay single-line/ellipsis as before.
+//
+// Columns, left → right:
+//   Item (code — name, or code+size for variant rows)  |
+//   Total Sales  | for each month (OLDEST → NEWEST): Start Stock |
+//   Sales | Restock  | End Stock (single column, as of end of Last Month)
+// Product rows show the SUM of their variants in every numeric column;
+// variant rows show their own individual numbers (unchanged math from
+// before).
+//
+// "Start Stock" for a given month = reconstructed stock as of the day
+// before that month begins. "Restock" = sum of stock_ledger quantity
+// (stock-in) within that month. "End Stock" = reconstructed stock as of
+// the END of the anchor (Last Month) — same reference-point convention as
+// Monthly Report (end of anchor month, not today's real date). Note this
+// also equals Start Stock of the month *after* the window, i.e. reading
+// left to right each month's Start + Sales(out) + Restock(in) walks
+// forward to the next month's Start, and the final End Stock closes it out.
+//
+// Grand-total row pinned at top, sums every numeric column across ALL
+// matching variants (not just the visible/capped ones) — same convention
+// as Monthly Report's Sales by Model/Product/Variant tables.
+//
+// >10 PRODUCT+CONDITION GROUPS → top 10 shown (with ALL of their
+// variants) + "Show all (N)" button, N being the group count — same CAP
+// convention as before, just counted at the product+condition level now
+// instead of the flat variant-row level, since grouping means a shown
+// group always brings its whole size run with it. A product with both
+// good and minor_defect history counts as 2 toward this cap, same as any
+// other two distinct products would.
+// Sticky first column, capped width + native tooltip, same ITEM_COL_MAX_WIDTH
+// convention as Monthly Report — except product rows now wrap their name
+// onto additional lines instead of ellipsis-truncating (see above), so
+// the tooltip on those rows is mostly a safety net for edge cases rather
+// than the primary way to read a long name. HEADER IS ALSO FROZEN (sticky
+// top) so it stays visible while scrolling down through many products,
+// and a bold vertical divider marks the boundary between each month's
+// 3-column block so it's easier to track which month you're reading while
+// scrolling. The table now scrolls inside its own bounded box (max-height
+// 640px, both axes) rather than growing the whole page, so sticky top/
+// left both have a well-defined scroll container regardless of where
+// this block is embedded — adjust the 640 if you want more/less visible
+// at once.
+//
+// ARCHITECTURE NOTE: no ctx.sql anywhere (admin-gated, silently empty for
+// non-admin roles). All reads via ctx.api.resource(...).list() through
+// fetchAllPages/fetchByIn.
+//
+// RELATION RESOLUTION (fixed from first draft): product_variant's
+// fk_product_code / fk_sku_option_id are fetched as PLAIN SCALAR fields
+// (the raw FK columns, same values the old raw-SQL joins used — proven
+// correct), NOT via `appends` guessing a belongsTo relation name. The
+// resulting codes/ids are then separately batch-resolved against
+// `product` (by code) and `sku_option` (by id) via fetchByIn. This avoids
+// depending on how (or whether) those belongsTo relations are configured
+// in NocoBase, which is what caused the earlier "(unknown) / (no size)"
+// rows.
+//
+// ASSUMPTIONS (confirm / correct if wrong):
+//   - "Has history at this store" = at least one store_sales OR
+//     stock_ledger row at this store, with transaction_date <= end of
+//     Last Month (all-time up to that point — stock reconstruction needs
+//     full history, not just the window).
+//   - Trailing Period is a free integer >= 1 month; no upper cap enforced.
+//   - Variants with no product_code (shouldn't normally happen) are
+//     bucketed into a single "(unknown)" product group rather than
+//     dropped, so nothing silently disappears.
+//   - condition field is "condition" on store_sales/stock_ledger, values
+//     'good' and 'minor_defect' only (confirmed) — a missing/null
+//     condition on older rows is treated as 'good'. Flag it if legacy
+//     rows should be handled differently (e.g. their own "(unspecified)"
+//     group instead of folding into 'good').
+//
+// Depends on: none.
+
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Select, DatePicker, InputNumber } = antd;
+const ce = React.createElement;
+
+const STOCK_COLOR = '#2563eb';
+const RESTOCK_COLOR = '#16a34a';
+const OOS_RED = '#dc2626';
+const PRODUCT_ROW_BG = '#eef2ff';
+const PRODUCT_ROW_TEXT = '#3730a3';
+const PRODUCT_ROW_BG_DEFECT = '#fff7ed';
+const PRODUCT_ROW_TEXT_DEFECT = '#9a3412';
+const MONTH_DIVIDER_ON_TINT_DEFECT = '2px solid #fdba74';
+
+// condition lives on each store_sales / stock_ledger transaction row
+// (field "condition"), not on product_variant — the same physical
+// variant/size can have both 'good' and 'minor_defect' transactions, and
+// those are treated as two entirely separate "products" throughout this
+// report (separate stock reconstruction, separate rows, separate group).
+// Rows with a missing/null condition are treated as 'good' (assumption —
+// flag it if older data should be handled differently).
+function normalizeCondition(c) { return c === 'minor_defect' ? 'minor_defect' : 'good'; }
+function conditionKey(variantId, c) { return String(variantId) + '::' + normalizeCondition(c); }
+
+const MONTH_DIVIDER = '2px solid #94a3b8';
+const MONTH_DIVIDER_ON_TINT = '2px solid #a5b4fc';
+// approximate rendered height of the top header row (month-name row), in
+// px — the second header row (Start/Sales/Restock) needs to stick just
+// below it. If you change header font-size/padding, this may need a
+// small nudge; a 1-2px mismatch is harmless, a large one will show a gap
+// or overlap between the two sticky header rows.
+const HEADER_ROW1_HEIGHT = 33;
+const CAP = 10;
+// Narrower than before now that product rows wrap their name onto its
+// own line instead of needing enough width to fit "CODE Name" on one
+// line — freeing more of a narrow/mobile viewport for the numeric
+// month columns, which is the data people actually scroll here to read.
+const ITEM_COL_MAX_WIDTH = 140;
+const PAGE_SIZE = 1000;
+const BATCH_SIZE = 150;
+
+// ── scaling helpers (standard going forward — reuse verbatim) ──
+function fetchAllPages(resourceName, params) {
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: PAGE_SIZE, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < PAGE_SIZE) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function fetchByIn(resourceName, field, values, params) {
+  const uniqueValues = Array.from(new Set(values)).filter(v => v !== null && v !== undefined && v !== '');
+  const batches = [];
+  for (let i = 0; i < uniqueValues.length; i += BATCH_SIZE) batches.push(uniqueValues.slice(i, i + BATCH_SIZE));
+  function runBatches(idx, acc) {
+    if (idx >= batches.length) return Promise.resolve(acc);
+    const filter = Object.assign({}, params && params.filter, { [field]: { $in: batches[idx] } });
+    return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter }))
+      .then(function (rows) { return runBatches(idx + 1, acc.concat(rows)); });
+  }
+  return runBatches(0, []);
+}
+
+function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+function dash(n) { return n === 0 ? '-' : String(n); }
+function ymd(d) { return dayjs(d).format('YYYY-MM-DD'); }
+
+// ── data fetchers (all via resource API — no ctx.sql) ──
+function fetchStores() {
+  return fetchAllPages('store', { fields: ['id', 'store_code', 'name'], sort: ['name'] });
+}
+function fetchSalesRows(storeId, uptoDate) {
+  return fetchAllPages('store_sales', {
+    fields: ['quantity', 'transaction_date', 'fk_product_variant_id', 'condition'],
+    filter: { fk_store_id: storeId, transaction_date: { $lte: uptoDate } },
+  });
+}
+function fetchLedgerRows(storeId, uptoDate) {
+  return fetchAllPages('stock_ledger', {
+    fields: ['quantity', 'transaction_date', 'fk_product_variant_id', 'condition'],
+    filter: { fk_store_id: storeId, transaction_date: { $lte: uptoDate } },
+  });
+}
+// raw scalar FK values only — no appends/relation-name guessing
+function fetchVariantDetails(variantIds) {
+  return fetchByIn('product_variant', 'id', variantIds, {
+    fields: ['id', 'fk_product_code', 'fk_sku_option_id'],
+  });
+}
+function fetchProducts(codes) {
+  return fetchByIn('product', 'code', codes, { fields: ['code', 'name', 'model'] });
+}
+function fetchSkuOptions(ids) {
+  return fetchByIn('sku_option', 'id', ids, { fields: ['id', 'display', 'value', 'sort'] });
+}
+
+// ── stock reconstruction — keyed by variant+condition composite key, so
+// 'good' and 'minor_defect' units of the same size are reconstructed as
+// two independent running balances, never netted against each other. ──
+function buildEvents(salesRowsAllTime, ledgerRowsAllTime) {
+  const events = {};
+  function push(row, sign) {
+    const key = conditionKey(row.fk_product_variant_id, row.condition);
+    if (!events[key]) events[key] = [];
+    events[key].push({ date: ymd(row.transaction_date), delta: sign * num(row.quantity) });
+  }
+  salesRowsAllTime.forEach(r => push(r, -1));
+  ledgerRowsAllTime.forEach(r => push(r, 1));
+  return events;
+}
+function stockAsOf(events, key, dateStr) {
+  const list = events[String(key)];
+  if (!list) return 0;
+  let sum = 0;
+  for (let i = 0; i < list.length; i++) { if (list[i].date <= dateStr) sum += list[i].delta; }
+  return sum;
+}
+
+// ── months: N trailing, ascending (oldest → newest) ──
+function buildMonths(anchorMonth, count) {
+  const months = [];
+  for (let i = 0; i < count; i++) {
+    const m = anchorMonth.subtract(i, 'month');
+    months.push({ key: m.format('YYYY-MM'), label: m.format('MMM YYYY') });
+  }
+  return months.reverse();
+}
+
+// ── row assembly (one row per variant+condition pair — 'good' and
+// 'minor_defect' units of the same size are two separate rows/products
+// throughout, per the condition split). Display label is the short
+// "CODE+SIZE" form since the product name/code combo now lives on the
+// group header row instead. ──
+function buildVariantRows(salesRowsAllTime, ledgerRowsAllTime, variantDetailsById, productsByCode, skuOptionsById, monthsAsc, anchorEndDate, events) {
+  const monthKeys = monthsAsc.map(m => m.key);
+  const monthSet = {};
+  monthKeys.forEach(k => { monthSet[k] = true; });
+  const keySet = new Set();
+  salesRowsAllTime.forEach(r => keySet.add(conditionKey(r.fk_product_variant_id, r.condition)));
+  ledgerRowsAllTime.forEach(r => keySet.add(conditionKey(r.fk_product_variant_id, r.condition)));
+  const salesByKeyMonth = {};
+  salesRowsAllTime.forEach(function (r) {
+    const key = conditionKey(r.fk_product_variant_id, r.condition);
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (!monthSet[mk]) return;
+    if (!salesByKeyMonth[key]) salesByKeyMonth[key] = {};
+    salesByKeyMonth[key][mk] = (salesByKeyMonth[key][mk] || 0) + num(r.quantity);
+  });
+  const restockByKeyMonth = {};
+  ledgerRowsAllTime.forEach(function (r) {
+    const key = conditionKey(r.fk_product_variant_id, r.condition);
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (!monthSet[mk]) return;
+    if (!restockByKeyMonth[key]) restockByKeyMonth[key] = {};
+    restockByKeyMonth[key][mk] = (restockByKeyMonth[key][mk] || 0) + num(r.quantity);
+  });
+  const rows = Array.from(keySet).map(function (key) {
+    const sep = key.lastIndexOf('::');
+    const vid = key.slice(0, sep);
+    const condition = key.slice(sep + 2);
+    const detail = variantDetailsById[vid];
+    const productCode = detail ? (detail.fk_product_code || '') : '';
+    const product = productCode ? productsByCode[productCode] : null;
+    const skuId = detail ? detail.fk_sku_option_id : null;
+    const sku = skuId != null ? skuOptionsById[String(skuId)] : null;
+    const productName = product ? (product.name || '') : '';
+    const skuLabel = sku ? (sku.display || sku.value || '(no size)') : '(no size)';
+    const skuSort = sku ? num(sku.sort) : 0;
+    const salesByMonth = salesByKeyMonth[key] || {};
+    const restockByMonth = restockByKeyMonth[key] || {};
+    let totalSales = 0;
+    monthKeys.forEach(mk => { totalSales += (salesByMonth[mk] || 0); });
+    const startByMonth = {};
+    monthsAsc.forEach(function (m) {
+      const boundary = dayjs(m.key + '-01').subtract(1, 'day').format('YYYY-MM-DD');
+      startByMonth[m.key] = stockAsOf(events, key, boundary);
+    });
+    return {
+      variantId: vid,
+      conditionKey: key,
+      condition: condition,
+      productCode: productCode,
+      productName: productName,
+      skuLabel: skuLabel,
+      skuSort: skuSort,
+      // short "CODE+SIZE" form, e.g. "O230001XS" — the product-level
+      // code/name (and condition) is shown once on the group header row
+      // instead.
+      label: (productCode || '(unknown)') + skuLabel,
+      startByMonth: startByMonth,
+      salesByMonth: salesByMonth,
+      restockByMonth: restockByMonth,
+      totalSales: totalSales,
+      endStock: stockAsOf(events, key, anchorEndDate),
+    };
+  });
+  // stable base ordering (grouping/sorting for display happens in
+  // buildProductGroups); keep variants sorted by condition then sku order
+  // here too so anything consuming the flat list also gets a sane order.
+  rows.sort(function (a, b) {
+    if (a.productCode !== b.productCode) return a.productCode < b.productCode ? -1 : 1;
+    if (a.condition !== b.condition) return a.condition < b.condition ? -1 : 1;
+    return a.skuSort - b.skuSort;
+  });
+  return rows;
+}
+
+// ── group flat variant rows into one entry per PRODUCT+CONDITION (good
+// and minor_defect of the same product are two separate groups), each
+// carrying the sum of its variants across every numeric column, plus its
+// own variants (sorted by sku order) for the sub-rows. Groups are ordered
+// by their own Total Sales descending — fixed sort, not toggleable. ──
+function buildProductGroups(variantRows, monthsAsc) {
+  const groups = {};
+  variantRows.forEach(function (r) {
+    const key = (r.productCode || '') + '::' + r.condition;
+    if (!groups[key]) {
+      const startByMonth = {}, salesByMonth = {}, restockByMonth = {};
+      monthsAsc.forEach(function (m) { startByMonth[m.key] = 0; salesByMonth[m.key] = 0; restockByMonth[m.key] = 0; });
+      groups[key] = {
+        productCode: r.productCode,
+        productName: r.productName,
+        condition: r.condition,
+        label: (r.productCode || '(unknown)') + (r.productName ? (' ' + r.productName) : ''),
+        totalSales: 0,
+        startByMonth: startByMonth,
+        salesByMonth: salesByMonth,
+        restockByMonth: restockByMonth,
+        endStock: 0,
+        variants: [],
+      };
+    }
+    const g = groups[key];
+    g.totalSales += r.totalSales;
+    g.endStock += r.endStock;
+    monthsAsc.forEach(function (m) {
+      g.startByMonth[m.key] += (r.startByMonth[m.key] || 0);
+      g.salesByMonth[m.key] += (r.salesByMonth[m.key] || 0);
+      g.restockByMonth[m.key] += (r.restockByMonth[m.key] || 0);
+    });
+    g.variants.push(r);
+  });
+  const list = Object.keys(groups).map(k => groups[k]);
+  list.forEach(function (g) { g.variants.sort((a, b) => a.skuSort - b.skuSort); });
+  list.sort(function (a, b) {
+    if (b.totalSales !== a.totalSales) return b.totalSales - a.totalSales;
+    if (a.productCode !== b.productCode) return a.productCode < b.productCode ? -1 : 1;
+    return a.condition < b.condition ? -1 : (a.condition > b.condition ? 1 : 0);
+  });
+  return list;
+}
+
+// ── small building blocks ──
+function sectionTitle(text, subtitle) {
+  return ce('div', { style: { marginBottom: 10 } },
+    ce('div', { style: { fontSize: 15, fontWeight: 700, color: '#111827' } }, text),
+    subtitle ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginTop: 2 } }, subtitle) : null
+  );
+}
+function showAllButton(total, onClick) {
+  return ce('div', { style: { padding: '10px 0', textAlign: 'center' } },
+    ce('button', { onClick: onClick, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff', color: '#374151' } }, 'Show all (' + total + ')')
+  );
+}
+// single-line, ellipsis-truncated label — used for variant sub-rows,
+// where there's no separate name to wrap (just "CODE+SIZE").
+function truncatedLabel(text, extraStyle) {
+  return ce('span', { title: text, style: Object.assign({ display: 'inline-block', maxWidth: ITEM_COL_MAX_WIDTH - 20, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', verticalAlign: 'middle' }, extraStyle || {}) }, text);
+}
+// two-line label for product (group) rows — code on top (bold,
+// single-line/ellipsis in the rare case a code itself is very long),
+// full product name wrapped underneath (smaller, normal weight, wraps
+// onto as many lines as needed instead of truncating). This is what
+// lets the Item column stay narrow on mobile while still showing the
+// whole product name.
+function productLabelBlock(code, name, textColor) {
+  return ce('div', { style: { display: 'flex', flexDirection: 'column', maxWidth: ITEM_COL_MAX_WIDTH - 20 } },
+    ce('span', {
+      title: code,
+      style: { fontWeight: 700, color: textColor, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
+    }, code || '(unknown)'),
+    name
+      ? ce('span', {
+          style: { fontWeight: 500, fontSize: 11, color: textColor, opacity: 0.85, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.3, marginTop: 1 }
+        }, name)
+      : null
+  );
+}
+function fieldLabel(t) {
+  return ce('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, t);
+}
+
+// ── the table ──
+function StockTrackingTable(props) {
+  const monthsAsc = props.monthsAsc;
+  const rows = props.rows; // flat, all variants — used only for the grand-total row
+  const groups = props.groups; // grouped by product, for display + cap
+  const [showAll, setShowAll] = useState(false);
+  const visibleGroups = (showAll || groups.length <= CAP) ? groups : groups.slice(0, CAP);
+
+  const thStyle = { padding: '7px 10px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', textAlign: 'right', borderBottom: '2px solid #e5e7eb', whiteSpace: 'nowrap' };
+  const thItemStyle = { ...thStyle, textAlign: 'left', position: 'sticky', left: 0, top: 0, background: '#fff', zIndex: 3, maxWidth: ITEM_COL_MAX_WIDTH };
+  const thGroupStyle = { padding: '6px 10px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', textAlign: 'center', borderBottom: '1px solid #f3f4f6', whiteSpace: 'nowrap', position: 'sticky', top: 0, background: '#fff', zIndex: 2 };
+  const tdStyle = { padding: '6px 10px', fontSize: 12, textAlign: 'right', borderBottom: '1px solid #f0f0f0', whiteSpace: 'nowrap' };
+  const tdItemStyle = { ...tdStyle, textAlign: 'left', fontWeight: 600, color: '#374151', position: 'sticky', left: 0, zIndex: 1, maxWidth: ITEM_COL_MAX_WIDTH, whiteSpace: 'normal' };
+  const startTdStyle = (v, bg) => ({ ...tdStyle, color: v <= 0 ? OOS_RED : STOCK_COLOR, borderLeft: MONTH_DIVIDER, background: bg });
+  const restockTdStyle = (bg) => ({ ...tdStyle, color: RESTOCK_COLOR, background: bg });
+  const endStockTdStyle = (v, bg) => ({ ...tdStyle, color: v <= 0 ? OOS_RED : STOCK_COLOR, fontWeight: 700, background: bg });
+
+  const grandTotalSales = rows.reduce((s, r) => s + r.totalSales, 0);
+  const grandEndStock = rows.reduce((s, r) => s + r.endStock, 0);
+  const grandByMonth = {};
+  monthsAsc.forEach(function (m) {
+    grandByMonth[m.key] = {
+      start: rows.reduce((s, r) => s + (r.startByMonth[m.key] || 0), 0),
+      sales: rows.reduce((s, r) => s + (r.salesByMonth[m.key] || 0), 0),
+      restock: rows.reduce((s, r) => s + (r.restockByMonth[m.key] || 0), 0),
+    };
+  });
+
+  // product (group) subtotal row — tinted + bold to mark the boundary.
+  // Color depends on condition: indigo for 'good', orange for
+  // 'minor_defect', so the two splits are visually distinguishable at a
+  // glance, not just by the label text. Item cell shows the two-line
+  // code/name block (see productLabelBlock) instead of a single
+  // truncated line.
+  function productRow(g) {
+    const isDefect = g.condition === 'minor_defect';
+    const bg = isDefect ? PRODUCT_ROW_BG_DEFECT : PRODUCT_ROW_BG;
+    const text = isDefect ? PRODUCT_ROW_TEXT_DEFECT : PRODUCT_ROW_TEXT;
+    const divider = isDefect ? MONTH_DIVIDER_ON_TINT_DEFECT : MONTH_DIVIDER_ON_TINT;
+    return ce('tr', { key: 'grp_' + (g.productCode || '(unknown)') + '_' + g.condition, style: { background: bg } },
+      ce('td', { style: { ...tdItemStyle, background: bg } }, productLabelBlock(g.productCode, g.productName, text)),
+      ce('td', { style: { ...tdStyle, background: bg, fontWeight: 700, color: text } }, String(g.totalSales)),
+      monthsAsc.map(function (m) {
+        return [
+          ce('td', { key: m.key + '_start', style: { ...tdStyle, background: bg, fontWeight: 700, color: text, borderLeft: divider } }, dash(g.startByMonth[m.key])),
+          ce('td', { key: m.key + '_sales', style: { ...tdStyle, background: bg, fontWeight: 700, color: text } }, dash(g.salesByMonth[m.key])),
+          ce('td', { key: m.key + '_restock', style: { ...tdStyle, background: bg, fontWeight: 700, color: text } }, dash(g.restockByMonth[m.key])),
+        ];
+      }).flat(),
+      ce('td', { style: { ...tdStyle, background: bg, fontWeight: 700, color: text } }, dash(g.endStock))
+    );
+  }
+  // variant sub-row — plain/zebra, indented under its product. Unchanged:
+  // still a single-line "CODE+SIZE" label, no name to wrap here.
+  function variantRow(r, bg) {
+    return ce('tr', { key: r.conditionKey, style: { background: bg } },
+      ce('td', { style: { ...tdItemStyle, background: bg } }, truncatedLabel(r.label, { paddingLeft: 14, color: '#6b7280', fontWeight: 500 })),
+      ce('td', { style: tdStyle }, String(r.totalSales)),
+      monthsAsc.map(function (m) {
+        return [
+          ce('td', { key: m.key + '_start', style: startTdStyle(r.startByMonth[m.key] || 0, bg) }, dash(r.startByMonth[m.key] || 0)),
+          ce('td', { key: m.key + '_sales', style: { ...tdStyle, background: bg } }, dash(r.salesByMonth[m.key] || 0)),
+          ce('td', { key: m.key + '_restock', style: restockTdStyle(bg) }, dash(r.restockByMonth[m.key] || 0)),
+        ];
+      }).flat(),
+      ce('td', { style: endStockTdStyle(r.endStock, bg) }, dash(r.endStock))
+    );
+  }
+
+  return ce('div', null,
+    ce('div', { style: { overflow: 'auto', maxHeight: 640, border: '1px solid #e5e7eb', borderRadius: 6 } },
+      ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', minWidth: 460 + monthsAsc.length * 150 } },
+        ce('thead', null,
+          ce('tr', null,
+            ce('th', { style: thItemStyle, rowSpan: 2 }, 'Product / Size'),
+            ce('th', { style: Object.assign({}, thStyle, { position: 'sticky', top: 0, background: '#fff', zIndex: 2 }), rowSpan: 2 }, 'Total Sales'),
+            monthsAsc.map(m => ce('th', { key: m.key, colSpan: 3, style: Object.assign({}, thGroupStyle, { borderLeft: MONTH_DIVIDER }) }, m.label)),
+            ce('th', { style: Object.assign({}, thStyle, { color: STOCK_COLOR, position: 'sticky', top: 0, background: '#fff', zIndex: 2 }), rowSpan: 2 }, 'End Stock')
+          ),
+          ce('tr', null,
+            monthsAsc.map(function (m) {
+              return [
+                ce('th', { key: m.key + '_start', style: Object.assign({}, thStyle, { color: STOCK_COLOR, borderLeft: MONTH_DIVIDER, position: 'sticky', top: HEADER_ROW1_HEIGHT, background: '#fff', zIndex: 2 }) }, 'Start'),
+                ce('th', { key: m.key + '_sales', style: Object.assign({}, thStyle, { position: 'sticky', top: HEADER_ROW1_HEIGHT, background: '#fff', zIndex: 2 }) }, 'Sales'),
+                ce('th', { key: m.key + '_restock', style: Object.assign({}, thStyle, { color: RESTOCK_COLOR, position: 'sticky', top: HEADER_ROW1_HEIGHT, background: '#fff', zIndex: 2 }) }, 'Restock'),
+              ];
+            })
+          )
+        ),
+        ce('tbody', null,
+          ce('tr', { style: { background: '#f8fafc' } },
+            ce('td', { style: { ...tdItemStyle, background: '#f8fafc', fontWeight: 700, color: '#111827', whiteSpace: 'nowrap' } }, 'Total'),
+            ce('td', { style: { ...tdStyle, fontWeight: 700, color: '#111827' } }, String(grandTotalSales)),
+            monthsAsc.map(function (m) {
+              const g = grandByMonth[m.key];
+              return [
+                ce('td', { key: m.key + '_start', style: { ...tdStyle, fontWeight: 700, color: STOCK_COLOR, borderLeft: MONTH_DIVIDER } }, String(g.start)),
+                ce('td', { key: m.key + '_sales', style: { ...tdStyle, fontWeight: 700 } }, String(g.sales)),
+                ce('td', { key: m.key + '_restock', style: { ...tdStyle, fontWeight: 700, color: RESTOCK_COLOR } }, String(g.restock)),
+              ];
+            }).flat(),
+            ce('td', { style: { ...tdStyle, fontWeight: 700, color: STOCK_COLOR } }, String(grandEndStock))
+          ),
+          groups.length
+            ? visibleGroups.map(function (g) {
+                return [productRow(g)].concat(
+                  g.variants.map(function (r, i) {
+                    const bg = i % 2 === 0 ? '#ffffff' : '#fafafa';
+                    return variantRow(r, bg);
+                  })
+                );
+              }).flat()
+            : ce('tr', null, ce('td', { colSpan: monthsAsc.length * 3 + 3, style: { padding: '16px', textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'No variants with history at this store.'))
+        )
+      )
+    ),
+    (!showAll && groups.length > CAP) ? showAllButton(groups.length, function () { setShowAll(true); }) : null
+  );
+}
+
+// ── root ──
+function Root() {
+  const [stores, setStores] = useState([]);
+  const [storeId, setStoreId] = useState(null);
+  const [lastMonth, setLastMonth] = useState(function () { return dayjs(); });
+  const [trailingMonths, setTrailingMonths] = useState(6);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [rows, setRows] = useState(null);
+  const [groups, setGroups] = useState([]);
+  const [monthsAsc, setMonthsAsc] = useState([]);
+
+  useEffect(function () {
+    fetchStores().then(setStores).catch(function (e) { setErr((e && e.message) || String(e)); });
+  }, []);
+
+  useEffect(function () {
+    if (!storeId) { setRows(null); setGroups([]); return; }
+    const anchor = lastMonth || dayjs();
+    const n = Math.max(1, num(trailingMonths) || 6);
+    const months = buildMonths(anchor, n); // ascending
+    const anchorEndDate = anchor.endOf('month').format('YYYY-MM-DD');
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    Promise.all([fetchSalesRows(storeId, anchorEndDate), fetchLedgerRows(storeId, anchorEndDate)])
+      .then(function (r) {
+        if (!alive) return;
+        const salesRowsAllTime = r[0], ledgerRowsAllTime = r[1];
+        const events = buildEvents(salesRowsAllTime, ledgerRowsAllTime);
+        const variantIds = Array.from(new Set(
+          salesRowsAllTime.map(x => x.fk_product_variant_id).concat(ledgerRowsAllTime.map(x => x.fk_product_variant_id))
+        ));
+        return fetchVariantDetails(variantIds).then(function (details) {
+          if (!alive) return;
+          const detailsById = {};
+          details.forEach(function (d) { detailsById[String(d.id)] = d; });
+          const productCodes = Array.from(new Set(details.map(d => d.fk_product_code).filter(Boolean)));
+          const skuIds = Array.from(new Set(details.map(d => d.fk_sku_option_id).filter(v => v !== null && v !== undefined)));
+          return Promise.all([fetchProducts(productCodes), fetchSkuOptions(skuIds)]).then(function (r2) {
+            if (!alive) return;
+            const productsByCode = {};
+            r2[0].forEach(function (p) { productsByCode[p.code] = p; });
+            const skuOptionsById = {};
+            r2[1].forEach(function (s) { skuOptionsById[String(s.id)] = s; });
+            const builtRows = buildVariantRows(salesRowsAllTime, ledgerRowsAllTime, detailsById, productsByCode, skuOptionsById, months, anchorEndDate, events);
+            const builtGroups = buildProductGroups(builtRows, months);
+            setMonthsAsc(months);
+            setRows(builtRows);
+            setGroups(builtGroups);
+          });
+        });
+      })
+      .catch(function (e) {
+        if (!alive) return;
+        setErr((e && e.message) || String(e));
+        setRows(null);
+        setGroups([]);
+      })
+      .finally(function () { if (alive) setLoading(false); });
+    return function () { alive = false; };
+  }, [storeId, lastMonth, trailingMonths]);
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, padding: 4 } },
+    ce('div', { style: { display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'nowrap' } },
+      ce('div', { style: { minWidth: 180, flex: '1 1 200px' } },
+        fieldLabel('Store'),
+        ce(Select, {
+          value: storeId, onChange: setStoreId, style: { width: '100%' }, allowClear: true,
+          placeholder: 'Select a store to generate a report',
+          options: stores.map(s => ({ value: s.id, label: s.store_code ? (s.store_code + ' — ' + s.name) : s.name })),
+          showSearch: true,
+          filterOption: (input, option) => (option.label || '').toLowerCase().indexOf(input.toLowerCase()) !== -1,
+        })
+      ),
+      ce('div', { style: { flex: '0 0 150px' } },
+        fieldLabel('Last Month'),
+        ce(DatePicker, { picker: 'month', value: lastMonth, onChange: v => setLastMonth(v || dayjs()), style: { width: '100%' }, allowClear: false, format: 'MMM YYYY' })
+      ),
+      ce('div', { style: { flex: '0 0 170px' } },
+        fieldLabel('Trailing Period (months)'),
+        ce(InputNumber, { value: trailingMonths, onChange: v => setTrailingMonths(v || 1), min: 1, style: { width: '100%' } })
+      )
+    ),
+    !storeId
+      ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Select a store to generate a report.')
+      : err
+        ? ce('div', { style: { padding: 16, color: '#ef4444', fontSize: 12 } }, err)
+        : loading && !rows
+          ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…')
+          : rows
+            ? ce('div', null,
+                loading ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 6 } }, 'Refreshing…') : null,
+                sectionTitle('Stock Tracking', 'Grouped by product (tinted rows), sorted by each product\'s total sales in the trailing period — every size is listed under its product. Each month shows Start / Sales / Restock, End Stock is as of the end of Last Month'),
+                ce(StockTrackingTable, { monthsAsc: monthsAsc, rows: rows, groups: groups })
+              )
+            : null
+  );
+}
+
+ctx.render(ce(Root));
