@@ -1,0 +1,54 @@
+const variant_id = ctx.record?.id ?? "";
+
+const STATUS_COLOR = {
+  pending: '#f97316',
+  not_applicable: '#06b6d4',
+  approved: '#22c55e',
+  fail: '#ef4444',
+};
+const STATUS_LABEL = {
+  pending: 'Pending',
+  not_applicable: 'N/A',
+  approved: 'Approved',
+  fail: 'Fail',
+};
+
+if (!variant_id) {
+  ctx.element.innerHTML = '';
+} else {
+  const uid = "sv_qc_" + variant_id;
+  const sql =
+    "SELECT sample_qc_checklist.name AS name, sample_qc_check.status AS status " +
+    "FROM sample_qc_check, sample_qc_checklist " +
+    "WHERE sample_qc_check.fk_sample_variant_id = " + variant_id + " " +
+    "AND sample_qc_check.fk_sample_qc_checklist_id = sample_qc_checklist.id " +
+    "ORDER BY sample_qc_checklist.sort ASC";
+
+  ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+    .then(function() {
+      return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+    })
+    .then(function(rows) {
+      rows = rows || [];
+      if (!rows.length) {
+        ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No checklist</span>';
+        return;
+      }
+      var html = '<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:4px;max-width:100%;">';
+      rows.forEach(function(row) {
+        var statusKey = String(row.status || '').toLowerCase();
+        var color = STATUS_COLOR[statusKey] || '#9ca3af';
+        var label = STATUS_LABEL[statusKey] || (row.status || '—');
+        html +=
+          '<div style="display:flex;align-items:center;gap:6px;">' +
+            '<span style="font-size:11px;font-weight:600;color:#1e293b;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + (row.name || '—') + '</span>' +
+            '<span style="flex-shrink:0;font-size:10px;font-weight:700;color:' + color + ';background:' + color + '18;border:1px solid ' + color + '44;border-radius:999px;padding:1px 8px;">' + label + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+      ctx.element.innerHTML = html;
+    })
+    .catch(function(err) {
+      ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+    });
+}
