@@ -1,0 +1,634 @@
+// ui_production_addmarker — shared "Production Marker" summary + creation UI.
+// Stored as a `source_code` row named 'ui_production_addmarker'.
+// Loaded via loadCode(ctx, 'ui_production_addmarker'); compiled with
+//   new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
+//
+// 2026-07 REWRITE: all reads moved off raw ctx.sql onto ctx.api.resource()
+// (fetchAllPages/fetchByIn), same pattern proven in product_measurement.js /
+// ui_product_measurement_add.js / ui_product_measurement_edit.js — those
+// three independently confirmed ctx.sql.save() is admin/root-gated and
+// silently fails (empty results, no error) for non-admin roles. This was
+// almost certainly the real cause of the intermittent "Could not load
+// production info." / "Cannot read properties of null (reading 'sql')"
+// failures, not the concurrent-dynamic-uid race theorized earlier.
+//
+// EXPORTS (contract):
+//   openModal({ ctx, productionId, onSaved })
+//       — opens the marker summary/creation panel immediately, fetches inside.
+//         Hosted via Modal.confirm (proven record-button pattern for a bare
+//         JSAction on a native table, which has no host React tree to mount
+//         a real Drawer into — never nest an actual Drawer inside
+//         Modal.confirm), styled via injected CSS to sit anchored to the
+//         right edge like a drawer.
+//   fetchSummary(ctx, productionId)
+//       — returns { productionId, productCode, productName, productModel,
+//                    productModelValid, konveksiName, fabricCode, remarks,
+//                    markers:[{linkId,markerId,length,sizes}],
+//                    linkableMarkers:[{markerId,length,sizes,matchReason}],
+//                    skuOptions:[{id,display}] } | null
+//
+// MARKER <-> PRODUCT MAPPING: markers may map to MULTIPLE products via the
+// `product_marker` collection (plain fk_marker_id + fk_product_code columns,
+// no belongsTo relations configured on it, confirmed from its schema — so
+// writes/reads use raw filter values directly). `marker` and `marker_details`
+// DO have real belongsTo relations (product / marker / sku_option
+// respectively) — their field names are hardcoded from the schema dump
+// (MARKER_RELS / MARKER_DETAILS_RELS below) rather than looked up at runtime,
+// since the runtime lookup required reading NocoBase's `fields`
+// meta-collection, which non-admin roles can't access (see the note above
+// MARKER_RELS for the full story).
+//
+// Reuse suggestions shown, in order:
+//   1. SAME PRODUCT — markers already product_marker-linked to this
+//      production's own product code.
+//   2. SAME MODEL — only when this product's `model` passes isValidModel()
+//      (rejects bare brand-letter+digits placeholders like "O41" but accepts
+//      "O41Seville"): markers linked to OTHER products sharing that model.
+//   3. MANUAL LOOKUP — free-text product.code search, so a marker can be
+//      consciously mapped onto a product it wasn't associated with before.
+//
+// Every link action (suggested or manual-search result) also calls
+// ensureProductLinks() to backfill a product_marker row for this production's
+// OWN product code if missing — so linking a marker into a "different"
+// product widens its own reuse map going forward.
+//
+// Writes:
+//   - New marker: direct creates to marker -> marker_details -> production_marker
+//     -> product_marker (one row for this production's product code). Direct
+//     per-collection creates via ctx.api.resource(...).create(), matching the
+//     proven write path elsewhere in this codebase.
+//   - Link existing marker: production_marker create + ensureProductLinks.
+//   - Unlink: destroys only the production_marker row — the marker, its
+//     marker_details, and its product_marker mappings are never deleted
+//     (nested Modal.confirm pattern, same as cancelLedger in ui_material_out.js).
+//
+// Depends on: none.
+
+const { Modal, Select, InputNumber, Button, Input } = antd;
+const ce = React.createElement;
+const { useState, useEffect, useRef } = React;
+
+// ── resource-based read helpers (non-admin-safe, scales past page limits) —
+// same pattern as product_measurement.js / ui_product_measurement_add.js ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(ctx, resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function chunk(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(ctx, resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, 150);
+  return batches.reduce(function (p, batch) {
+    return p.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(ctx, resourceName, Object.assign({}, params, { filter: filter })).then(rows => acc.concat(rows));
+    });
+  }, Promise.resolve([]));
+}
+
+// ── belongsTo relation field names — HARDCODED, confirmed from the schema
+// dump, rather than resolved at runtime via ctx.api.resource('fields').
+// That dynamic lookup read NocoBase's `fields` system/meta-collection,
+// which non-admin roles don't have read access to. My earlier getRels()
+// caught that rejection internally and fell back to a raw-FK write (which
+// is why the marker still ended up saved correctly) — but NocoBase's own
+// global HTTP interceptor still surfaced a "No permissions" toast for that
+// failed sub-request regardless of the local catch. Hardcoding removes the
+// `fields` read entirely, so there's nothing left to fail.
+const MARKER_RELS = { fk_product_code: { field: 'product', targetKey: 'code' } }; // product's primary key is `code`, not `id`
+const MARKER_DETAILS_RELS = {
+  fk_marker_id: { field: 'marker', targetKey: 'id' },
+  fk_sku_option_id: { field: 'sku_option', targetKey: 'id' },
+};
+// production_marker and product_marker have NO belongsTo relations
+// configured (confirmed from their schema — plain fk columns only), so
+// their writes already use raw values directly, no map needed.
+
+function assocFragment(rels, fkColumn, value) {
+  const rel = rels[fkColumn];
+  const out = {};
+  if (rel && value != null) { out[rel.field] = {}; out[rel.field][rel.targetKey] = value; }
+  else { out[fkColumn] = value; }
+  return out;
+}
+
+// ── model validity: reject bare "brand-letter(s) + digits" placeholders
+// like "O41", accept anything with real content after that, like "O41Seville" ----
+function isValidModel(model) {
+  if (!model) return false;
+  const m = String(model).trim();
+  if (!m) return false;
+  return !/^[A-Za-z]+\d+$/.test(m);
+}
+
+// ── fetch marker_details (size:qty) for a set of marker ids, shared by the
+// main summary fetch and manual search ──
+async function fetchMarkerDetailsMap(ctx, markerIds) {
+  if (!markerIds.length) return {};
+  const rows = await fetchByIn(ctx, 'marker_details', 'fk_marker_id', markerIds, { fields: ['fk_marker_id', 'quantity'], appends: ['sku_option'] });
+  const byMarker = {};
+  rows.forEach(function (r) {
+    const key = String(r.fk_marker_id);
+    const so = r.sku_option || {};
+    (byMarker[key] = byMarker[key] || []).push({ display: so.display || '-', sort: so.sort || 0, quantity: r.quantity });
+  });
+  Object.keys(byMarker).forEach(function (k) { byMarker[k].sort(function (a, b) { return a.sort - b.sort; }); });
+  return byMarker;
+}
+
+// ── data fetch ──
+async function fetchSummary(ctx, productionId) {
+  const prodRows = await fetchAllPages(ctx, 'production', { filter: { id: productionId }, appends: ['product_code', 'konveksi'], pageSize: 1 });
+  const head = prodRows[0];
+  if (!head) return null;
+
+  const product = head.product_code || {};
+  const konveksi = head.konveksi || {};
+  const productCode = head.fk_product_code;
+  const productModel = product.model || null;
+  const modelValid = isValidModel(productModel);
+
+  // markers already linked to this production
+  const linkedRows = await fetchAllPages(ctx, 'production_marker', { filter: { fk_production_id: productionId }, fields: ['id', 'fk_marker_id'] });
+  const linkedMarkerIds = uniqVals(linkedRows.map(r => r.fk_marker_id));
+  const linkIdByMarker = {};
+  linkedRows.forEach(function (r) { linkIdByMarker[String(r.fk_marker_id)] = r.id; });
+
+  // tier 1: markers already mapped to this production's own product
+  const sameProductLinks = await fetchAllPages(ctx, 'product_marker', { filter: { fk_product_code: productCode }, fields: ['fk_marker_id'] });
+  const sameProductIds = uniqVals(sameProductLinks.map(r => r.fk_marker_id)).filter(id => linkedMarkerIds.indexOf(id) === -1);
+
+  // tier 2: markers mapped to other products sharing a valid model
+  let sameModelIds = [];
+  if (modelValid) {
+    const siblingProducts = await fetchAllPages(ctx, 'product', { filter: { model: productModel }, fields: ['code'] });
+    const siblingCodes = uniqVals(siblingProducts.map(p => p.code)).filter(c => c !== productCode);
+    if (siblingCodes.length) {
+      const siblingLinks = await fetchByIn(ctx, 'product_marker', 'fk_product_code', siblingCodes, { fields: ['fk_marker_id'] });
+      const exclude = linkedMarkerIds.concat(sameProductIds);
+      sameModelIds = uniqVals(siblingLinks.map(r => r.fk_marker_id)).filter(id => exclude.indexOf(id) === -1);
+    }
+  }
+
+  const allMarkerIds = uniqVals(linkedMarkerIds.concat(sameProductIds).concat(sameModelIds));
+  const markerRows = allMarkerIds.length ? await fetchByIn(ctx, 'marker', 'id', allMarkerIds, { fields: ['id', 'length'] }) : [];
+  const lengthById = {};
+  markerRows.forEach(function (m) { lengthById[String(m.id)] = m.length; });
+  const detailsMap = await fetchMarkerDetailsMap(ctx, allMarkerIds);
+
+  const markers = linkedMarkerIds.map(function (id) {
+    return { linkId: linkIdByMarker[String(id)], markerId: id, length: lengthById[String(id)], sizes: detailsMap[String(id)] || [] };
+  });
+  const linkableMarkers = sameProductIds.map(function (id) {
+    return { markerId: id, length: lengthById[String(id)], sizes: detailsMap[String(id)] || [], matchReason: 'same product' };
+  }).concat(sameModelIds.map(function (id) {
+    return { markerId: id, length: lengthById[String(id)], sizes: detailsMap[String(id)] || [], matchReason: 'same model' };
+  }));
+
+  const skuRows = await fetchAllPages(ctx, 'sku_option', { fields: ['id', 'display'], sort: ['sort'] });
+
+  return {
+    productionId: head.id,
+    productCode: productCode,
+    productName: product.name,
+    productModel: productModel,
+    productModelValid: modelValid,
+    konveksiName: konveksi.name,
+    fabricCode: product.fk_main_fabric_code,
+    remarks: head.remarks,
+    markers: markers,
+    linkableMarkers: linkableMarkers,
+    skuOptions: skuRows,
+  };
+}
+
+// ── manual lookup: markers mapped to an arbitrary, user-typed product code ──
+async function searchByProductCode(ctx, code) {
+  const trimmed = String(code || '').trim();
+  if (!trimmed) return [];
+  const links = await fetchAllPages(ctx, 'product_marker', { filter: { fk_product_code: trimmed }, fields: ['fk_marker_id'] });
+  const markerIds = uniqVals(links.map(r => r.fk_marker_id));
+  if (!markerIds.length) return [];
+  const markerRows = await fetchByIn(ctx, 'marker', 'id', markerIds, { fields: ['id', 'length'] });
+  const detailsMap = await fetchMarkerDetailsMap(ctx, markerIds);
+  return markerRows.map(function (m) {
+    return { markerId: m.id, length: m.length, sizes: detailsMap[String(m.id)] || [], matchReason: 'manual: ' + trimmed };
+  });
+}
+
+// ── write: new marker -> marker_details -> production_marker -> product_marker ──
+async function createMarker(ctx, productCode, productionId, length, sizes) {
+  const markerValues = Object.assign({ length: length }, assocFragment(MARKER_RELS, 'fk_product_code', productCode));
+  const markerRes = await ctx.api.resource('marker').create({ values: markerValues });
+  const markerId = markerRes?.data?.data?.id;
+  if (!markerId) throw new Error('Failed to create marker.');
+
+  for (const s of sizes) {
+    const v = { quantity: s.qty };
+    Object.assign(v, assocFragment(MARKER_DETAILS_RELS, 'fk_marker_id', markerId));
+    Object.assign(v, assocFragment(MARKER_DETAILS_RELS, 'fk_sku_option_id', s.id));
+    await ctx.api.resource('marker_details').create({ values: v });
+  }
+
+  await linkMarker(ctx, markerId, productionId);
+  await ensureProductLinks(ctx, markerId, [productCode]);
+  return markerId;
+}
+
+// ── link an existing marker to this production (no new marker row) — plain
+// fk columns, no belongsTo relation configured on production_marker ──
+async function linkMarker(ctx, markerId, productionId) {
+  await ctx.api.resource('production_marker').create({ values: { fk_marker_id: markerId, fk_production_id: productionId } });
+}
+
+// ── ensure product_marker rows exist for (markerId, each product code) —
+// plain fk columns, no belongsTo relation configured on product_marker
+// (confirmed from its schema), so reads/writes use raw values directly ──
+async function ensureProductLinks(ctx, markerId, productCodes) {
+  const codes = (productCodes || []).filter(Boolean);
+  if (!codes.length) return { attempted: 0, created: 0 };
+  const existing = await fetchByIn(ctx, 'product_marker', 'fk_product_code', codes, { filter: { fk_marker_id: markerId }, fields: ['fk_product_code'] });
+  const have = {};
+  existing.forEach(function (r) { have[r.fk_product_code] = true; });
+  let created = 0;
+  for (const code of codes) {
+    if (have[code]) continue;
+    await ctx.api.resource('product_marker').create({ values: { fk_marker_id: markerId, fk_product_code: code } });
+    created++;
+  }
+  return { attempted: codes.length, created: created };
+}
+
+// ── unlink: destroy only the production_marker row, marker + its
+// product_marker mappings are kept ──
+function confirmUnlink(ctx, linkId, onDone) {
+  Modal.confirm({
+    title: 'Remove this marker from production?',
+    content: 'This only removes the link between this production and the marker — the marker, its size/quantity data, and its product mappings are all kept for reuse.',
+    okText: 'Remove link',
+    okButtonProps: { danger: true },
+    cancelText: 'Back',
+    onOk: function () {
+      return ctx.api.resource('production_marker').destroy({ filterByTk: linkId })
+        .then(function () { ctx.message.success('Marker unlinked.'); if (onDone) onDone(); })
+        .catch(function (e) { ctx.message.error('Unlink failed: ' + ((e && e.message) || e)); });
+    },
+  });
+}
+
+// ── injected scoped CSS (proven pattern — a <style> tag rendered inline,
+// never document.head access) to make Modal.confirm sit like a right drawer ──
+const PMK_CSS =
+  ".pamk-drawer-modal{top:0 !important;padding-bottom:0 !important;margin:0 !important;" +
+  "position:fixed !important;right:0 !important;height:100vh !important;max-width:420px !important;" +
+  "width:100% !important;}" +
+  ".pamk-drawer-modal .ant-modal-content{height:100vh;border-radius:0;display:flex;flex-direction:column;}" +
+  ".pamk-drawer-modal .ant-modal-body{flex:1;overflow-y:auto;}" +
+  "@media (max-width:480px){.pamk-drawer-modal{max-width:100% !important;}}";
+const PmkStyles = () => ce('style', null, PMK_CSS);
+
+const fieldLabel = t => ce('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, t);
+
+function box(children) {
+  return ce('div', { style: { padding: '8px 10px', background: '#f8fafc', borderRadius: 6, border: '1px solid #f1f5f9', marginBottom: 16 } }, children);
+}
+function sizesLabel(sizes) {
+  return (sizes || []).map(s => s.display + ':' + s.quantity).join('  ');
+}
+
+// ── rich text editor: uncontrolled contentEditable div (avoids cursor jump),
+// same proven pattern as ui_production_edit.js's RichTextEditor ──
+const RichTextEditor = function (props) {
+  const ref = useRef(null);
+  const docRef = useRef(null);
+  useEffect(function () {
+    if (ref.current) { docRef.current = ref.current.ownerDocument; ref.current.innerHTML = props.value || ''; }
+  }, []);
+  function sync() { if (props.onChange && ref.current) props.onChange(ref.current.innerHTML); }
+  function exec(cmd, val) {
+    const doc = docRef.current; if (!doc || !ref.current) return;
+    ref.current.focus();
+    try { doc.execCommand(cmd, false, val || null); } catch (e) {}
+    sync();
+  }
+  const btn = (label, cmd, val, title, style) => ce('button', {
+    type: 'button', title: title || label, onMouseDown: e => e.preventDefault(), onClick: () => exec(cmd, val),
+    style: Object.assign({ border: '1px solid #e5e7eb', background: '#fff', borderRadius: 6, minWidth: 30, height: 26, padding: '0 8px', cursor: 'pointer', fontSize: 12, color: '#374151' }, style || {}),
+  }, label);
+  return ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden' } },
+    ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4, padding: 6, background: '#f8fafc', borderBottom: '1px solid #e5e7eb' } },
+      btn('B', 'bold', null, 'Bold', { fontWeight: 800 }),
+      btn('I', 'italic', null, 'Italic', { fontStyle: 'italic', fontWeight: 700 }),
+      btn('U', 'underline', null, 'Underline', { textDecoration: 'underline', fontWeight: 700 }),
+      btn('• List', 'insertUnorderedList', null, 'Bullet list'),
+      btn('⨯', 'removeFormat', null, 'Clear formatting')),
+    ce('div', {
+      ref: ref, contentEditable: true, onInput: sync,
+      style: { minHeight: 80, maxHeight: 220, overflowY: 'auto', padding: '8px 10px', fontSize: 13, color: '#374151', lineHeight: 1.6, outline: 'none' }
+    })
+  );
+};
+
+// ── reusable row for a linkable/found marker: length, sizes, match tag, Link button ──
+function MarkerLinkRow(props) {
+  const mk = props.mk;
+  return ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
+    ce('div', null,
+      ce('span', { style: { fontWeight: 600, color: '#374151' } }, mk.length + ' cm — '),
+      ce('span', { style: { color: '#64748b' } }, sizesLabel(mk.sizes)),
+      ce('span', { style: { marginLeft: 6, fontSize: 10, color: '#94a3af', textTransform: 'uppercase', letterSpacing: '0.03em' } }, '(' + mk.matchReason + ')')
+    ),
+    ce(Button, { size: 'small', loading: props.linking, onClick: () => props.onLink(mk.markerId) }, 'Link')
+  );
+}
+
+// ── new marker form: size(s) via dropdown, quantity via InputNumber, length via InputNumber ──
+function NewMarkerForm(props) {
+  const skuOptions = props.skuOptions || [];
+  const onAdd = props.onAdd;
+  const [length, setLength] = useState(null);
+  const [sizes, setSizes] = useState([]); // array of sku_option ids
+  const [qty, setQty] = useState({}); // { id: qty }
+
+  const options = skuOptions.map(s => ({ label: s.display, value: s.id }));
+
+  function add() {
+    if (!length) { props.ctx.message.error('Enter a marker length.'); return; }
+    if (!sizes.length) { props.ctx.message.error('Select at least one size.'); return; }
+    const chosen = sizes.map(id => {
+      const opt = skuOptions.find(s => s.id === id);
+      return { id: id, display: opt ? opt.display : id, qty: qty[id] || 1 };
+    });
+    onAdd({ length: length, sizes: chosen });
+    setLength(null);
+    setSizes([]);
+    setQty({});
+  }
+
+  return ce('div', { style: { border: '1px dashed #d9d9d9', padding: 12, borderRadius: 6, marginBottom: 16 } },
+    ce('div', { style: { marginBottom: 10 } },
+      fieldLabel('Marker length (cm)'),
+      ce(InputNumber, { style: { width: '100%' }, min: 0, value: length, onChange: setLength })
+    ),
+    ce('div', { style: { marginBottom: 10 } },
+      fieldLabel('Size(s)'),
+      ce(Select, {
+        mode: 'multiple', style: { width: '100%' }, placeholder: 'Select size(s)',
+        options: options, value: sizes, onChange: setSizes,
+      })
+    ),
+    sizes.length > 0
+      ? ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 } },
+          sizes.map(id => {
+            const opt = skuOptions.find(s => s.id === id);
+            return ce('div', { key: id, style: { display: 'flex', alignItems: 'center', gap: 4 } },
+              ce('span', { style: { fontSize: 12, color: '#374151' } }, (opt ? opt.display : id) + ':'),
+              ce(InputNumber, { min: 1, style: { width: 64 }, value: qty[id] || 1, onChange: v => setQty(Object.assign({}, qty, { [id]: v || 1 })) })
+            );
+          })
+        )
+      : null,
+    ce(Button, { type: 'dashed', block: true, onClick: add }, 'Add to list')
+  );
+}
+
+// ── manual lookup box: free-text product code -> search -> results with Link ──
+function ManualLookup(props) {
+  const [code, setCode] = useState('');
+  const [results, setResults] = useState(null);
+  const [searching, setSearching] = useState(false);
+
+  async function doSearch() {
+    if (!code.trim()) return;
+    setSearching(true);
+    try {
+      const r = await searchByProductCode(props.ctx, code);
+      setResults(r);
+    } catch (e) {
+      props.ctx.message.error('Search failed: ' + ((e && e.message) || e));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  return ce('div', { style: { marginBottom: 16 } },
+    fieldLabel('Manual Lookup (any product.code)'),
+    ce('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+      ce(Input, { value: code, onChange: e => setCode(e.target.value), placeholder: 'e.g. O41SEV', onPressEnter: doSearch }),
+      ce(Button, { onClick: doSearch, loading: searching }, 'Search')
+    ),
+    results !== null
+      ? (results.length === 0
+          ? ce('div', { style: { color: '#d1d5db', fontStyle: 'italic', fontSize: 12 } }, 'No markers mapped to that code')
+          : results.map(mk => ce(MarkerLinkRow, { key: mk.markerId, mk: mk, linking: props.linkingId === mk.markerId, onLink: props.onLink })))
+      : null
+  );
+}
+
+// ── main content, loads inside the modal ──
+function MarkerContent(props) {
+  const ctx = props.ctx;
+  const productionId = props.productionId;
+  const onSaved = props.onSaved;
+  const [state, setState] = useState({ loading: true, data: null, err: null });
+  const [pending, setPending] = useState([]); // queued new markers (not saved yet)
+  const [saving, setSaving] = useState(false);
+  const [linking, setLinking] = useState(null); // markerId currently being linked
+  const [remarksValue, setRemarksValue] = useState('');
+  const [remarksDirty, setRemarksDirty] = useState(false);
+  const [savingRemarks, setSavingRemarks] = useState(false);
+
+  function load() {
+    setState(s => Object.assign({}, s, { loading: true }));
+    fetchSummary(ctx, productionId)
+      .then(function (d) { setState({ loading: false, data: d, err: null }); })
+      .catch(function (e) { setState({ loading: false, data: null, err: (e && e.message) || 'load failed' }); });
+  }
+  useEffect(function () { load(); }, [productionId]);
+
+  // sync the remarks draft from freshly-loaded data, but never clobber an
+  // in-progress unsaved edit (e.g. a marker action triggering a background reload)
+  useEffect(function () {
+    if (state.data && !remarksDirty) setRemarksValue(state.data.remarks || '');
+  }, [state.data]);
+
+  async function saveRemarks() {
+    if (!state.data) return;
+    setSavingRemarks(true);
+    try {
+      await ctx.api.resource('production').update({ filterByTk: state.data.productionId, values: { remarks: remarksValue } });
+      ctx.message.success('Remarks saved.');
+      setRemarksDirty(false);
+      if (onSaved) onSaved();
+    } catch (e) {
+      ctx.message.error('Failed to save remarks: ' + ((e && e.message) || e));
+    } finally {
+      setSavingRemarks(false);
+    }
+  }
+
+  if (state.loading) {
+    return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…');
+  }
+  const d = state.data;
+  if (!d) {
+    return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, state.err || 'Could not load production info.');
+  }
+
+  function removePending(idx) { setPending(pending.filter((_, i) => i !== idx)); }
+
+  async function saveAll() {
+    if (!pending.length) { ctx.message.warning('No new markers to save.'); return; }
+    setSaving(true);
+    try {
+      for (const m of pending) {
+        await createMarker(ctx, d.productCode, d.productionId, m.length, m.sizes);
+      }
+      ctx.notification.success({ message: 'Markers saved', description: pending.length + ' marker(s) created.', duration: 6 });
+      setPending([]);
+      load();
+      if (onSaved) onSaved();
+    } catch (e) {
+      console.error('Save error:', e);
+      ctx.message.error('Failed to save: ' + ((e && e.message) || e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function doLink(markerId) {
+    setLinking(markerId);
+    try {
+      await linkMarker(ctx, markerId, d.productionId);
+      await ensureProductLinks(ctx, markerId, [d.productCode]);
+      ctx.message.success('Marker linked.');
+      load();
+      if (onSaved) onSaved();
+    } catch (e) {
+      ctx.message.error('Link failed: ' + ((e && e.message) || e));
+    } finally {
+      setLinking(null);
+    }
+  }
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+    ce(PmkStyles, null),
+
+    ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid #e5e7eb' } },
+      ce('span', { style: { fontSize: 15, fontWeight: 600, color: '#111827' } }, 'Production Marker'),
+      ce('button', {
+        onClick: () => Modal.destroyAll(), title: 'Close',
+        style: { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 8, width: 30, height: 30, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15, color: '#475569', cursor: 'pointer' },
+      }, '\u00D7')
+    ),
+
+    box([
+      ce('div', { key: 'pc', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
+        ce('span', { style: { color: '#64748b' } }, 'Product Code'), ce('span', { style: { fontWeight: 600 } }, d.productCode || '-')),
+      ce('div', { key: 'pn', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
+        ce('span', { style: { color: '#64748b' } }, 'Product Name'), ce('span', { style: { fontWeight: 600 } }, d.productName || '-')),
+      ce('div', { key: 'pm', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
+        ce('span', { style: { color: '#64748b' } }, 'Product Model'),
+        ce('span', { style: { fontWeight: 600 } },
+          (d.productModel || '(not set)') + (d.productModel && !d.productModelValid ? '  (placeholder — ignored for matching)' : ''))),
+      ce('div', { key: 'kv', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
+        ce('span', { style: { color: '#64748b' } }, 'Konveksi'), ce('span', { style: { fontWeight: 600 } }, d.konveksiName || '-')),
+      ce('div', { key: 'mf', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12 } },
+        ce('span', { style: { color: '#64748b' } }, 'Main Fabric'), ce('span', { style: { fontWeight: 600 } }, d.fabricCode || '-')),
+    ]),
+
+    ce('div', { style: { marginBottom: 16 } },
+      fieldLabel('Remarks'),
+      ce(RichTextEditor, {
+        key: 'pamk_remarks_' + d.productionId,
+        value: remarksValue,
+        onChange: v => { setRemarksValue(v); setRemarksDirty(true); },
+      }),
+      ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
+        ce(Button, { size: 'small', type: 'primary', loading: savingRemarks, disabled: !remarksDirty, onClick: saveRemarks }, 'Save Remarks')
+      )
+    ),
+
+    fieldLabel('Existing Markers (this production)'),
+    d.markers.length === 0
+      ? ce('div', { style: { color: '#d1d5db', fontStyle: 'italic', fontSize: 12, marginBottom: 16 } }, 'No markers yet')
+      : ce('div', { style: { marginBottom: 16 } },
+          d.markers.map(mk =>
+            ce('div', { key: mk.linkId, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
+              ce('div', null,
+                ce('span', { style: { fontWeight: 600, color: '#374151' } }, mk.length + ' cm — '),
+                ce('span', { style: { color: '#64748b' } }, sizesLabel(mk.sizes))
+              ),
+              ce('button', {
+                onClick: () => confirmUnlink(ctx, mk.linkId, load),
+                style: { border: 'none', background: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 12 }
+              }, 'Remove')
+            )
+          )
+        ),
+
+    d.linkableMarkers.length > 0
+      ? ce('div', { style: { marginBottom: 16 } },
+          fieldLabel('Reuse Marker'),
+          d.linkableMarkers.map(mk => ce(MarkerLinkRow, { key: mk.markerId, mk: mk, linking: linking === mk.markerId, onLink: doLink }))
+        )
+      : null,
+
+    ce(ManualLookup, { ctx: ctx, linkingId: linking, onLink: doLink }),
+
+    fieldLabel('Add New Marker'),
+    ce(NewMarkerForm, { ctx: ctx, skuOptions: d.skuOptions, onAdd: m => setPending(pending.concat([m])) }),
+
+    pending.length > 0
+      ? ce('div', { style: { marginBottom: 16 } },
+          ce('div', { style: { fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 6 } }, 'Pending (not saved yet)'),
+          pending.map((m, i) =>
+            ce('div', { key: i, style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
+              ce('span', null, m.length + ' cm — ' + m.sizes.map(s => s.display + ':' + s.qty).join(' ')),
+              ce('button', { onClick: () => removePending(i), style: { border: 'none', background: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 12 } }, 'remove')
+            )
+          )
+        )
+      : null,
+
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 } },
+      ce('button', { onClick: () => Modal.destroyAll(), style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Close'),
+      ce(Button, { type: 'primary', loading: saving, onClick: saveAll }, 'Save New Markers')
+    )
+  );
+}
+
+// ── entry point ──
+function openModal(args) {
+  const ctx = args.ctx;
+  const productionId = args.productionId;
+  const onSaved = args.onSaved;
+
+  if (!ctx) return;
+  if (!productionId) { ctx.message.warning('No production record found.'); return; }
+
+  Modal.confirm({
+    className: 'pamk-drawer-modal',
+    icon: null,
+    content: ce(MarkerContent, { ctx: ctx, productionId: productionId, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+
+return { openModal, fetchSummary, searchByProductCode, isValidModel, MarkerContent };
