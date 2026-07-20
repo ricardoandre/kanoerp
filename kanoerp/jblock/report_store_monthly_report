@@ -1,0 +1,1170 @@
+// jblock — MONTHLY REPORT
+//
+// Controls: Store (required), Month Period (anchor month, DEFAULTS TO LAST
+// MONTH, not the current month). Window is FIXED at the trailing 6 months
+// from that anchor throughout this report.
+//
+// 1. TOTAL SALES TREND — plain inline SVG bar chart (no charting library
+//    assumed available), store-wide monthly quantity, oldest→newest LEFT
+//    TO RIGHT — the one place in this report that reads chronologically
+//    forward; every table elsewhere reads most-recent-first.
+//
+// 2/3/4. SALES BY MODEL / PRODUCT / VARIANT — Total + 6 month-columns,
+//    grand-total row pinned at top. Sortable: click "Total" or any month
+//    header to sort by that column (click again to flip asc/desc).
+//    DEFAULT sort is by the Month Period column (follows whichever month
+//    you pick until you manually click a different column). More than 10
+//    rows → top 10 shown + "Show all (N)" button.
+//    Model and Product tables: the CHOSEN month's column (only that one,
+//    not all 6) gets a ⚠ warning if that row had at least one OOS variant
+//    as of Month Period's end. Rows are also CLICKABLE — opens the same
+//    drill-down drawer used by Need Restock/Rotation (see below). Variant
+//    table has neither — no OOS warning, no click-through (a "size" being
+//    OOS across every product sharing it is a different, rarer question,
+//    and there's no single product to drill into for a size).
+//
+//    Below Model and Product tables: RISING / DECLINING summaries, shown
+//    SIDE BY SIDE on wide screens (flex-wrap, so it naturally stacks on
+//    narrow ones instead of needing separate mobile/desktop logic). Rows
+//    are also clickable, same drawer.
+//
+// 5. NEED RESTOCK / 6. PRODUCT ROTATION — Need Restock ranks by MISSED
+//    SALES OPPORTUNITY (see below, no longer "currently OOS ranked by
+//    importance"); Product Rotation is worst 6-month sellers ranked
+//    ascending, but now REQUIRES A MINIMUM 3-MONTH TRIAL: a product must
+//    have its earliest record (first sale or stock-ledger entry) before
+//    the 1st of the month immediately preceding Month Period — e.g. for
+//    a June anchor, before May 1st, guaranteeing at least 3 calendar
+//    months of history (Apr/May/Jun) by the end of the window — anything
+//    newer is excluded from Rotation entirely so brand-new products
+//    aren't flagged for dropping before they've had a fair chance. Rows
+//    clickable on both, opens the per-size drill-down drawer.
+//
+// DRILL-DOWN DRAWER — two modes:
+//    Product (clicked a product row, or a Rising/Declining Product row, or
+//      a Need Restock/Rotation row): ONE product's per-size breakdown.
+//    Model (clicked a model row, or a Rising/Declining Model row): ALL
+//      products under that model, ranked by their own sales in the
+//      displayed window (bestseller first), each shown as its own
+//      identical per-product block — same shape as Product mode, just
+//      repeated. Capped at 25 products with a note if truncated.
+//    Inside this drawer specifically, months run OLDEST→NEWEST left to
+//    right — same deliberate exception as the trend chart, and as
+//    established for this drawer previously.
+//    Summary header per product block shows Current (End) Stock AND
+//    Total Sales for the 6-month window, side by side.
+//    Per-month columns are Beg / New / Sold, and the per-row End Stock
+//    (unchanged) is now the LAST column of the table, after all months,
+//    instead of pinned next to Size — this keeps the sticky Size column
+//    as the only frozen column and, combined with a fixed table layout /
+//    percentage column widths, lets the whole table fit inside the
+//    drawer on a normal desktop viewport without horizontal scrolling:
+//      Beg  = stock as of the start of that month (unchanged).
+//      ADJ  = net of ALL stock_ledger quantity entries in that exact
+//             month, positive AND negative (stock-in, incoming/outgoing
+//             transfers, adjustments — everything nets together). This
+//             was previously "New" and counted inbound (positive) entries
+//             only; it's now a genuine net-adjustment figure, so it can
+//             show negative months.
+//      Sold = units sold in that exact month (unchanged).
+//      Stock (end) = stock as of Month Period's end (unchanged values,
+//             just relocated to the end of the row).
+//    A final "Suggested Restock" column (per size, plus a product total)
+//    now follows Stock: peakMonthlySales (that size's single best month
+//    of sales within the displayed 6-month window) minus its current
+//    (end) stock, floored at 0, plus a fixed +1 unit buffer — 0/blank
+//    when current stock already covers the peak month. This is the same
+//    per-variant opportunity figure that drives Need Restock's sort
+//    below, just with the +1 buffer added for the actual restock
+//    suggestion (the buffer is NOT included in the sort score).
+//
+// STICKY COLUMN WIDTH: the frozen first column (item label) in the
+//    Model/Product/Variant tables and the Rising/Declining lists is capped
+//    at a fixed max-width with ellipsis truncation (full text still
+//    available via native title-tooltip on hover) — a long "CODE — Product
+//    Name" label was pushing the data columns out of view on the Product
+//    table especially. Applied to every sticky-column table in this file
+//    for consistency, not just Sales by Product.
+//
+// RISING/DECLINING FORMULA (unchanged from before): drop any of the 5
+//    months before Month Period that had 0 sales, average what's left as
+//    the baseline (skip the row entirely if there's no non-zero prior
+//    month at all), gain = chosen month − that average. Rising = positive
+//    gain desc. Declining = negative gain, most negative first. Ranked by
+//    absolute unit gain (pcs), not percentage.
+//
+// NEED RESTOCK — MISSED SALES OPPORTUNITY SCORE (replaces the old
+//    sales6mo × (1 + oosStreak) importance score): for each VARIANT under
+//    a product, take that variant's single best month of sales within the
+//    displayed 6-month window (peakMonthlySales), subtract its current
+//    (end-of-Month-Period) stock, and floor at 0 — a variant that's
+//    already stocked at or above its own peak demand contributes nothing.
+//    Sum that across every variant of the product; that sum is the
+//    product's uncapped opportunity, representing the most additional
+//    sales this product plausibly left on the table by being
+//    under-stocked. That sum is then CAPPED by a second figure, Highest
+//    Monthly Sales — the biggest single month the WHOLE product (all
+//    variants combined) actually did within the window: if that
+//    realistic ceiling is lower than the summed opportunity, the score
+//    uses the ceiling instead (each variant's own peak may have landed in
+//    a different month, so the summed figure can overstate what the
+//    product could really do in any one month). Products scoring 0
+//    (every variant already covers its own peak) are dropped from the
+//    list entirely — there's no restock upside to show. No OOS
+//    requirement and no top-30 candidate-pool pre-filter anymore — every
+//    product with history is considered; the score itself is the filter.
+//    Sort is this (capped) score, descending.
+//
+// ASSUMPTIONS (confirm / correct if wrong) — carried over:
+//   - OOS threshold is stock <= 0 throughout.
+//   - Stock reference point is the END of Month Period, not today's real
+//     date.
+//   - "Products/models with history" = at least one store_sales or
+//     stock_ledger record at this store.
+//   - Need Restock no longer uses a candidate pool or OOS requirement —
+//     every product with history is scored, and only score > 0 survives
+//     the filter (see MISSED SALES OPPORTUNITY SCORE above).
+//   - Product Rotation's minimum-trial "start selling" date = the
+//     earliest of that product's store_sales OR stock_ledger records
+//     (i.e. when it first showed up at this store at all), not strictly
+//     its first actual sale — a product that's had zero sales across a
+//     full 3-month trial is exactly the case Rotation should surface, so
+//     gating on "first sale" alone would wrongly exclude it. Flag it if
+//     you wanted the stricter "first sale only" definition instead.
+//   - Sticky column max-width is 220px, arbitrary but reasonable — easy
+//     to adjust if it's cutting off codes that need more room in
+//     practice.
+//   - NEW: the drill-down drawer's "New" column is renamed "ADJ" and now
+//     nets ALL stock_ledger.quantity entries in that month (positive and
+//     negative), instead of summing positive (inbound) entries only —
+//     flag it if you wanted it split back into separate in/out figures.
+//   - NEW: Product Rotation also excludes products that are currently out
+//     of stock (end-of-Month-Period stock <= 0) — there's nothing to
+//     "drop" from a product that's already gone; Rotation is meant to
+//     surface poor sellers that are still tying up shelf space/inventory.
+//   - NEW: drill-down drawer widths were widened (product mode 700→960,
+//     model mode 860→1040) to give the now-fixed-layout table enough
+//     room on desktop; if your typical screen is narrower than ~1300px
+//     you may still see the browser's own scrollbar for the drawer
+//     itself (not the table) — flag it and I'll size it responsively
+//     instead of with fixed px.
+//   - NEW: mobile (≤640px) responsive pass, via a single injected <style>
+//     tag (RESPONSIVE_STYLE) using a 'mreport-' class prefix so it won't
+//     clash with other jblocks on the same page:
+//       • Need Restock / Product Rotation cards: the right-hand stat
+//         block (Opportunity/Stock/Last Mo./6 Mo.) and badges shrink
+//         (smaller gap/font) instead of overflowing.
+//       • The drill-down drawer's per-size table switches OFF its
+//         desktop fixed/percentage column layout (which exists purely to
+//         avoid horizontal scroll on desktop) and instead gets a fixed
+//         min-width with normal auto column sizing, so text stays
+//         readable and the table scrolls horizontally instead of
+//         squishing.
+//       • Sales by Product: the item cell switches from one truncated
+//         line to two wrapped lines (code, then name) so the name isn't
+//         clipped on a narrow screen; Model/Variant tables are unchanged.
+//     640px is a reasonable phone-width guess — flag it if you want the
+//     breakpoint adjusted.
+//
+// KNOWN LIMITATION (carried over): fetchStores()/fetchSalesRows()/
+// fetchLedgerRows() still use ctx.sql (admin/root-gated, silently empty
+// for non-admin roles). Only fetchImages() is on the resource API.
+//
+// Depends on: none.
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Select, DatePicker, Drawer } = antd;
+const ce = React.createElement;
+const STOCK_COLOR = '#2563eb';
+const OOS_RED = '#dc2626';
+const OOS_AMBER = '#b45309';
+const RESTOCK_GREEN = '#16a34a';
+const SUGGEST_ORANGE = '#ea580c';
+const SALES_PURPLE = '#7c3aed';
+// mobile-only overrides, injected once via a <style> tag (see Root). Uses
+// !important because everything it targets is normally styled inline —
+// external/class CSS is otherwise lower priority than inline style attrs.
+// 'mreport-' prefix avoids clashing with other jblocks on the same page.
+const RESPONSIVE_STYLE = `
+.mreport-scroll { -webkit-overflow-scrolling: touch; }
+.mreport-item-oneline { display: inline-block; }
+.mreport-item-twoline { display: none; }
+@media (max-width: 640px) {
+  .mreport-productrow { gap: 8px !important; padding: 8px 10px !important; }
+  .mreport-productrow-img { width: 36px !important; height: 36px !important; }
+  .mreport-badges { gap: 4px !important; }
+  .mreport-badge { font-size: 8px !important; padding: 1px 5px !important; }
+  .mreport-stats { display: grid !important; grid-template-columns: repeat(2, auto) !important; gap: 4px 10px !important; justify-content: end !important; }
+  .mreport-stat-label { font-size: 7px !important; }
+  .mreport-stat-value { font-size: 10px !important; }
+  .mreport-item-oneline { display: none !important; }
+  .mreport-item-twoline { display: block !important; }
+  .mreport-product-itemcol { max-width: 260px !important; white-space: normal !important; }
+  .mreport-detail-table { table-layout: auto !important; min-width: 820px !important; }
+  .mreport-detail-table col { width: auto !important; }
+}
+`;
+const CAP = 10;
+const ITEM_COL_MAX_WIDTH = 220;
+// ── helpers ──
+function uniqueUid(base) {
+  return base + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+function runSql(uid, sql) {
+  const u = uniqueUid(uid);
+  return ctx.sql.save({ uid: u, sql, dataSourceKey: 'main' })
+    .then(() => ctx.sql.runById(u, { type: 'selectRows', dataSourceKey: 'main' }))
+    .then(r => r || []);
+}
+function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+function esc(s) { return String(s).replace(/'/g, "''"); }
+function ymd(d) { return dayjs(d).format('YYYY-MM-DD'); }
+function dash(n) { return n === 0 ? '-' : String(n); }
+// compact "MMM 'YY" label used only inside the drill-down drawer table,
+// where 6 months × 3 sub-columns need to fit without horizontal scroll.
+function shortMonthLabel(monthKey) {
+  return dayjs(monthKey + '-01').format("MMM 'YY");
+}
+function fetchStores() {
+  return runSql('vmr_stores', "SELECT id, store_code, name FROM store ORDER BY name ASC");
+}
+function fetchImages() {
+  const pageSize = 1000;
+  function loadPage(page, acc) {
+    return ctx.api.resource('product').list({
+      fields: ['code'], appends: ['image'], pageSize: pageSize, page: page,
+    }).then(function (res) {
+      const rows = (res && res.data && res.data.data) || [];
+      const merged = acc.concat(rows);
+      if (rows.length < pageSize) return merged;
+      return loadPage(page + 1, merged);
+    });
+  }
+  return loadPage(1, []).then(function (rows) {
+    const map = {};
+    rows.forEach(function (p) {
+      const img = p.image;
+      const imgRow = Array.isArray(img) ? img[0] : img;
+      if (!imgRow) return;
+      map[p.code] = imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
+    });
+    return map;
+  }).catch(function () { return {}; });
+}
+function fetchSalesRows(storeId, uptoDate) {
+  return runSql('vmr_sales_v3',
+    "SELECT ss.quantity AS quantity, ss.transaction_date AS transaction_date, " +
+    "  pv.id AS variant_id, pv.fk_product_code AS product_code, pv.fk_sku_option_id AS sku_option_id, " +
+    "  p.model AS model, p.name AS product_name, so.display AS sku_display, so.value AS sku_value, so.sort AS sku_sort " +
+    "FROM store_sales ss " +
+    "JOIN product_variant pv ON ss.fk_product_variant_id = pv.id " +
+    "JOIN product p ON pv.fk_product_code = p.code " +
+    "JOIN sku_option so ON pv.fk_sku_option_id = so.id " +
+    "WHERE ss.fk_store_id = " + Number(storeId) +
+    "  AND ss.transaction_date <= '" + esc(uptoDate) + "'"
+  );
+}
+function fetchLedgerRows(storeId, uptoDate) {
+  return runSql('vmr_ledger_v3',
+    "SELECT sl.quantity AS quantity, sl.transaction_date AS transaction_date, " +
+    "  pv.id AS variant_id, pv.fk_product_code AS product_code, pv.fk_sku_option_id AS sku_option_id, " +
+    "  p.model AS model, p.name AS product_name, so.display AS sku_display, so.value AS sku_value, so.sort AS sku_sort " +
+    "FROM stock_ledger sl " +
+    "JOIN product_variant pv ON sl.fk_product_variant_id = pv.id " +
+    "JOIN product p ON pv.fk_product_code = p.code " +
+    "JOIN sku_option so ON pv.fk_sku_option_id = so.id " +
+    "WHERE sl.fk_store_id = " + Number(storeId) +
+    "  AND sl.transaction_date <= '" + esc(uptoDate) + "'"
+  );
+}
+// ── months: 6, anchor first, descending (most recent first) ──
+function buildMonths(anchorMonth) {
+  const months = [];
+  for (let i = 0; i < 6; i++) {
+    const m = anchorMonth.subtract(i, 'month');
+    months.push({ key: m.format('YYYY-MM'), label: m.format('MMM YYYY') });
+  }
+  return months;
+}
+// ── stock reconstruction ──
+function buildEvents(salesRowsAllTime, ledgerRowsAllTime) {
+  const events = {};
+  function push(row, sign) {
+    const vid = String(row.variant_id);
+    if (!events[vid]) events[vid] = [];
+    events[vid].push({ date: ymd(row.transaction_date), delta: sign * num(row.quantity) });
+  }
+  salesRowsAllTime.forEach(r => push(r, -1));
+  ledgerRowsAllTime.forEach(r => push(r, 1));
+  return events;
+}
+function stockAsOf(events, variantId, dateStr) {
+  const list = events[String(variantId)];
+  if (!list) return 0;
+  let sum = 0;
+  for (let i = 0; i < list.length; i++) { if (list[i].date <= dateStr) sum += list[i].delta; }
+  return sum;
+}
+function stockForVariantSet(events, variantIdSet, dateStr) {
+  let sum = 0;
+  variantIdSet.forEach(vid => { sum += stockAsOf(events, vid, dateStr); });
+  return sum;
+}
+function isOOSForVariantSet(events, variantIdSet, dateStr) {
+  let any = false;
+  variantIdSet.forEach(function (vid) { if (stockAsOf(events, vid, dateStr) <= 0) any = true; });
+  return any;
+}
+function endOfMonthCapped(monthKey, anchorEndDate) {
+  const eom = dayjs(monthKey + '-01').endOf('month').format('YYYY-MM-DD');
+  return eom > anchorEndDate ? anchorEndDate : eom;
+}
+// ── section 1 data ──
+function computeMonthlyStoreTotal(salesRowsAllTime, monthKeys) {
+  const monthSet = {};
+  monthKeys.forEach(k => { monthSet[k] = true; });
+  const totals = {};
+  monthKeys.forEach(k => { totals[k] = 0; });
+  salesRowsAllTime.forEach(function (r) {
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (monthSet[mk]) totals[mk] += num(r.quantity);
+  });
+  return totals;
+}
+// ── sections 2/3/4 data ──
+function groupKeyForSimple(row, groupBy) {
+  if (groupBy === 'product') {
+    return { key: 'prod_' + (row.product_code || ''), label: (row.product_code || '(no product)') + (row.product_name ? (' — ' + row.product_name) : ''), code: row.product_code || null, name: row.product_name || '' };
+  }
+  if (groupBy === 'variant') {
+    return { key: 'sku_' + row.sku_option_id, label: row.sku_display || row.sku_value || '(no size)', code: null, name: '' };
+  }
+  return { key: 'model_' + (row.model || ''), label: row.model || '(no model)', code: null, name: '' };
+}
+function buildGroupedSales(salesRowsAllTime, ledgerRowsAllTime, groupBy, monthKeys) {
+  const monthSet = {};
+  monthKeys.forEach(k => { monthSet[k] = true; });
+  const groups = {};
+  function ensure(g) {
+    if (!groups[g.key]) {
+      const byMonth = {};
+      monthKeys.forEach(mk => { byMonth[mk] = 0; });
+      groups[g.key] = { label: g.label, code: g.code, name: g.name, total: 0, byMonth: byMonth, variantIds: new Set() };
+    }
+    return groups[g.key];
+  }
+  salesRowsAllTime.forEach(function (r) {
+    const g = groupKeyForSimple(r, groupBy);
+    const group = ensure(g);
+    group.variantIds.add(String(r.variant_id));
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (monthSet[mk]) {
+      const q = num(r.quantity);
+      group.total += q; group.byMonth[mk] += q;
+    }
+  });
+  ledgerRowsAllTime.forEach(function (r) {
+    const g = groupKeyForSimple(r, groupBy);
+    if (!groups[g.key]) return;
+    groups[g.key].variantIds.add(String(r.variant_id));
+  });
+  const list = Object.keys(groups).map(k => groups[k]);
+  list.sort((a, b) => b.total - a.total);
+  return list;
+}
+// OOS is checked ONLY for the chosen (most recent displayed) month, not
+// every month in the window.
+function attachChosenMonthOOS(rows, events, chosenMonthKey, anchorEndDate) {
+  rows.forEach(function (row) {
+    row.isOOSChosen = isOOSForVariantSet(events, row.variantIds, endOfMonthCapped(chosenMonthKey, anchorEndDate));
+  });
+}
+// ── rising/declining trend summary ──
+function computeTrendSummary(rows, months) {
+  const chosenKey = months[0].key;
+  const priorKeys = months.slice(1).map(m => m.key);
+  const rising = [], declining = [];
+  rows.forEach(function (row) {
+    const priorValues = priorKeys.map(k => row.byMonth[k]).filter(v => v > 0);
+    if (!priorValues.length) return;
+    const avgPrev = priorValues.reduce((s, v) => s + v, 0) / priorValues.length;
+    const current = row.byMonth[chosenKey] || 0;
+    const gain = current - avgPrev;
+    const entry = { label: row.label, code: row.code, current: current, avgPrev: avgPrev, gain: gain };
+    if (gain > 0) rising.push(entry);
+    else if (gain < 0) declining.push(entry);
+  });
+  rising.sort((a, b) => b.gain - a.gain);
+  declining.sort((a, b) => a.gain - b.gain);
+  return { rising: rising, declining: declining };
+}
+// ── product-level index + metrics (sections 5/6) ──
+function buildProductVariantIndex(salesRowsAllTime, ledgerRowsAllTime) {
+  const idx = {};
+  function ensure(code) {
+    if (!idx[code]) idx[code] = { code: code, name: '', model: '', variantIds: new Set() };
+    return idx[code];
+  }
+  function consume(rows) {
+    rows.forEach(function (r) {
+      const code = r.product_code || '';
+      if (!code) return;
+      const p = ensure(code);
+      if (!p.name && r.product_name) p.name = r.product_name;
+      if (!p.model && r.model) p.model = r.model;
+      p.variantIds.add(String(r.variant_id));
+    });
+  }
+  consume(salesRowsAllTime);
+  consume(ledgerRowsAllTime);
+  return idx;
+}
+// ── Product Rotation's minimum trial period: a product's earliest record
+// (first sale OR first stock-ledger entry, whichever comes first — i.e.
+// when it first showed up at this store at all, whether or not it went
+// on to sell) — used so brand-new products aren't flagged for dropping
+// before they've had a fair chance. Returns { code -> 'YYYY-MM-DD' }. ──
+function computeFirstRecordDateByProduct(salesRowsAllTime, ledgerRowsAllTime) {
+  const first = {};
+  function consider(rows) {
+    rows.forEach(function (r) {
+      const code = r.product_code || '';
+      if (!code) return;
+      const d = ymd(r.transaction_date);
+      if (!first[code] || d < first[code]) first[code] = d;
+    });
+  }
+  consider(salesRowsAllTime);
+  consider(ledgerRowsAllTime);
+  return first;
+}
+function computeProductMetrics(productIndex, salesRowsAllTime, events, months, anchorEndDate) {
+  const monthKeys = months.map(m => m.key);
+  const lastMonthKey = monthKeys[0];
+  const salesByProductMonth = {};
+  salesRowsAllTime.forEach(function (r) {
+    const code = r.product_code || '';
+    if (!code) return;
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (!salesByProductMonth[code]) salesByProductMonth[code] = {};
+    salesByProductMonth[code][mk] = (salesByProductMonth[code][mk] || 0) + num(r.quantity);
+  });
+  const metrics = {};
+  Object.keys(productIndex).forEach(function (code) {
+    const p = productIndex[code];
+    const byMonth = salesByProductMonth[code] || {};
+    let sales6mo = 0;
+    monthKeys.forEach(mk => { sales6mo += (byMonth[mk] || 0); });
+    const salesLastMonth = byMonth[lastMonthKey] || 0;
+    const currentStock = stockForVariantSet(events, p.variantIds, anchorEndDate);
+    const hasOOSVariant = isOOSForVariantSet(events, p.variantIds, anchorEndDate);
+    let oosStreak = 0;
+    for (let i = 0; i < months.length; i++) {
+      const eom = endOfMonthCapped(months[i].key, anchorEndDate);
+      if (isOOSForVariantSet(events, p.variantIds, eom)) oosStreak++; else break;
+    }
+    metrics[code] = { code: code, name: p.name, model: p.model, sales6mo: sales6mo, salesLastMonth: salesLastMonth, currentStock: currentStock, hasOOSVariant: hasOOSVariant, oosStreak: oosStreak };
+  });
+  return metrics;
+}
+// ── Need Restock's "missed sales opportunity" score: per-variant, take
+// that variant's single best month of sales in the displayed window,
+// subtract its current (end-of-Month-Period) stock, floor at 0, then sum
+// across every variant of the product. A variant already stocked at or
+// above its own peak demand contributes 0 — no OOS requirement, the score
+// itself does the filtering.
+// CAPPED by a second figure, the product's own Highest Monthly Sales —
+// the biggest single month the WHOLE product (all variants combined)
+// actually did within the window. The per-variant sum above can overstate
+// potential, since each variant's peak may have landed in a different
+// month and could never really happen all at once; if that realistic
+// ceiling is lower than the summed opportunity, use the ceiling instead.
+// Returns { code -> score }. ──
+function computeRestockOpportunity(productIndex, salesRowsAllTime, events, months, anchorEndDate) {
+  const monthKeys = months.map(m => m.key);
+  const salesByVariantMonth = {};
+  const salesByProductMonth = {};
+  salesRowsAllTime.forEach(function (r) {
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (monthKeys.indexOf(mk) === -1) return;
+    const vid = String(r.variant_id);
+    const q = num(r.quantity);
+    if (!salesByVariantMonth[vid]) salesByVariantMonth[vid] = {};
+    salesByVariantMonth[vid][mk] = (salesByVariantMonth[vid][mk] || 0) + q;
+    const code = r.product_code || '';
+    if (code) {
+      if (!salesByProductMonth[code]) salesByProductMonth[code] = {};
+      salesByProductMonth[code][mk] = (salesByProductMonth[code][mk] || 0) + q;
+    }
+  });
+  const scores = {};
+  Object.keys(productIndex).forEach(function (code) {
+    const p = productIndex[code];
+    let opportunityScore = 0;
+    p.variantIds.forEach(function (vid) {
+      const byMonth = salesByVariantMonth[vid] || {};
+      let peak = 0;
+      monthKeys.forEach(function (mk) { const v = byMonth[mk] || 0; if (v > peak) peak = v; });
+      const currentStock = stockAsOf(events, vid, anchorEndDate);
+      opportunityScore += Math.max(peak - currentStock, 0);
+    });
+    const byProductMonth = salesByProductMonth[code] || {};
+    let highestMonthlySales = 0;
+    monthKeys.forEach(function (mk) { const v = byProductMonth[mk] || 0; if (v > highestMonthlySales) highestMonthlySales = v; });
+    scores[code] = highestMonthlySales < opportunityScore ? highestMonthlySales : opportunityScore;
+  });
+  return scores;
+}
+// ── which products belong under a clicked model, ranked by sales in window ──
+function getModelProductCodes(modelName, salesRowsAllTime, monthKeys) {
+  const monthSet = {};
+  monthKeys.forEach(k => { monthSet[k] = true; });
+  const perProduct = {};
+  salesRowsAllTime.forEach(function (r) {
+    if ((r.model || '') !== modelName) return;
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    if (!monthSet[mk]) return;
+    const code = r.product_code || '';
+    if (!code) return;
+    perProduct[code] = (perProduct[code] || 0) + num(r.quantity);
+  });
+  const arr = Object.keys(perProduct).map(code => ({ code: code, sortVal: perProduct[code] }));
+  arr.sort((a, b) => b.sortVal - a.sortVal);
+  return arr;
+}
+// ── per-product, per-size breakdown for the drill-down drawer (months
+// passed in ASCENDING order — oldest left, newest right). Includes an ADJ
+// figure per month alongside Beginning stock and Sold, plus a
+// totalSales6mo rollup for the summary header. ──
+function buildProductSizeDetail(productCode, salesRowsAllTime, ledgerRowsAllTime, events, monthsAsc, anchorEndDate) {
+  const monthBoundary = {};
+  monthsAsc.forEach(m => { monthBoundary[m.key] = dayjs(m.key + '-01').subtract(1, 'day').format('YYYY-MM-DD'); });
+  const productSales = salesRowsAllTime.filter(r => (r.product_code || '') === productCode);
+  const productLedger = ledgerRowsAllTime.filter(r => (r.product_code || '') === productCode);
+  let productName = '';
+  const sizes = {};
+  function ensureSize(r) {
+    const sid = r.sku_option_id;
+    if (!sizes[sid]) sizes[sid] = { label: r.sku_display || r.sku_value || '(no size)', sortOrder: num(r.sku_sort), variantId: r.variant_id, salesByExactMonth: {}, adjByExactMonth: {} };
+    return sizes[sid];
+  }
+  productSales.forEach(function (r) {
+    if (!productName && r.product_name) productName = r.product_name;
+    const s = ensureSize(r);
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    s.salesByExactMonth[mk] = (s.salesByExactMonth[mk] || 0) + num(r.quantity);
+  });
+  productLedger.forEach(function (r) {
+    if (!productName && r.product_name) productName = r.product_name;
+    const s = ensureSize(r);
+    // ADJ = net of ALL stock_ledger entries in that exact month, positive
+    // AND negative (stock-in, incoming/outgoing transfers, adjustments —
+    // everything), not just inbound units.
+    const q = num(r.quantity);
+    const mk = dayjs(r.transaction_date).format('YYYY-MM');
+    s.adjByExactMonth[mk] = (s.adjByExactMonth[mk] || 0) + q;
+  });
+  const sizeList = Object.keys(sizes).map(function (sid) {
+    const s = sizes[sid];
+    const currentStock = stockAsOf(events, s.variantId, anchorEndDate);
+    const beginByMonth = {}, salesByMonth = {}, adjByMonth = {}, priorMonthSales = {};
+    let peakSales = 0;
+    monthsAsc.forEach(function (m) {
+      beginByMonth[m.key] = stockAsOf(events, s.variantId, monthBoundary[m.key]);
+      salesByMonth[m.key] = s.salesByExactMonth[m.key] || 0;
+      adjByMonth[m.key] = s.adjByExactMonth[m.key] || 0;
+      if (salesByMonth[m.key] > peakSales) peakSales = salesByMonth[m.key];
+      const priorKey = dayjs(m.key + '-01').subtract(1, 'month').format('YYYY-MM');
+      priorMonthSales[m.key] = s.salesByExactMonth[priorKey] || 0;
+    });
+    // suggested restock = this size's own best month of sales minus its
+    // current stock, floored at 0, plus a fixed +1 unit buffer — 0 when
+    // current stock already covers the peak month. NOTE: the +1 buffer
+    // is NOT part of the Need Restock sort score (that uses the
+    // unbuffered opportunity figure) — it only applies to this suggested
+    // quantity.
+    const restockOpportunity = Math.max(peakSales - currentStock, 0);
+    const suggestedRestock = restockOpportunity > 0 ? restockOpportunity + 1 : 0;
+    return { skuOptionId: sid, label: s.label, sortOrder: s.sortOrder, currentStock: currentStock, beginByMonth: beginByMonth, salesByMonth: salesByMonth, adjByMonth: adjByMonth, priorMonthSales: priorMonthSales, peakSales: peakSales, suggestedRestock: suggestedRestock };
+  });
+  sizeList.sort((a, b) => a.sortOrder - b.sortOrder);
+  const currentStock = sizeList.reduce((s, x) => s + x.currentStock, 0);
+  const beginByMonth = {}, salesByMonth = {}, adjByMonth = {};
+  monthsAsc.forEach(function (m) {
+    beginByMonth[m.key] = sizeList.reduce((s, x) => s + x.beginByMonth[m.key], 0);
+    salesByMonth[m.key] = sizeList.reduce((s, x) => s + x.salesByMonth[m.key], 0);
+    adjByMonth[m.key] = sizeList.reduce((s, x) => s + x.adjByMonth[m.key], 0);
+  });
+  const totalSales6mo = monthsAsc.reduce((s, m) => s + salesByMonth[m.key], 0);
+  const totalSuggestedRestock = sizeList.reduce((s, x) => s + x.suggestedRestock, 0);
+  return { code: productCode, name: productName, currentStock: currentStock, totalSales6mo: totalSales6mo, totalSuggestedRestock: totalSuggestedRestock, beginByMonth: beginByMonth, salesByMonth: salesByMonth, adjByMonth: adjByMonth, sizes: sizeList };
+}
+// ── small building blocks ──
+function sectionTitle(text, subtitle) {
+  return ce('div', { style: { marginBottom: 10 } },
+    ce('div', { style: { fontSize: 15, fontWeight: 700, color: '#111827' } }, text),
+    subtitle ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginTop: 2 } }, subtitle) : null
+  );
+}
+function subheading(text) {
+  return ce('div', { style: { fontSize: 12, fontWeight: 700, color: '#374151', margin: '0 0 6px' } }, text);
+}
+function showAllButton(total, onClick) {
+  return ce('div', { style: { padding: '10px 0', textAlign: 'center' } },
+    ce('button', { onClick: onClick, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff', color: '#374151' } }, 'Show all (' + total + ')')
+  );
+}
+function sortIndicator(active, dir) {
+  if (!active) return '';
+  return dir === 1 ? ' ▲' : ' ▼';
+}
+// truncated sticky-column text with a native tooltip carrying the full label
+function truncatedLabel(text) {
+  return ce('span', { title: text, style: { display: 'inline-block', maxWidth: ITEM_COL_MAX_WIDTH - 20, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', verticalAlign: 'middle' } }, text);
+}
+// ── section 1: bar chart ──
+function TrendChart(props) {
+  const monthsAsc = props.monthsAsc;
+  const values = props.values;
+  const width = 700, height = 220, padding = 32;
+  const max = Math.max.apply(null, values.concat([1]));
+  const n = Math.max(monthsAsc.length, 1);
+  const slot = (width - padding * 2) / n;
+  const barWidth = slot * 0.6;
+  const usableHeight = height - padding * 2 - 14;
+  const bars = monthsAsc.map(function (m, i) {
+    const v = values[i] || 0;
+    const h = max > 0 ? (v / max) * usableHeight : 0;
+    const x = padding + i * slot + (slot - barWidth) / 2;
+    const y = height - padding - h;
+    return ce('g', { key: m.key },
+      ce('rect', { x: x, y: y, width: barWidth, height: h, fill: STOCK_COLOR, rx: 3 }),
+      ce('text', { x: x + barWidth / 2, y: y - 6, textAnchor: 'middle', fontSize: 11, fill: '#374151', fontWeight: 600 }, String(v)),
+      ce('text', { x: x + barWidth / 2, y: height - padding + 16, textAnchor: 'middle', fontSize: 10, fill: '#6b7280' }, m.label)
+    );
+  });
+  return ce('svg', { viewBox: '0 0 ' + width + ' ' + height, style: { width: '100%', height: 220, display: 'block' } },
+    ce('line', { x1: padding, y1: height - padding, x2: width - padding, y2: height - padding, stroke: '#e5e7eb' }),
+    bars
+  );
+}
+// ── sections 2/3/4: sortable grouped sales table ──
+function SalesGroupTable(props) {
+  const months = props.months;
+  const rows = props.rows;
+  const itemLabel = props.itemLabel;
+  const showOOSWarning = !!props.showOOSWarning;
+  const groupKind = props.groupKind; // 'model' | 'product' | 'variant'
+  const onEntityClick = props.onEntityClick; // (kind, key) => void, only wired for model/product
+  const [showAll, setShowAll] = useState(false);
+  const [sortCol, setSortCol] = useState(null);
+  const [sortDir, setSortDir] = useState(-1);
+  const chosenMonthKey = months[0] && months[0].key;
+  const effectiveSortCol = sortCol || chosenMonthKey || 'total';
+  const clickable = groupKind === 'model' || groupKind === 'product';
+  function handleSort(col) {
+    if (col === effectiveSortCol) setSortDir(sortDir === -1 ? 1 : -1);
+    else { setSortCol(col); setSortDir(-1); }
+  }
+  const thStyle = { padding: '7px 10px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', textAlign: 'right', borderBottom: '2px solid #e5e7eb', whiteSpace: 'nowrap', cursor: 'pointer', userSelect: 'none' };
+  const thItemStyle = { ...thStyle, textAlign: 'left', position: 'sticky', left: 0, background: '#fff', cursor: 'default', maxWidth: ITEM_COL_MAX_WIDTH };
+  const tdStyle = { padding: '6px 10px', fontSize: 12, textAlign: 'right', borderBottom: '1px solid #f0f0f0', whiteSpace: 'nowrap' };
+  const tdItemStyle = { ...tdStyle, textAlign: 'left', fontWeight: 600, color: '#374151', position: 'sticky', left: 0, maxWidth: ITEM_COL_MAX_WIDTH };
+  // Sales by Product only: on mobile, code+name switch from one truncated
+  // line to two wrapped lines (via CSS toggling .mreport-item-oneline /
+  // .mreport-item-twoline) so the name isn't clipped on a narrow screen —
+  // desktop keeps the compact single-line truncated form.
+  const itemColClassName = groupKind === 'product' ? 'mreport-product-itemcol' : undefined;
+  function itemCell(r, bg) {
+    if (groupKind !== 'product') {
+      return ce('td', { style: { ...tdItemStyle, background: bg }, className: itemColClassName }, truncatedLabel(r.label));
+    }
+    return ce('td', { style: { ...tdItemStyle, background: bg }, className: itemColClassName },
+      ce('span', { className: 'mreport-item-oneline' }, truncatedLabel(r.label)),
+      ce('div', { className: 'mreport-item-twoline' },
+        ce('div', { style: { fontWeight: 700 } }, r.code || '(no product)'),
+        r.name ? ce('div', { style: { fontWeight: 400, color: '#6b7280', whiteSpace: 'normal', wordBreak: 'break-word' } }, r.name) : null
+      )
+    );
+  }
+  const sorted = rows.slice().sort(function (a, b) {
+    const av = effectiveSortCol === 'total' ? a.total : a.byMonth[effectiveSortCol];
+    const bv = effectiveSortCol === 'total' ? b.total : b.byMonth[effectiveSortCol];
+    return (av - bv) * sortDir;
+  });
+  const visible = (showAll || sorted.length <= CAP) ? sorted : sorted.slice(0, CAP);
+  const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+  const grandByMonth = {};
+  months.forEach(m => { grandByMonth[m.key] = rows.reduce((s, r) => s + r.byMonth[m.key], 0); });
+  function monthCell(row, m, bg) {
+    const val = row.byMonth[m.key];
+    const isChosenOOS = showOOSWarning && m.key === chosenMonthKey && row.isOOSChosen;
+    return ce('td', { key: m.key, style: { ...tdStyle, background: bg, color: isChosenOOS ? OOS_AMBER : undefined, fontWeight: isChosenOOS ? 700 : 400 } },
+      isChosenOOS ? ('⚠ ' + String(val)) : String(val)
+    );
+  }
+  function rowClickHandler(row) {
+    if (!clickable || !onEntityClick) return undefined;
+    return function () { onEntityClick(groupKind, groupKind === 'model' ? row.label : row.code); };
+  }
+  return ce('div', null,
+    ce('div', { className: 'mreport-scroll', style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 6 } },
+      ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', minWidth: 560 } },
+        ce('thead', null,
+          ce('tr', null,
+            ce('th', { style: thItemStyle, className: itemColClassName }, itemLabel),
+            ce('th', { style: thStyle, onClick: function () { handleSort('total'); } }, 'Total' + sortIndicator(effectiveSortCol === 'total', sortDir)),
+            months.map(m => ce('th', { key: m.key, style: thStyle, onClick: function () { handleSort(m.key); } }, m.label + sortIndicator(effectiveSortCol === m.key, sortDir)))
+          )
+        ),
+        ce('tbody', null,
+          ce('tr', { style: { background: '#f8fafc' } },
+            ce('td', { style: { ...tdItemStyle, background: '#f8fafc', fontWeight: 700, color: '#111827' }, className: itemColClassName }, 'Total'),
+            ce('td', { style: { ...tdStyle, fontWeight: 700, color: '#111827' } }, String(grandTotal)),
+            months.map(m => ce('td', { key: m.key, style: { ...tdStyle, fontWeight: 700, color: '#111827' } }, String(grandByMonth[m.key])))
+          ),
+          sorted.length
+            ? visible.map(function (r, i) {
+                const bg = i % 2 === 0 ? '#ffffff' : '#fafafa';
+                return ce('tr', { key: i, style: { background: bg, cursor: clickable ? 'pointer' : 'default' }, onClick: rowClickHandler(r) },
+                  itemCell(r, bg),
+                  ce('td', { style: tdStyle }, String(r.total)),
+                  months.map(m => monthCell(r, m, bg))
+                );
+              })
+            : ce('tr', null, ce('td', { colSpan: months.length + 2, style: { padding: '16px', textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'No sales in this range.'))
+        )
+      )
+    ),
+    (!showAll && sorted.length > CAP) ? showAllButton(sorted.length, function () { setShowAll(true); }) : null
+  );
+}
+// ── rising/declining summary list ──
+function TrendSummaryList(props) {
+  const items = props.items;
+  const imageMap = props.imageMap;
+  const tone = props.tone; // 'up' | 'down'
+  const kind = props.kind; // 'model' | 'product'
+  const onEntityClick = props.onEntityClick;
+  const [showAll, setShowAll] = useState(false);
+  const visible = (showAll || items.length <= CAP) ? items : items.slice(0, CAP);
+  const gainColor = tone === 'up' ? '#16a34a' : OOS_RED;
+  const thStyle = { padding: '6px 10px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', textAlign: 'right', borderBottom: '2px solid #e5e7eb', whiteSpace: 'nowrap' };
+  const thItemStyle = { ...thStyle, textAlign: 'left', maxWidth: ITEM_COL_MAX_WIDTH };
+  const tdStyle = { padding: '6px 10px', fontSize: 12, textAlign: 'right', borderBottom: '1px solid #f0f0f0', whiteSpace: 'nowrap' };
+  const tdItemStyle = { ...tdStyle, textAlign: 'left', fontWeight: 600, color: '#374151', maxWidth: ITEM_COL_MAX_WIDTH };
+  return ce('div', null,
+    ce('div', { className: 'mreport-scroll', style: { overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 6 } },
+      ce('table', { style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', minWidth: 380 } },
+        ce('thead', null, ce('tr', null,
+          ce('th', { style: thItemStyle }, 'Item'),
+          ce('th', { style: thStyle }, 'Chosen Mo.'),
+          ce('th', { style: thStyle }, 'Avg Prev.'),
+          ce('th', { style: thStyle }, 'Gain')
+        )),
+        ce('tbody', null,
+          items.length
+            ? visible.map(function (it, i) {
+                const bg = i % 2 === 0 ? '#ffffff' : '#fafafa';
+                const imgUrl = it.code ? imageMap[it.code] : null;
+                return ce('tr', {
+                  key: i, style: { background: bg, cursor: 'pointer' },
+                  onClick: function () { onEntityClick(kind, kind === 'model' ? it.label : it.code); }
+                },
+                  ce('td', { style: { ...tdItemStyle, background: bg } },
+                    imgUrl ? ce('img', { src: imgUrl, style: { width: 20, height: 20, objectFit: 'cover', borderRadius: 4, marginRight: 6, verticalAlign: 'middle' } }) : null,
+                    truncatedLabel(it.label)
+                  ),
+                  ce('td', { style: tdStyle }, String(it.current)),
+                  ce('td', { style: tdStyle }, it.avgPrev.toFixed(1)),
+                  ce('td', { style: { ...tdStyle, fontWeight: 700, color: gainColor } }, (it.gain > 0 ? '+' : '') + it.gain.toFixed(1))
+                );
+              })
+            : ce('tr', null, ce('td', { colSpan: 4, style: { padding: '14px', textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'None.'))
+        )
+      )
+    ),
+    (!showAll && items.length > CAP) ? showAllButton(items.length, function () { setShowAll(true); }) : null
+  );
+}
+// ── sections 5/6: ranked product list (clickable rows) ──
+function ProductRow(props) {
+  const it = props.item;
+  const imageMap = props.imageMap;
+  const kind = props.kind;
+  const monthLabel = props.monthLabel;
+  const onClick = props.onClick;
+  const imgUrl = imageMap[it.code] || null;
+  const badgeStyle = { fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 999, background: '#eef2ff', color: '#4338ca' };
+  const oosBadgeStyle = Object.assign({}, badgeStyle, { background: '#fee2e2', color: OOS_RED });
+  function stat(label, value, color) {
+    return ce('div', null,
+      ce('div', { className: 'mreport-stat-label', style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase' } }, label),
+      ce('div', { className: 'mreport-stat-value', style: { fontSize: 13, fontWeight: 700, color: color || '#374151' } }, value)
+    );
+  }
+  let badges;
+  if (kind === 'restock') {
+    badges = [
+      ce('span', { key: 'r6', className: 'mreport-badge', style: badgeStyle }, '#' + it.rank6mo + ' best-selling (6mo)'),
+      ce('span', { key: 'rlm', className: 'mreport-badge', style: badgeStyle }, '#' + it.rankLastMonth + ' best-selling (' + monthLabel + ')'),
+      it.oosStreak > 0 ? ce('span', { key: 'oos', className: 'mreport-badge', style: oosBadgeStyle }, 'OOS ' + it.oosStreak + ' mo' + (it.oosStreak > 1 ? 's' : '')) : null,
+    ];
+  } else {
+    badges = [
+      ce('span', { key: 'rw', className: 'mreport-badge', style: badgeStyle }, '#' + it.rankWorst + ' least-selling (6mo)'),
+      it.hasOOSVariant ? ce('span', { key: 'oos', className: 'mreport-badge', style: oosBadgeStyle }, 'Currently OOS') : null,
+    ];
+  }
+  return ce('div', { onClick: onClick, className: 'mreport-productrow', style: { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderBottom: '1px solid #f0f0f0', cursor: 'pointer' } },
+    imgUrl
+      ? ce('img', { src: imgUrl, alt: it.code, className: 'mreport-productrow-img', style: { width: 44, height: 44, objectFit: 'cover', borderRadius: 6, flexShrink: 0 } })
+      : ce('div', { className: 'mreport-productrow-img', style: { width: 44, height: 44, borderRadius: 6, background: '#f3f4f6', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, color: '#cbd5e1', flexShrink: 0 } }, 'No img'),
+    ce('div', { style: { flex: 1, minWidth: 0 } },
+      ce('div', { style: { fontWeight: 700, fontSize: 12.5, color: '#111827', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, it.code + (it.name ? (' — ' + it.name) : '')),
+      ce('div', { className: 'mreport-badges', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 3 } }, badges)
+    ),
+    ce('div', { className: 'mreport-stats', style: { display: 'flex', gap: 16, flexShrink: 0, textAlign: 'right' } },
+      kind === 'restock' ? stat('Opportunity', dash(it.score), SUGGEST_ORANGE) : null,
+      stat('Stock', dash(it.currentStock), it.currentStock <= 0 ? OOS_RED : STOCK_COLOR),
+      stat('Last Mo.', dash(it.salesLastMonth)),
+      stat('6 Mo.', dash(it.sales6mo))
+    )
+  );
+}
+function RankedProductList(props) {
+  const items = props.items;
+  const imageMap = props.imageMap;
+  const kind = props.kind;
+  const monthLabel = props.monthLabel;
+  const onRowClick = props.onRowClick;
+  const [showAll, setShowAll] = useState(false);
+  const visible = (showAll || items.length <= CAP) ? items : items.slice(0, CAP);
+  return ce('div', null,
+    ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden' } },
+      visible.length
+        ? visible.map(function (it) { return ce(ProductRow, { key: it.code, item: it, imageMap: imageMap, kind: kind, monthLabel: monthLabel, onClick: function () { onRowClick(it.code); } }); })
+        : ce('div', { style: { padding: 20, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Nothing to show.')
+    ),
+    (!showAll && items.length > CAP) ? showAllButton(items.length, function () { setShowAll(true); }) : null
+  );
+}
+// ── reusable per-product size×month block, used both standalone (Product
+// mode) and repeated (Model mode) inside the drill-down drawer. Each month
+// has THREE sub-columns: Beg / New / Sold. Stock (end stock) and then
+// Suggested Restock are pinned to the END of the table (not next to
+// Size), and the whole table uses a fixed layout with percentage column
+// widths so it fits inside the drawer on desktop without horizontal
+// scrolling. ──
+function ProductSizeBlock(props) {
+  const detail = props.detail;
+  const monthsAsc = props.monthsAsc;
+  const imageMap = props.imageMap;
+  const imgUrl = imageMap[detail.code] || null;
+  const thStyle = { padding: '5px 4px', fontSize: 9.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.02em', color: '#6b7280', textAlign: 'right', borderBottom: '2px solid #e5e7eb', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+  const thItemStyle = { ...thStyle, textAlign: 'left', position: 'sticky', left: 0, background: '#fff' };
+  const tdStyle = { padding: '5px 4px', fontSize: 11, textAlign: 'right', borderBottom: '1px solid #f0f0f0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+  const tdItemStyle = { ...tdStyle, textAlign: 'left', fontWeight: 600, color: '#374151', position: 'sticky', left: 0, background: '#fff' };
+  // column widths as percentages so table-layout:fixed can size every
+  // column up front and the table never needs to overflow its container.
+  const SIZE_PCT = 10;
+  const STOCK_PCT = 6;
+  const SUGGEST_PCT = 9;
+  const monthPct = (100 - SIZE_PCT - STOCK_PCT - SUGGEST_PCT) / monthsAsc.length;
+  const subPct = monthPct / 3;
+  const cols = [ce('col', { key: 'size', style: { width: SIZE_PCT + '%' } })]
+    .concat(monthsAsc.map(m => [
+      ce('col', { key: m.key + '_b', style: { width: subPct + '%' } }),
+      ce('col', { key: m.key + '_n', style: { width: subPct + '%' } }),
+      ce('col', { key: m.key + '_s', style: { width: subPct + '%' } }),
+    ]).flat())
+    .concat([
+      ce('col', { key: 'stock', style: { width: STOCK_PCT + '%' } }),
+      ce('col', { key: 'suggest', style: { width: SUGGEST_PCT + '%' } }),
+    ]);
+  return ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 8, marginBottom: 16, overflow: 'hidden' } },
+    ce('div', { style: { display: 'flex', gap: 12, padding: 12, background: '#fafafa', borderBottom: '1px solid #e5e7eb', alignItems: 'center' } },
+      imgUrl
+        ? ce('img', { src: imgUrl, alt: detail.code, style: { width: 48, height: 48, objectFit: 'cover', borderRadius: 6, flexShrink: 0 } })
+        : ce('div', { style: { width: 48, height: 48, borderRadius: 6, background: '#f3f4f6', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, color: '#cbd5e1', flexShrink: 0 } }, 'No image'),
+      ce('div', { style: { flex: 1, minWidth: 0 } },
+        ce('div', { style: { fontWeight: 700, fontSize: 13, color: '#111827', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, detail.code),
+        ce('div', { style: { fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, detail.name || '—')
+      ),
+      ce('div', { style: { textAlign: 'right', flexShrink: 0 } },
+        ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase' } }, 'Total Sales (6mo)'),
+        ce('div', { style: { fontSize: 16, fontWeight: 700, color: SALES_PURPLE } }, dash(detail.totalSales6mo))
+      ),
+      ce('div', { style: { textAlign: 'right', flexShrink: 0 } },
+        ce('div', { style: { fontSize: 9, color: '#9ca3af', textTransform: 'uppercase' } }, 'Current Stock'),
+        ce('div', { style: { fontSize: 16, fontWeight: 700, color: detail.currentStock <= 0 ? OOS_RED : STOCK_COLOR } }, dash(detail.currentStock))
+      )
+    ),
+    ce('div', { className: 'mreport-scroll', style: { overflowX: 'auto' } },
+      ce('table', { className: 'mreport-detail-table', style: { borderCollapse: 'separate', borderSpacing: 0, width: '100%', tableLayout: 'fixed' } },
+        ce('colgroup', null, cols),
+        ce('thead', null,
+          ce('tr', null,
+            ce('th', { style: thItemStyle, rowSpan: 2 }, 'Size'),
+            monthsAsc.map(m => ce('th', { key: m.key, colSpan: 3, style: Object.assign({}, thStyle, { textAlign: 'center' }) }, shortMonthLabel(m.key))),
+            ce('th', { style: Object.assign({}, thStyle, { color: STOCK_COLOR }), rowSpan: 2 }, 'Stock'),
+            ce('th', { style: Object.assign({}, thStyle, { color: SUGGEST_ORANGE, borderLeft: '1px solid #f3f4f6' }), rowSpan: 2 }, 'Suggest')
+          ),
+          ce('tr', null,
+            monthsAsc.map(function (m) {
+              return [
+                ce('th', { key: m.key + '_b', style: Object.assign({}, thStyle, { color: STOCK_COLOR, borderLeft: '1px solid #f3f4f6' }) }, 'Beg'),
+                ce('th', { key: m.key + '_r', style: Object.assign({}, thStyle, { color: '#6b7280' }) }, 'ADJ'),
+                ce('th', { key: m.key + '_s', style: thStyle }, 'Sold'),
+              ];
+            })
+          )
+        ),
+        ce('tbody', null,
+          ce('tr', { style: { background: '#f8fafc' } },
+            ce('td', { style: { ...tdItemStyle, background: '#f8fafc', fontWeight: 700 } }, 'Total'),
+            monthsAsc.map(function (m) {
+              return [
+                ce('td', { key: m.key + '_b', style: { ...tdStyle, fontWeight: 700, color: STOCK_COLOR, borderLeft: '1px solid #f3f4f6' } }, dash(detail.beginByMonth[m.key])),
+                ce('td', { key: m.key + '_r', style: { ...tdStyle, fontWeight: 700, color: detail.adjByMonth[m.key] > 0 ? RESTOCK_GREEN : (detail.adjByMonth[m.key] < 0 ? OOS_RED : undefined) } }, dash(detail.adjByMonth[m.key])),
+                ce('td', { key: m.key + '_s', style: { ...tdStyle, fontWeight: 700 } }, dash(detail.salesByMonth[m.key])),
+              ];
+            }).flat(),
+            ce('td', { style: { ...tdStyle, fontWeight: 700, color: detail.currentStock <= 0 ? OOS_RED : STOCK_COLOR } }, dash(detail.currentStock)),
+            ce('td', { style: { ...tdStyle, fontWeight: 700, color: SUGGEST_ORANGE, borderLeft: '1px solid #f3f4f6' } }, dash(detail.totalSuggestedRestock))
+          ),
+          detail.sizes.length
+            ? detail.sizes.map(function (s, i) {
+                const bg = i % 2 === 0 ? '#ffffff' : '#fafafa';
+                return ce('tr', { key: s.skuOptionId, style: { background: bg } },
+                  ce('td', { style: { ...tdItemStyle, background: bg } }, s.label),
+                  monthsAsc.map(function (m) {
+                    const beg = s.beginByMonth[m.key];
+                    const sold = s.salesByMonth[m.key];
+                    const adj = s.adjByMonth[m.key];
+                    const flagRed = beg <= 0 && s.priorMonthSales[m.key] > 0;
+                    return [
+                      ce('td', { key: m.key + '_b', style: { ...tdStyle, color: flagRed ? OOS_RED : STOCK_COLOR, fontWeight: flagRed ? 700 : 400, borderLeft: '1px solid #f3f4f6' } }, dash(beg)),
+                      ce('td', { key: m.key + '_r', style: { ...tdStyle, color: adj > 0 ? RESTOCK_GREEN : (adj < 0 ? OOS_RED : undefined) } }, dash(adj)),
+                      ce('td', { key: m.key + '_s', style: tdStyle }, dash(sold)),
+                    ];
+                  }).flat(),
+                  ce('td', { style: { ...tdStyle, fontWeight: 600, color: s.currentStock <= 0 ? OOS_RED : STOCK_COLOR } }, dash(s.currentStock)),
+                  ce('td', { style: { ...tdStyle, fontWeight: s.suggestedRestock > 0 ? 700 : 400, color: s.suggestedRestock > 0 ? SUGGEST_ORANGE : undefined, borderLeft: '1px solid #f3f4f6' } }, dash(s.suggestedRestock))
+                );
+              })
+            : ce('tr', null, ce('td', { colSpan: monthsAsc.length * 3 + 3, style: { padding: '10px', textAlign: 'center', color: '#9ca3af', fontSize: 11 } }, 'No size data.'))
+        )
+      )
+    )
+  );
+}
+// ── drill-down drawer: mode 'product' (one block) or 'model' (many blocks) ──
+function DetailsDrawer(props) {
+  const open = props.open;
+  const onClose = props.onClose;
+  const mode = props.mode; // 'product' | 'model'
+  const drawerKey = props.drawerKey; // product code, or model name
+  const monthsAsc = props.monthsAsc;
+  const imageMap = props.imageMap;
+  const rawData = props.rawData;
+  if (!drawerKey || !rawData) {
+    return ce(Drawer, { open: open, onClose: onClose, width: 960, title: 'Details' }, null);
+  }
+  if (mode === 'product') {
+    const detail = buildProductSizeDetail(drawerKey, rawData.salesRowsAllTime, rawData.ledgerRowsAllTime, rawData.events, monthsAsc, rawData.anchorEndDate);
+    return ce(Drawer, { open: open, onClose: onClose, width: 960, title: detail.code + (detail.name ? (' — ' + detail.name) : '') },
+      ce(ProductSizeBlock, { detail: detail, monthsAsc: monthsAsc, imageMap: imageMap })
+    );
+  }
+  const monthKeys = monthsAsc.map(m => m.key);
+  const ranked = getModelProductCodes(drawerKey, rawData.salesRowsAllTime, monthKeys);
+  const MODEL_CAP = 25;
+  const capped = ranked.slice(0, MODEL_CAP);
+  const blocks = capped.map(function (x) {
+    return buildProductSizeDetail(x.code, rawData.salesRowsAllTime, rawData.ledgerRowsAllTime, rawData.events, monthsAsc, rawData.anchorEndDate);
+  });
+  return ce(Drawer, { open: open, onClose: onClose, width: 1040, title: drawerKey },
+    ranked.length > MODEL_CAP
+      ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 12 } }, 'Showing top ' + MODEL_CAP + ' of ' + ranked.length + ' products, by sales.')
+      : null,
+    blocks.length
+      ? blocks.map(function (d) { return ce(ProductSizeBlock, { key: d.code, detail: d, monthsAsc: monthsAsc, imageMap: imageMap }); })
+      : ce('div', { style: { padding: 20, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'No product data for this model.')
+  );
+}
+// ── root ──
+function Root() {
+  const [stores, setStores] = useState([]);
+  const [storeId, setStoreId] = useState(null);
+  const [monthPeriod, setMonthPeriod] = useState(function () { return dayjs().subtract(1, 'month'); });
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [imageMap, setImageMap] = useState({});
+  const [data, setData] = useState(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerMode, setDrawerMode] = useState('product');
+  const [drawerKey, setDrawerKey] = useState(null);
+  useEffect(function () {
+    fetchStores().then(setStores).catch(function (e) { setErr((e && e.message) || String(e)); });
+    fetchImages().then(setImageMap);
+  }, []);
+  useEffect(function () {
+    if (!storeId) { setData(null); return; }
+    const anchor = monthPeriod || dayjs().subtract(1, 'month');
+    const months = buildMonths(anchor);
+    const monthKeys = months.map(m => m.key);
+    const anchorEndDate = anchor.endOf('month').format('YYYY-MM-DD');
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    Promise.all([fetchSalesRows(storeId, anchorEndDate), fetchLedgerRows(storeId, anchorEndDate)])
+      .then(function (r) {
+        if (!alive) return;
+        const salesRowsAllTime = r[0], ledgerRowsAllTime = r[1];
+        const events = buildEvents(salesRowsAllTime, ledgerRowsAllTime);
+        const monthlyStoreTotal = computeMonthlyStoreTotal(salesRowsAllTime, monthKeys);
+        const groupedModel = buildGroupedSales(salesRowsAllTime, ledgerRowsAllTime, 'model', monthKeys);
+        const groupedProduct = buildGroupedSales(salesRowsAllTime, ledgerRowsAllTime, 'product', monthKeys);
+        const groupedVariant = buildGroupedSales(salesRowsAllTime, ledgerRowsAllTime, 'variant', monthKeys);
+        attachChosenMonthOOS(groupedModel, events, monthKeys[0], anchorEndDate);
+        attachChosenMonthOOS(groupedProduct, events, monthKeys[0], anchorEndDate);
+        const modelTrend = computeTrendSummary(groupedModel, months);
+        const productTrend = computeTrendSummary(groupedProduct, months);
+        const productIndex = buildProductVariantIndex(salesRowsAllTime, ledgerRowsAllTime);
+        const metrics = computeProductMetrics(productIndex, salesRowsAllTime, events, months, anchorEndDate);
+        const metricsList = Object.values(metrics);
+        const rank6mo = metricsList.slice().sort((a, b) => b.sales6mo - a.sales6mo);
+        const rankLastMonth = metricsList.slice().sort((a, b) => b.salesLastMonth - a.salesLastMonth);
+        const rank6moIndex = {}; rank6mo.forEach((m, i) => { rank6moIndex[m.code] = i + 1; });
+        const rankLastMonthIndex = {}; rankLastMonth.forEach((m, i) => { rankLastMonthIndex[m.code] = i + 1; });
+        const opportunityScores = computeRestockOpportunity(productIndex, salesRowsAllTime, events, months, anchorEndDate);
+        const restock = metricsList
+          .map(m => Object.assign({}, m, { rank6mo: rank6moIndex[m.code], rankLastMonth: rankLastMonthIndex[m.code], score: opportunityScores[m.code] || 0 }))
+          .filter(m => m.score > 0);
+        restock.sort((a, b) => b.score - a.score);
+        // Product Rotation minimum trial: a product must have its earliest
+        // record (first sale or stock-ledger entry) BEFORE the 1st of the
+        // month immediately preceding Month Period — e.g. for a June
+        // anchor, before May 1 — which guarantees at least 3 calendar
+        // months of history (Apr/May/Jun in that example) by the end of
+        // the window. Products newer than that are excluded from
+        // Rotation entirely (not just ranked low), same as Need Restock
+        // excludes zero-opportunity products. ALSO excludes products
+        // that are currently out of stock (end-of-Month-Period stock
+        // <= 0) — nothing to "drop" from a product that's already gone;
+        // Rotation should only surface poor sellers still tying up
+        // shelf space.
+        const firstRecordByProduct = computeFirstRecordDateByProduct(salesRowsAllTime, ledgerRowsAllTime);
+        const rotationCutoffDate = anchor.subtract(1, 'month').startOf('month').format('YYYY-MM-DD');
+        const rotationEligible = metricsList.filter(function (m) {
+          const first = firstRecordByProduct[m.code];
+          return !!first && first < rotationCutoffDate && m.currentStock > 0;
+        });
+        const rotation = rotationEligible.slice().sort((a, b) => a.sales6mo - b.sales6mo).map((m, i) => Object.assign({}, m, { rankWorst: i + 1 }));
+        setData({
+          months: months, monthsAsc: months.slice().reverse(), anchorEndDate: anchorEndDate,
+          monthlyStoreTotal: monthlyStoreTotal,
+          groupedModel: groupedModel, groupedProduct: groupedProduct, groupedVariant: groupedVariant,
+          modelTrend: modelTrend, productTrend: productTrend,
+          restock: restock, rotation: rotation,
+          salesRowsAllTime: salesRowsAllTime, ledgerRowsAllTime: ledgerRowsAllTime, events: events,
+        });
+        setDrawerOpen(false);
+        setDrawerKey(null);
+      })
+      .catch(function (e) {
+        if (!alive) return;
+        setErr((e && e.message) || String(e));
+        setData(null);
+      })
+      .finally(function () { if (alive) setLoading(false); });
+    return function () { alive = false; };
+  }, [storeId, monthPeriod]);
+  function openDrawer(mode, key) {
+    setDrawerMode(mode);
+    setDrawerKey(key);
+    setDrawerOpen(true);
+  }
+  function openProductDrawer(code) { openDrawer('product', code); }
+  const fieldLabel = t => ce('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, t);
+  const trendValuesAsc = data ? data.monthsAsc.map(m => data.monthlyStoreTotal[m.key] || 0) : [];
+  const lastMonthLabel = data ? data.months[0].label : '';
+  // side-by-side on wide screens, stacks on narrow ones via flex-wrap
+  function sideBySide(leftTitle, leftNode, rightTitle, rightNode) {
+    return ce('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 16 } },
+      ce('div', { style: { flex: '1 1 340px', minWidth: 300 } }, subheading(leftTitle), leftNode),
+      ce('div', { style: { flex: '1 1 340px', minWidth: 300 } }, subheading(rightTitle), rightNode)
+    );
+  }
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, padding: 4 } },
+    ce('style', { key: 'mreport-style' }, RESPONSIVE_STYLE),
+    ce('div', { style: { display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' } },
+      ce('div', { style: { minWidth: 220, flex: '1 1 220px' } },
+        fieldLabel('Store'),
+        ce(Select, {
+          value: storeId, onChange: setStoreId, style: { width: '100%' }, allowClear: true,
+          placeholder: 'Select a store to generate a report',
+          options: stores.map(s => ({ value: s.id, label: s.store_code ? (s.store_code + ' — ' + s.name) : s.name })),
+          showSearch: true,
+          filterOption: (input, option) => (option.label || '').toLowerCase().indexOf(input.toLowerCase()) !== -1,
+        })
+      ),
+      ce('div', { style: { minWidth: 140, flex: '0 1 160px' } },
+        fieldLabel('Month Period'),
+        ce(DatePicker, { picker: 'month', value: monthPeriod, onChange: v => setMonthPeriod(v || dayjs().subtract(1, 'month')), style: { width: '100%' }, allowClear: false, format: 'MMM YYYY' })
+      )
+    ),
+    !storeId
+      ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Select a store to generate a report.')
+      : err
+        ? ce('div', { style: { padding: 16, color: '#ef4444', fontSize: 12 } }, err)
+        : loading && !data
+          ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…')
+          : data
+            ? ce('div', null,
+                loading ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 6 } }, 'Refreshing…') : null,
+                ce('div', { style: { marginBottom: 28 } },
+                  sectionTitle('Total Sales Trend', 'Total items (pcs) sold, last 6 months'),
+                  ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 6, padding: '12px 8px 4px' } },
+                    ce(TrendChart, { monthsAsc: data.monthsAsc, values: trendValuesAsc })
+                  )
+                ),
+                ce('div', { style: { marginBottom: 28 } },
+                  sectionTitle('Sales by Model', '⚠ marks the chosen month if that model had an OOS variant then — click a row for details'),
+                  ce(SalesGroupTable, { months: data.months, rows: data.groupedModel, itemLabel: 'Model', showOOSWarning: true, groupKind: 'model', onEntityClick: openDrawer }),
+                  sideBySide(
+                    'Rising Model', ce(TrendSummaryList, { items: data.modelTrend.rising, imageMap: imageMap, tone: 'up', kind: 'model', onEntityClick: openDrawer }),
+                    'Declining Model', ce(TrendSummaryList, { items: data.modelTrend.declining, imageMap: imageMap, tone: 'down', kind: 'model', onEntityClick: openDrawer })
+                  )
+                ),
+                ce('div', { style: { marginBottom: 28 } },
+                  sectionTitle('Sales by Product', '⚠ marks the chosen month if that product had an OOS variant then — click a row for details'),
+                  ce(SalesGroupTable, { months: data.months, rows: data.groupedProduct, itemLabel: 'Product', showOOSWarning: true, groupKind: 'product', onEntityClick: openDrawer }),
+                  sideBySide(
+                    'Rising Product', ce(TrendSummaryList, { items: data.productTrend.rising, imageMap: imageMap, tone: 'up', kind: 'product', onEntityClick: openDrawer }),
+                    'Declining Product', ce(TrendSummaryList, { items: data.productTrend.declining, imageMap: imageMap, tone: 'down', kind: 'product', onEntityClick: openDrawer })
+                  )
+                ),
+                ce('div', { style: { marginBottom: 28 } },
+                  sectionTitle('Sales by Variant'),
+                  ce(SalesGroupTable, { months: data.months, rows: data.groupedVariant, itemLabel: 'Variant', showOOSWarning: false, groupKind: 'variant', onEntityClick: null })
+                ),
+                ce('div', { style: { marginBottom: 28 } },
+                  sectionTitle('Need Restock', 'Products with the highest missed-sales opportunity if under-stocked sizes were restocked to their own best month — click a row for details'),
+                  ce(RankedProductList, { items: data.restock, imageMap: imageMap, kind: 'restock', monthLabel: lastMonthLabel, onRowClick: openProductDrawer })
+                ),
+                ce('div', { style: { marginBottom: 8 } },
+                  sectionTitle('Product Rotation', 'Lowest 6-month sales among products with at least a 3-month trial and still in stock — candidates to consider dropping — click a row for details'),
+                  ce(RankedProductList, { items: data.rotation, imageMap: imageMap, kind: 'rotation', monthLabel: lastMonthLabel, onRowClick: openProductDrawer })
+                ),
+                ce(DetailsDrawer, {
+                  open: drawerOpen, onClose: function () { setDrawerOpen(false); },
+                  mode: drawerMode, drawerKey: drawerKey, monthsAsc: data.monthsAsc, imageMap: imageMap,
+                  rawData: { salesRowsAllTime: data.salesRowsAllTime, ledgerRowsAllTime: data.ledgerRowsAllTime, events: data.events, anchorEndDate: data.anchorEndDate },
+                })
+              )
+            : null
+  );
+}
+ctx.render(ce(Root));
