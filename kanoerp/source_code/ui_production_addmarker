@@ -12,6 +12,13 @@
 // production info." / "Cannot read properties of null (reading 'sql')"
 // failures, not the concurrent-dynamic-uid race theorized earlier.
 //
+// FIX (this pass): the in-modal "Marker Notes" editor was reading/writing
+// production.remarks — WRONG. production has two separate real columns:
+// `remarks` (general, shown in the detail view's Remarks accordion) and
+// `marker_remarks` (marker-specific notes, shown in the detail view's
+// Marker section). This modal now reads/writes `marker_remarks` only, so
+// saving marker notes here no longer silently overwrites general remarks.
+//
 // EXPORTS (contract):
 //   openModal({ ctx, productionId, onSaved })
 //       — opens the marker summary/creation panel immediately, fetches inside.
@@ -22,7 +29,8 @@
 //         right edge like a drawer.
 //   fetchSummary(ctx, productionId)
 //       — returns { productionId, productCode, productName, productModel,
-//                    productModelValid, konveksiName, fabricCode, remarks,
+//                    productModelValid, konveksiName, fabricCode,
+//                    markerRemarks,
 //                    markers:[{linkId,markerId,length,sizes}],
 //                    linkableMarkers:[{markerId,length,sizes,matchReason}],
 //                    skuOptions:[{id,display}] } | null
@@ -61,6 +69,8 @@
 //   - Unlink: destroys only the production_marker row — the marker, its
 //     marker_details, and its product_marker mappings are never deleted
 //     (nested Modal.confirm pattern, same as cancelLedger in ui_material_out.js).
+//   - Marker notes: production.marker_remarks update, separate from the
+//     general production.remarks field (see FIX note above).
 //
 // Depends on: none.
 
@@ -208,7 +218,8 @@ async function fetchSummary(ctx, productionId) {
     productModelValid: modelValid,
     konveksiName: konveksi.name,
     fabricCode: product.fk_main_fabric_code,
-    remarks: head.remarks,
+    // marker-specific notes column — NOT production.remarks (see FIX note at top of file)
+    markerRemarks: head.marker_remarks,
     markers: markers,
     linkableMarkers: linkableMarkers,
     skuOptions: skuRows,
@@ -447,36 +458,49 @@ function MarkerContent(props) {
   const [pending, setPending] = useState([]); // queued new markers (not saved yet)
   const [saving, setSaving] = useState(false);
   const [linking, setLinking] = useState(null); // markerId currently being linked
-  const [remarksValue, setRemarksValue] = useState('');
-  const [remarksDirty, setRemarksDirty] = useState(false);
-  const [savingRemarks, setSavingRemarks] = useState(false);
+  const [markerRemarksValue, setMarkerRemarksValue] = useState('');
+  const [markerRemarksDirty, setMarkerRemarksDirtyState] = useState(false);
+  const markerRemarksDirtyRef = useRef(false);
+  function setMarkerRemarksDirty(v) { markerRemarksDirtyRef.current = v; setMarkerRemarksDirtyState(v); }
+  const [savingMarkerRemarks, setSavingMarkerRemarks] = useState(false);
 
+  // IMPORTANT: markerRemarksValue is set HERE, inside the same fetch
+  // callback that flips loading to false — not in a separate useEffect
+  // keyed on state.data. The RichTextEditor below is an uncontrolled
+  // component (mounts once, sets its own innerHTML on mount, ignores later
+  // prop changes — that's what avoids cursor-jump while typing). It first
+  // mounts on the render where loading becomes false. If the value arrives
+  // in a LATER render (via a separate effect), the editor has already
+  // mounted with an empty string and never picks up the real value —
+  // save works, but reopening/reloading shows blank. Setting it here, in
+  // the same tick as setState({loading:false,...}), means both land in the
+  // same batched render, so the editor mounts with the correct value.
   function load() {
     setState(s => Object.assign({}, s, { loading: true }));
     fetchSummary(ctx, productionId)
-      .then(function (d) { setState({ loading: false, data: d, err: null }); })
+      .then(function (d) {
+        setState({ loading: false, data: d, err: null });
+        if (!markerRemarksDirtyRef.current) setMarkerRemarksValue((d && d.markerRemarks) || '');
+      })
       .catch(function (e) { setState({ loading: false, data: null, err: (e && e.message) || 'load failed' }); });
   }
   useEffect(function () { load(); }, [productionId]);
 
-  // sync the remarks draft from freshly-loaded data, but never clobber an
-  // in-progress unsaved edit (e.g. a marker action triggering a background reload)
-  useEffect(function () {
-    if (state.data && !remarksDirty) setRemarksValue(state.data.remarks || '');
-  }, [state.data]);
-
-  async function saveRemarks() {
+  async function saveMarkerRemarks() {
     if (!state.data) return;
-    setSavingRemarks(true);
+    setSavingMarkerRemarks(true);
     try {
-      await ctx.api.resource('production').update({ filterByTk: state.data.productionId, values: { remarks: remarksValue } });
-      ctx.message.success('Remarks saved.');
-      setRemarksDirty(false);
+      // marker_remarks — NOT remarks. See FIX note at top of file: these are
+      // two separate real columns on production; this modal only ever
+      // touches the marker-specific one.
+      await ctx.api.resource('production').update({ filterByTk: state.data.productionId, values: { marker_remarks: markerRemarksValue } });
+      ctx.message.success('Marker notes saved.');
+      setMarkerRemarksDirty(false);
       if (onSaved) onSaved();
     } catch (e) {
-      ctx.message.error('Failed to save remarks: ' + ((e && e.message) || e));
+      ctx.message.error('Failed to save marker notes: ' + ((e && e.message) || e));
     } finally {
-      setSavingRemarks(false);
+      setSavingMarkerRemarks(false);
     }
   }
 
@@ -551,14 +575,14 @@ function MarkerContent(props) {
     ]),
 
     ce('div', { style: { marginBottom: 16 } },
-      fieldLabel('Remarks'),
+      fieldLabel('Marker Notes'),
       ce(RichTextEditor, {
-        key: 'pamk_remarks_' + d.productionId,
-        value: remarksValue,
-        onChange: v => { setRemarksValue(v); setRemarksDirty(true); },
+        key: 'pamk_marker_remarks_' + d.productionId,
+        value: markerRemarksValue,
+        onChange: v => { setMarkerRemarksValue(v); setMarkerRemarksDirty(true); },
       }),
       ce('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
-        ce(Button, { size: 'small', type: 'primary', loading: savingRemarks, disabled: !remarksDirty, onClick: saveRemarks }, 'Save Remarks')
+        ce(Button, { size: 'small', type: 'primary', loading: savingMarkerRemarks, disabled: !markerRemarksDirty, onClick: saveMarkerRemarks }, 'Save Marker Notes')
       )
     ),
 
