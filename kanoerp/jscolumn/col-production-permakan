@@ -1,0 +1,82 @@
+const prod_id = ctx.record?.id ?? "";
+
+
+
+// query 1: total permakan
+ctx.sql.save({
+  uid: "permakan_total_" + prod_id,
+  sql: `SELECT SUM(quantity) AS total_permakan
+        FROM production_result
+        WHERE fk_production_id = ${prod_id}
+        AND is_permakan = TRUE`,
+  dataSourceKey: "main"
+}).then(() => {
+  return ctx.sql.runById("permakan_total_" + prod_id, {
+    type: "selectRows",
+    dataSourceKey: "main"
+  });
+}).then(function (totalRows) {
+  const totalPermakan = totalRows?.[0]?.total_permakan ?? 0;
+
+  // query 2: total permakan sent (quantity < 0, multiply by -1)
+  return ctx.sql.save({
+    uid: "permakan_sent_" + prod_id,
+    sql: `SELECT SUM(quantity) * -1 AS sent_permakan
+          FROM production_result
+          WHERE fk_production_id = ${prod_id}
+          AND is_permakan = TRUE
+          AND quantity < 0`,
+    dataSourceKey: "main"
+  }).then(() => {
+    return ctx.sql.runById("permakan_sent_" + prod_id, {
+      type: "selectRows",
+      dataSourceKey: "main"
+    });
+  }).then(function (sentRows) {
+    const sentPermakan = sentRows?.[0]?.sent_permakan ?? 0;
+
+    // query 3: total permakan return (quantity > 0)
+    return ctx.sql.save({
+      uid: "permakan_return_" + prod_id,
+      sql: `SELECT SUM(quantity) AS return_permakan
+            FROM production_result
+            WHERE fk_production_id = ${prod_id}
+            AND is_permakan = TRUE
+            AND quantity > 0`,
+      dataSourceKey: "main"
+    }).then(() => {
+      return ctx.sql.runById("permakan_return_" + prod_id, {
+        type: "selectRows",
+        dataSourceKey: "main"
+      });
+    }).then(function (returnRows) {
+      const returnPermakan = returnRows?.[0]?.return_permakan ?? 0;
+
+      ctx.element.innerHTML = `
+        <div style="
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          font-size: 12px;
+          line-height: 1.4;
+        ">
+          <div>
+            <span style="color: #888;">Total Permakan:</span>
+            <span style="font-weight: 600; margin-left: 4px;">${totalPermakan}</span>
+          </div>
+          <div>
+            <span style="color: #888;">Total Permakan Sent:</span>
+            <span style="font-weight: 600; margin-left: 4px; color: #1890ff;">${sentPermakan}</span>
+          </div>
+          <div>
+            <span style="color: #888;">Total Permakan Return:</span>
+            <span style="font-weight: 600; margin-left: 4px; color: #52c41a;">${returnPermakan}</span>
+          </div>
+        </div>
+      `;
+
+    }); // end returnRows.then
+  }); // end sentRows.then
+}).catch(err => {
+  ctx.element.innerHTML = 'SQL ERROR: ' + err.message;
+});
