@@ -1,0 +1,400 @@
+const { React, antd } = ctx.libs;
+const { useEffect, useState } = React;
+const { Spin, Typography, Row, Col } = antd;
+const { Text } = Typography;
+
+const STATUS_COLOR = {
+  ideas: '#f97316', pola: '#f97316', first_sample: '#d97706',
+  pricing: '#84cc16', color: '#84cc16', done: '#22c55e', cancel: '#ef4444',
+};
+const STATUS_BG = {
+  ideas: '#fff7ed', pola: '#fff7ed', first_sample: '#fffbeb',
+  pricing: '#f7fee7', color: '#f7fee7', done: '#f0fdf4', cancel: '#fef2f2',
+};
+const STATUS_LABEL = {
+  ideas: 'Ideas', pola: 'Pola', first_sample: 'First Sample',
+  pricing: 'Pricing', color: 'Color Sample', done: 'Done', cancel: 'Cancel',
+};
+const VARIANT_STATUS_COLOR = {
+  sewing: '#d97706', qc: '#84cc16', approval: '#84cc16', done: '#22c55e', cancel: '#ef4444',
+};
+const VARIANT_STATUS_LABEL = {
+  sewing: 'Sewing', qc: 'QC', approval: 'Approval', done: 'Done', cancel: 'Cancel',
+};
+const TYPE_LABELS = {
+  atasan: 'Atasan', tunik: 'Tunik', bawahan: 'Bawahan',
+  dress: 'Dress', set: 'Set', outerwear: 'Outerwear', hijab: 'Hijab',
+};
+
+const hostRecord =
+  (await ctx.getVar?.('ctx.record')) ||
+  (await ctx.getVar?.('ctx.popup.record')) ||
+  ctx.record || null;
+
+const SampleDetailView = function() {
+  const [loading, setLoading]       = useState(true);
+  const [detail, setDetail]         = useState(null);
+  const [images, setImages]         = useState([]);
+  const [bigImg, setBigImg]         = useState(0);
+  const [variants, setVariants]     = useState([]);
+  const [materials, setMaterials]   = useState([]);
+  const [comments, setComments]     = useState([]);
+  const [history, setHistory]       = useState([]);
+  const [showAllComments, setShowAllComments] = useState(false);
+  const [showAllHistory, setShowAllHistory]   = useState(false);
+  const [designerMap, setDesignerMap] = useState({});
+  const [sewingPicMap, setSewingPicMap] = useState({});
+  const [errorText, setErrorText]   = useState('');
+
+  useEffect(function() {
+    let active = true;
+
+    async function bootstrap() {
+      if (!hostRecord?.id) { setErrorText('Record unavailable.'); setLoading(false); return; }
+      const id = hostRecord.id;
+      const sql = ctx.sql;
+
+      function q(uid, sqlStr) {
+        return sql.save({ uid, sql: sqlStr, dataSourceKey: 'main' })
+          .catch(() => {})
+          .then(() => sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+          .then(r => r || []);
+      }
+
+      try {
+        // Q1: main sample info
+        const rows = await q('sd_main_' + id,
+          "SELECT sample.id AS id, sample.name AS sample_name, sample.status AS status, " +
+          "sample.type AS type, sample.designer AS designer, sample.is_new AS is_new, " +
+          "sample.description AS description, sample.remarks AS remarks, " +
+          "sample.difficulty AS difficulty, sample.target_price AS target_price, sample.pricing_remarks AS pricing_remarks, " +
+          "collection.name AS col_name " +
+          "FROM sample, collection " +
+          "WHERE sample.id = " + id + " AND sample.fk_collection_id = collection.id"
+        );
+        if (!rows.length) { setErrorText('No sample found.'); setLoading(false); return; }
+        if (active) setDetail(rows[0]);
+
+        // Q1b: materials (fabric + accessories combined) from sample_material
+        const matRows = await q('sd_materials_' + id,
+          "SELECT sample_material.fk_raw_material_code AS material_code, " +
+          "sample_material.quantity AS quantity " +
+          "FROM sample_material " +
+          "WHERE sample_material.fk_sample_id = " + id
+        );
+        if (active) setMaterials(matRows);
+
+        // Q2: images
+        const imgRows = await q('sd_img_' + id,
+          "SELECT attachments.url AS img_url, attachments.filename AS img_filename " +
+          "FROM t_wda3bnmr9c9, attachments " +
+          "WHERE t_wda3bnmr9c9.f_57nmxuosclw = " + id + " " +
+          "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd ORDER BY attachments.id ASC"
+        );
+        const origin = window.location.origin;
+        if (active) setImages(imgRows.map(r =>
+          r.img_url || (r.img_filename ? origin + '/storage/uploads/' + r.img_filename : null)
+        ).filter(Boolean));
+
+        // Q3: variants
+        const vrows = await q('sd_var_' + id,
+          "SELECT id, sewing_date, status, sewing_pic, fk_fabric_code, fk_fabric_code2 " +
+          "FROM sample_variant WHERE fk_sample_variant_id = " + id + " ORDER BY id ASC"
+        );
+        if (active) setVariants(vrows);
+
+        // Q4: comments
+        const crows = await q('sd_comments_' + id,
+          "SELECT users.nickname AS name, sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+          "FROM sample_comment, users " +
+          "WHERE sample_comment.fk_sample_id = " + id + " AND sample_comment.created_by_id = users.id " +
+          "ORDER BY sample_comment.created_at DESC LIMIT 10"
+        );
+        if (active) setComments(crows);
+
+        // Q7: history (sample + sample_variant combined)
+        const sampleHistRows = await q('sd_history_' + id,
+          "SELECT users.nickname AS nickname, history.create_date AS create_date, " +
+          "history.status AS status, history.category AS category, history.message AS message " +
+          "FROM history, users " +
+          "WHERE history.table_name = 'sample' AND history.table_id = " + id + " " +
+          "AND history.fk_user_id = users.id"
+        );
+
+        const variantIds = vrows.map(v => v.id).filter(Boolean);
+        let variantHistRows = [];
+        if (variantIds.length) {
+          variantHistRows = await q('sd_var_history_' + id,
+            "SELECT users.nickname AS nickname, history.create_date AS create_date, " +
+            "history.status AS status, history.category AS category, history.message AS message " +
+            "FROM history, users " +
+            "WHERE history.table_name = 'sample_variant' AND history.table_id IN (" + variantIds.join(',') + ") " +
+            "AND history.fk_user_id = users.id"
+          );
+        }
+
+        const combinedHistory = sampleHistRows.concat(variantHistRows).sort(
+          (a, b) => new Date(b.create_date) - new Date(a.create_date)
+        );
+        if (active) setHistory(combinedHistory);
+
+        const frows = await q('sd_designer',
+          "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'"
+        );
+        const dm = {};
+        try {
+          const arr = JSON.parse(frows[0]?.options || '{}').uiSchema?.enum || [];
+          arr.forEach(o => { if (o.value) dm[o.value] = o.label || o.value; });
+        } catch(e) {}
+        if (active) setDesignerMap(dm);
+
+        // Q6: sewing_pic labels
+        const sprows = await q('sd_sewingpic',
+          "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample_variant' AND name = 'sewing_pic'"
+        );
+        const sm = {};
+        try {
+          const arr = JSON.parse(sprows[0]?.options || '{}').uiSchema?.enum || [];
+          arr.forEach(o => { if (o.value) sm[o.value] = o.label || o.value; });
+        } catch(e) {}
+        if (active) setSewingPicMap(sm);
+
+      } catch(err) {
+        if (active) setErrorText(err?.message || 'Failed to load.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    bootstrap();
+    return () => { active = false; };
+  }, [hostRecord?.id]);
+
+  if (loading) return React.createElement('div', { style: { padding: 80, textAlign: 'center' } }, React.createElement(Spin, { size: 'large' }));
+  if (errorText) return React.createElement('div', { style: { padding: 24 } }, React.createElement(Text, { type: 'danger' }, errorText));
+
+  const d = detail;
+  const status = String(d.status || '').toLowerCase();
+  const color  = STATUS_COLOR[status] || '#9ca3af';
+  const bg     = STATUS_BG[status]    || '#f3f4f6';
+  const label  = STATUS_LABEL[status] || d.status || '—';
+
+  // Style helpers
+  const secTitle = { fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#9ca3af', marginBottom: 10 };
+
+  const card = (children, extra) => React.createElement('div', {
+    style: Object.assign({ borderRadius: 14, border: '1px solid #e5e7eb', background: '#fff', padding: '18px 20px', height: '100%' }, extra || {})
+  }, children);
+
+  const metaItem = (lbl, val) => !val ? null : React.createElement('div', { style: { marginBottom: 10 } },
+    React.createElement('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, lbl),
+    React.createElement('div', { style: { fontSize: 13, color: '#111827', fontWeight: 500, marginTop: 2 } }, val)
+  );
+
+  const htmlBlock = (lbl, html) => !html ? null : React.createElement('div', { style: { marginBottom: 16 } },
+    React.createElement('div', { style: secTitle }, lbl),
+    React.createElement('div', { style: { fontSize: 13, color: '#374151', lineHeight: 1.8 }, dangerouslySetInnerHTML: { __html: html } })
+  );
+
+  function fmtDate(d) {
+    if (!d) return '';
+    return String(d).substring(0, 16).replace('T', ' ');
+  }
+
+  return React.createElement('div', { style: { fontFamily: 'sans-serif', display: 'flex', flexDirection: 'column', gap: 12 } },
+
+    // ── SECTION 1: HIGHLIGHT ──
+    React.createElement('div', {
+      style: { borderRadius: 14, overflow: 'hidden', border: '1px solid ' + color + '55', boxShadow: '0 0 0 3px ' + color + '18' }
+    },
+      React.createElement('div', { style: { height: 5, background: color } }),
+      React.createElement('div', { style: { padding: '18px 22px', background: '#fff' } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 14 } },
+          React.createElement('span', { style: { fontSize: 20, fontWeight: 700, color: '#111827' } }, d.sample_name),
+          React.createElement('span', { style: { padding: '3px 12px', borderRadius: 999, fontSize: 12, fontWeight: 600, background: bg, color: color, border: '1px solid ' + color + '44' } }, label),
+          d.is_new ? React.createElement('span', { style: { padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, background: '#dcfce7', color: '#16a34a' } }, 'New') : null
+        ),
+        React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px 24px' } },
+          metaItem('Collection', d.col_name),
+          metaItem('Type', TYPE_LABELS[d.type] || d.type),
+          metaItem('Designer', designerMap[d.designer] || d.designer),
+        )
+      )
+    ),
+
+    // ── SECTION 2: IMAGES + INFO ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // Images
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'Reference Images'),
+          images.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '20px 0' } }, 'No images')
+            : React.createElement('div', null,
+                React.createElement('img', {
+                  src: images[bigImg] || images[0],
+                  onClick: () => window.open(images[bigImg] || images[0], '_blank'),
+                  style: { width: '100%', maxHeight: 320, objectFit: 'contain', borderRadius: 8, background: '#f8fafc', cursor: 'pointer', marginBottom: images.length > 1 ? 8 : 0 }
+                }),
+                images.length > 1
+                  ? React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                      images.map((url, i) => React.createElement('img', {
+                        key: i, src: url, onClick: () => setBigImg(i),
+                        style: { width: 52, height: 52, objectFit: 'cover', borderRadius: 6, cursor: 'pointer', flexShrink: 0, border: bigImg === i ? '2px solid ' + color : '2px solid #e5e7eb', opacity: bigImg === i ? 1 : 0.65 }
+                      }))
+                    )
+                  : null
+              )
+        ))
+      ),
+
+      // Description + Remarks
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          htmlBlock('Description', d.description),
+          htmlBlock('Remarks', d.remarks),
+          !d.description && !d.remarks
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No description or remarks')
+            : null
+        ))
+      )
+    ),
+
+    // ── SECTION 3: VARIANTS ──
+    variants.length > 0
+      ? React.createElement('div', { style: { borderRadius: 14, border: '1px solid #e5e7eb', background: '#fff', padding: '18px 20px' } },
+          React.createElement('div', { style: secTitle }, 'Variants (' + variants.length + ')'),
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 5 } },
+            variants.map(function(v, i) {
+              const vs = String(v.status || '').toLowerCase();
+              const vc = VARIANT_STATUS_COLOR[vs] || '#9ca3af';
+              const vl = VARIANT_STATUS_LABEL[vs] || v.status || '—';
+              return React.createElement('div', {
+                key: i,
+                style: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', borderRadius: 8, background: '#f8fafc', fontSize: 12, flexWrap: 'wrap' }
+              },
+                React.createElement('div', { style: { width: 7, height: 7, borderRadius: '50%', background: vc, flexShrink: 0 } }),
+                React.createElement('span', { style: { flex: 1, color: '#374151', fontWeight: 500, minWidth: 80 } }, [v.fk_fabric_code, v.fk_fabric_code2].filter(Boolean).join(' / ') || '—'),
+                v.sewing_pic ? React.createElement('span', { style: { fontSize: 11, color: '#64748b' } }, sewingPicMap[v.sewing_pic] || v.sewing_pic) : null,
+                v.sewing_date ? React.createElement('span', { style: { fontSize: 11, color: '#94a3b8' } }, String(v.sewing_date).substring(0, 10)) : null,
+                React.createElement('span', { style: { fontSize: 10, fontWeight: 700, color: vc, background: vc + '18', borderRadius: 4, padding: '1px 7px' } }, vl)
+              );
+            })
+          )
+        )
+      : null,
+
+    // ── SECTION 4: MATERIALS + PRICING REMARKS ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // Left: materials list (fabric + accessories from sample_material)
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+
+          React.createElement('div', { style: Object.assign({}, secTitle, { marginBottom: 8 }) }, 'Materials'),
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 } },
+            materials.length === 0
+              ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 12, fontStyle: 'italic' } }, 'No materials')
+              : materials.map(function(m, mi) {
+                  return React.createElement('div', { key: mi, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 10px', background: '#f8fafc', borderRadius: 6 } },
+                    React.createElement('span', { style: { fontWeight: 600, fontSize: 12, color: '#1e293b' } }, m.material_code),
+                    m.quantity ? React.createElement('span', { style: { fontSize: 11, color: '#64748b' } }, 'Qty: ' + m.quantity) : null
+                  );
+                })
+          ),
+
+          // Difficulty + Price on one row
+          (d.difficulty || d.target_price)
+            ? React.createElement('div', { style: { display: 'flex', gap: 16, paddingTop: 8, borderTop: '1px solid #f1f5f9' } },
+                d.difficulty ? React.createElement('div', null,
+                  React.createElement('div', { style: { fontSize: 10, color: '#9ca3af' } }, 'Difficulty'),
+                  React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: '#374151' } }, d.difficulty)
+                ) : null,
+                d.target_price ? React.createElement('div', null,
+                  React.createElement('div', { style: { fontSize: 10, color: '#9ca3af' } }, 'Target Price'),
+                  React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: '#374151' } }, d.target_price)
+                ) : null
+              )
+            : null
+        ))
+      ),
+
+      // Right: pricing remarks
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'Pricing Remarks'),
+          d.pricing_remarks
+            ? React.createElement('div', { style: { fontSize: 13, color: '#374151', lineHeight: 1.8 }, dangerouslySetInnerHTML: { __html: d.pricing_remarks } })
+            : React.createElement('div', { style: { color: '#d1d5db', fontSize: 12, fontStyle: 'italic' } }, 'No pricing remarks')
+        ))
+      )
+    ),
+
+    // ── SECTION 5: COMMENTS + HISTORY ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // Comments
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'Comments'),
+          comments.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '8px 0' } }, 'No comments')
+            : React.createElement('div', null,
+                React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+                  (showAllComments ? comments : comments.slice(0, 5)).map(function(c, i) {
+                    return React.createElement('div', { key: i, style: { borderLeft: '3px solid #e2e8f0', paddingLeft: 12 } },
+                      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
+                        React.createElement('span', { style: { fontWeight: 700, fontSize: 12, color: '#1e293b' } }, c.name || '—'),
+                        React.createElement('span', { style: { fontSize: 10, color: '#94a3b8' } }, fmtDate(c.comment_date))
+                      ),
+                      React.createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.6 }, dangerouslySetInnerHTML: { __html: c.comment || '' } })
+                    );
+                  })
+                ),
+                comments.length > 5
+                  ? React.createElement('button', {
+                      onClick: () => setShowAllComments(!showAllComments),
+                      style: { marginTop: 10, fontSize: 11, color: '#6366f1', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600, padding: 0 }
+                    }, showAllComments ? 'Show less' : 'View ' + (comments.length - 5) + ' more')
+                  : null
+              )
+        ))
+      ),
+
+      // History
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'History'),
+          history.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '8px 0' } }, 'No history')
+            : React.createElement('div', null,
+                React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                  (showAllHistory ? history : history.slice(0, 5)).map(function(h, i) {
+                    return React.createElement('div', { key: i, style: { borderLeft: '3px solid #e2e8f0', paddingLeft: 12 } },
+                      React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 } },
+                        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flex: 1, minWidth: 0 } },
+                          React.createElement('span', { style: { fontWeight: 700, fontSize: 12, color: '#1e293b' } }, h.nickname || '—'),
+                          h.category ? React.createElement('span', { style: { fontSize: 10, fontWeight: 600, color: '#7c3aed', background: '#f5f3ff', borderRadius: 4, padding: '1px 6px', whiteSpace: 'nowrap' } }, h.category) : null
+                        ),
+                        React.createElement('span', { style: { fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0 } }, fmtDate(h.create_date))
+                      ),
+                      h.status ? React.createElement('div', { style: { fontSize: 11, color: '#64748b', marginTop: 4 } }, 'Status: ' + h.status) : null,
+                      h.message ? React.createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.5, marginTop: 2 } }, h.message) : null
+                    );
+                  })
+                ),
+                history.length > 5
+                  ? React.createElement('button', {
+                      onClick: () => setShowAllHistory(!showAllHistory),
+                      style: { marginTop: 10, fontSize: 11, color: '#6366f1', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600, padding: 0 }
+                    }, showAllHistory ? 'Show less' : 'View ' + (history.length - 5) + ' more')
+                  : null
+              )
+        ))
+      )
+    )
+  );
+};
+
+ctx.render(React.createElement(SampleDetailView));
