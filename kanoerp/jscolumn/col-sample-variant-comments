@@ -1,0 +1,65 @@
+const variant_id = ctx.record?.id ?? "";
+
+if (!variant_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  return String(d).substring(0, 16).replace('T', ' ');
+}
+
+const uidParent = "sv_comments_parent_" + variant_id;
+const sqlParent =
+  "SELECT fk_sample_variant_id AS sample_id FROM sample_variant WHERE id=" + variant_id;
+
+ctx.sql.save({ uid: uidParent, sql: sqlParent, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uidParent, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(prows) {
+    var sampleId = prows && prows[0] && prows[0].sample_id;
+    if (!sampleId) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No comments</span>';
+      return;
+    }
+
+    const uid = "sv_comments_" + variant_id;
+    const sql =
+      "SELECT users.nickname AS name, sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+      "FROM sample_comment, users " +
+      "WHERE sample_comment.fk_sample_id = " + sampleId + " " +
+      "AND sample_comment.created_by_id = users.id " +
+      "ORDER BY sample_comment.created_at DESC LIMIT 3";
+
+    return ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+      .then(function() {
+        return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+      })
+      .then(function(rows) {
+        rows = rows || [];
+
+        if (!rows.length) {
+          ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No comments</span>';
+          return;
+        }
+
+        var html = '<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:6px;max-width:100%;">';
+
+        rows.forEach(function(row) {
+          html +=
+            '<div style="border-left:2px solid #e2e8f0;padding:3px 0 3px 7px;">' +
+              '<span style="font-size:11px;font-weight:700;color:#1e293b;display:block;">' + (row.name || '—') + '</span>' +
+              '<span style="font-size:10px;color:#94a3b8;display:block;margin-bottom:2px;">' + fmtDate(row.comment_date) + '</span>' +
+              '<div style="font-size:11px;color:#374151;line-height:1.5;white-space:normal;overflow-wrap:break-word;word-break:break-word;">' + (row.comment || '') + '</div>' +
+            '</div>';
+        });
+
+        html += '</div>';
+        ctx.element.innerHTML = html;
+      });
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
