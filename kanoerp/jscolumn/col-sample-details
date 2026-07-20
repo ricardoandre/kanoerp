@@ -1,0 +1,123 @@
+const prod_id = ctx.record?.id ?? "";
+
+if (!prod_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+const uid = "sample_summary_" + prod_id;
+const sql =
+  "SELECT sample.id AS sample_id, sample.name AS sample_name, " +
+  "collection.brand AS collection_brand, sample.status AS sample_status, " +
+  "sample.type AS sample_type, sample.designer AS sample_designer, " +
+  "collection.name AS collection_name " +
+  "FROM sample, collection " +
+  "WHERE sample.fk_collection_id = collection.id " +
+  "AND sample.id = " + prod_id;
+
+ctx.sql.save({
+  uid: uid,
+  sql: sql,
+  dataSourceKey: "main"
+}).then(function () {
+  return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+}).then(function (rows) {
+  if (!rows || !rows.length) {
+    ctx.element.innerHTML = '<span style="color:#ccc;font-size:11px;">—</span>';
+    return;
+  }
+  var r = rows[0];
+  var TYPE_LABELS = {
+    atasan:    'Atasan',
+    tunik:     'Tunik',
+    bawahan:   'Bawahan',
+    dress:     'Dress',
+    set:       'Set',
+    outerwear: 'Outerwear',
+    hijab:     'Hijab',
+  };
+  var STATUS_COLOR = {
+    ideas:        '#f97316',
+    pola:         '#f97316',
+    first_sample: '#d97706',
+    pricing:      '#84cc16',
+    color: '#84cc16',
+    done:         '#22c55e',
+    cancel:       '#ef4444',
+  };
+  var STATUS_LABEL = {
+    ideas:        'Ideas',
+    pola:         'Pola',
+    first_sample: 'First Sample',
+    pricing:      'Pricing',
+    color: 'Color Sample',
+    done:         'Done',
+    cancel:       'Cancel',
+  };
+
+  // Fetch designer label from fields table
+  return ctx.sql.save({
+    uid: 'sample_summary_designer_opts',
+    sql: "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'",
+    dataSourceKey: "main"
+  }).then(function() {
+    return ctx.sql.runById('sample_summary_designer_opts', { type: "selectRows", dataSourceKey: "main" });
+  }).then(function(frows) {
+    var designerMap = {};
+    try {
+      var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
+      var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
+      arr.forEach(function(o) { if (o.value != null) designerMap[String(o.value)] = o.label; });
+    } catch(e) {}
+
+    // Fetch first material from sample_material
+    return ctx.sql.save({
+      uid: 'sample_summary_material_' + prod_id,
+      sql: "SELECT fk_raw_material_code AS material_code, quantity AS quantity " +
+           "FROM sample_material WHERE fk_sample_id = " + prod_id + " ORDER BY id ASC LIMIT 1",
+      dataSourceKey: "main"
+    }).then(function() {
+      return ctx.sql.runById('sample_summary_material_' + prod_id, { type: "selectRows", dataSourceKey: "main" });
+    }).then(function(mrows) {
+      var materialLine = '';
+      if (mrows && mrows.length) {
+        var m = mrows[0];
+        materialLine = m.material_code + (m.quantity ? ' (' + m.quantity + ')' : '');
+      }
+
+      var status        = String(r.sample_status || '').toLowerCase();
+      var statusColor   = STATUS_COLOR[status] || '#9ca3af';
+      var statusLabel   = STATUS_LABEL[status] || (r.sample_status || '—');
+      var typeLabel     = TYPE_LABELS[String(r.sample_type || '').toLowerCase()] || (r.sample_type || '—');
+      var designerLabel = designerMap[String(r.sample_designer || '')] || (r.sample_designer || '—');
+
+      function row(label, value) {
+        if (!value) return '';
+        return (
+          '<div style="display:flex;gap:4px;padding:2px 0;border-bottom:1px solid #f5f5f5;align-items:flex-start;">' +
+            '<span style="font-size:10px;color:#9ca3af;min-width:56px;flex-shrink:0;padding-top:1px;">' + label + '</span>' +
+            '<span style="font-size:11px;color:#1e293b;font-weight:500;word-break:break-word;">' + value + '</span>' +
+          '</div>'
+        );
+      }
+
+      ctx.element.innerHTML =
+        '<div style="font-family:system-ui,sans-serif;font-size:11px;line-height:1.4;">' +
+          '<div style="margin-bottom:5px;">' +
+            '<span style="display:inline-block;background:' + statusColor + '22;color:' + statusColor + ';' +
+              'border:1px solid ' + statusColor + '66;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">' +
+              statusLabel +
+            '</span>' +
+          '</div>' +
+          row('Collection', r.collection_name) +
+          row('Sample', r.sample_name) +
+          row('Brand', r.collection_brand) +
+          row('Type', typeLabel) +
+          row('Designer', designerLabel) +
+          row('Material', materialLine) +
+        '</div>';
+    });
+  });
+}).catch(function (err) {
+  ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+});
