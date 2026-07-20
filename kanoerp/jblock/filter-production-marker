@@ -1,0 +1,302 @@
+// =====================================================================
+// 🔧🔧 PER-PAGE CONFIG — CHANGE THIS ON EVERY PAGE 🔧🔧
+//   This must be the uid of the production TABLE block on THIS page.
+//   Each page has its own table with its own uid. If you copy this
+//   control to a new page without updating the line below, it stays
+//   pointed at the old page's table -> "Target block not found".
+// =====================================================================
+const productionBlockUid = 'd21scuigzjv';
+
+// Junction table + FK column for the production <-> marker m2m relation
+// (confirmed from schema: production.production_markers
+//  -> through=production_marker, otherKey=fk_marker_id, foreignKey=fk_production_id)
+const markerJoinTable = 'production_marker';
+const markerJoinFk    = 'fk_production_id';
+
+const { Button, Space, Input, Tooltip, Tag } = ctx.antd;
+const { useState, useEffect } = ctx.React;
+
+// =====================================================================
+// ⚠️ SINGLE SOURCE OF TRUTH for the marker quick-filter.
+//   'all'          -> no marker condition
+//   'empty_marker' -> rows with NO row in the join table (no marker attached)
+// =====================================================================
+const filterConfigs = [
+  { key: 'all',          label: 'All' },
+  { key: 'empty_marker', label: 'Empty Marker' },
+];
+
+const labelOf = (key) => (filterConfigs.find(c => c.key === key) || {}).label || key;
+
+const STATUS_COLOR = {
+  all: '#334155',
+  empty_marker: '#ef4444',
+};
+
+// =====================================================================
+// 📊 COUNTER + MARKED-ID RESOLUTION
+//   The table's filter engine does not support an "$exists" operator on
+//   m2m relation fields (it silently no-ops), so we can't filter empty
+//   markers directly on `production_markers.id`. Instead we resolve the
+//   (small) set of production ids that DO have a marker attached, via
+//   SQL, and later exclude them with a plain `id: { $notIn: [...] }`
+//   filter — an operator every table/resource filter supports.
+// =====================================================================
+// NOTE: uses GROUP_CONCAT (MySQL/MariaDB/SQLite). If your DB is Postgres,
+// swap this line for:
+//   (SELECT STRING_AGG(DISTINCT ${markerJoinFk}::text, ',') FROM ${markerJoinTable}) AS marked_ids
+const countSql = `
+  SELECT COUNT(*) AS total,
+    COUNT(CASE WHEN NOT EXISTS (
+      SELECT 1 FROM ${markerJoinTable} jm
+      WHERE jm.${markerJoinFk} = production.id
+    ) THEN 1 END) AS empty_marker_count,
+    (SELECT GROUP_CONCAT(DISTINCT ${markerJoinFk})
+       FROM ${markerJoinTable}) AS marked_ids
+  FROM production
+`;
+
+if (ctx.flowSettingsEnabled) {
+  await ctx.sql.save({ uid: ctx.model.uid, sql: countSql, dataSourceKey: 'main' });
+}
+ctx.useResource('SQLResource');
+ctx.resource.setDataSourceKey('main');
+ctx.resource.setFilterByTk(ctx.model.uid);
+await ctx.resource.refresh();
+const stats = ctx.resource.getData()[0] || {};
+
+const statMapping = {
+  all: stats.total || 0,
+  empty_marker: stats.empty_marker_count || 0,
+};
+
+// marked_ids comes back from GROUP_CONCAT as a plain comma-separated
+// string (e.g. "12,45,90"), or null/empty if no rows have a marker yet.
+let rawMarkedIds = stats.marked_ids;
+if (typeof rawMarkedIds === 'string') {
+  rawMarkedIds = rawMarkedIds.split(',');
+} else if (!Array.isArray(rawMarkedIds)) {
+  rawMarkedIds = [];
+}
+const markedIds = rawMarkedIds.filter(v => v !== null && v !== undefined && v !== '');
+
+// =====================================================================
+// 🧩 Build combined filter from control state
+// =====================================================================
+const buildFilter = (s) => {
+  const and = [];
+
+  // -- marker quick filter --
+  // Excludes any production row whose id appears in markedIds (rows that
+  // DO have a marker attached), leaving only rows with no marker.
+  // Using a plain id/$notIn filter here because $exists on the m2m
+  // relation field is not honored by the table's filter engine.
+  if (s.markerFilter === 'empty_marker') {
+    and.push({ id: { $notIn: markedIds.length ? markedIds : ['__none__'] } });
+  }
+  // 'all' -> no condition added
+
+  const pc = (s.productCode || '').trim();
+  const pn = (s.productName || '').trim();
+  const kv = (s.konveksi || '').trim();
+  if (pc) and.push({ 'product_code.code': { $includes: pc } });
+  if (pn) and.push({ 'product_code.name': { $includes: pn } });
+  if (kv) and.push({ 'konveksi.name':     { $includes: kv } });
+
+  return { $and: and };
+};
+
+// ⚠️ Default state: markerFilter defaults to 'empty_marker' per requirement.
+const DEFAULT_STATE = {
+  markerFilter: 'empty_marker',
+  productCode: '', productName: '', konveksi: '',
+};
+
+// =====================================================================
+// 🎯 COMPONENT
+// =====================================================================
+const MarkerFilterControl = () => {
+  const [f, setF] = useState(DEFAULT_STATE);
+  const [applied, setApplied] = useState(DEFAULT_STATE);
+  const [busy, setBusy] = useState(false);
+
+  // Apply the default filter (Empty Marker) automatically on first load,
+  // so the table reflects it immediately instead of only after the user
+  // clicks a control.
+  useEffect(() => {
+    applyToTarget(DEFAULT_STATE);
+  }, []);
+
+  const applyToTarget = async (s) => {
+    setBusy(true);
+    try {
+      const target = ctx.engine.getModel(productionBlockUid);
+      if (!target) {
+        ctx.message.error(
+          'Target table block not found on this page. Set productionBlockUid to THIS page\'s ' +
+          'production table uid (currently "' + productionBlockUid + '").'
+        );
+        return;
+      }
+      if (target.resource.filters && target.resource.filters[ctx.model.uid]) {
+        delete target.resource.filters[ctx.model.uid];
+      }
+      target.resource.addFilterGroup(ctx.model.uid, buildFilter(s));
+      await target.resource.refresh();
+      // best-effort hard re-render for blocks full of custom JS (guarded)
+      if (typeof target.rerender === 'function') target.rerender();
+      setApplied(s);
+    } catch (err) {
+      ctx.message.error(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // quick filter -> apply immediately (toggle back to 'all' if re-clicked)
+  const handleMarkerQuick = (key) => {
+    const next = { ...f, markerFilter: f.markerFilter === key ? 'all' : key };
+    setF(next);
+    applyToTarget(next);
+  };
+
+  // text inputs -> stage only, apply on Enter / Filter button
+  const setField = (field, value) => setF(prev => ({ ...prev, [field]: value }));
+
+  const handleFilter = () => applyToTarget(f);
+
+  const handleReset = () => {
+    setF(DEFAULT_STATE);
+    applyToTarget(DEFAULT_STATE);
+  };
+
+  // remove one applied chip
+  const removeChip = (field) => {
+    const cleared = field === 'markerFilter' ? 'all' : '';
+    const next = { ...applied, [field]: cleared };
+    setF(next);
+    applyToTarget(next);
+  };
+
+  // ---- styles ----
+  const cardStyle = {
+    background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12,
+    padding: 16, display: 'flex', flexDirection: 'column', gap: 16,
+  };
+  const sectionLabel = {
+    fontSize: 11, fontWeight: 700, color: '#9ca3af',
+    textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, display: 'block',
+  };
+  const fieldLabel = {
+    fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, display: 'block',
+  };
+
+  // active filter chips
+  const chips = [];
+  if (applied.markerFilter !== 'all') chips.push({ field: 'markerFilter', text: labelOf(applied.markerFilter) });
+  if (applied.productCode) chips.push({ field: 'productCode', text: 'Code: ' + applied.productCode });
+  if (applied.productName) chips.push({ field: 'productName', text: 'Name: ' + applied.productName });
+  if (applied.konveksi)    chips.push({ field: 'konveksi',   text: 'Konveksi: ' + applied.konveksi });
+
+  return (
+    <div style={cardStyle}>
+
+      {/* MARKER QUICK FILTER */}
+      <div>
+        <span style={sectionLabel}>Marker</span>
+        <Space wrap size={8}>
+          {filterConfigs.map(config => {
+            const isActive = f.markerFilter === config.key;
+            const count = statMapping[config.key] || 0;
+            const accent = STATUS_COLOR[config.key] || '#334155';
+            return (
+              <Button
+                key={config.key}
+                onClick={() => handleMarkerQuick(config.key)}
+                style={{
+                  borderRadius: 999,
+                  fontWeight: isActive ? 600 : 400,
+                  background: isActive ? accent : '#fff',
+                  borderColor: isActive ? accent : '#e5e7eb',
+                  color: isActive ? '#fff' : '#475569',
+                }}
+              >
+                {config.label}
+                <span style={{
+                  marginLeft: 6, fontSize: 12, fontWeight: 600,
+                  padding: '0 7px', borderRadius: 999,
+                  background: isActive ? 'rgba(255,255,255,0.25)' : '#f1f5f9',
+                  color: isActive ? '#fff' : '#64748b',
+                }}>{count}</span>
+              </Button>
+            );
+          })}
+        </Space>
+      </div>
+
+      {/* SEARCH */}
+      <div>
+        <span style={sectionLabel}>Search</span>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <div style={{ width: 200 }}>
+            <span style={fieldLabel}>Product Code</span>
+            <Input
+              allowClear
+              placeholder="e.g. KVA-TSH-001"
+              value={f.productCode}
+              onChange={(e) => setField('productCode', e.target.value)}
+              onPressEnter={handleFilter}
+            />
+          </div>
+          <div style={{ width: 220 }}>
+            <span style={fieldLabel}>Product Name</span>
+            <Input
+              allowClear
+              placeholder="e.g. Basic Tee"
+              value={f.productName}
+              onChange={(e) => setField('productName', e.target.value)}
+              onPressEnter={handleFilter}
+            />
+          </div>
+          <div style={{ width: 200 }}>
+            <span style={fieldLabel}>Konveksi Name</span>
+            <Input
+              allowClear
+              placeholder="e.g. Konveksi A"
+              value={f.konveksi}
+              onChange={(e) => setField('konveksi', e.target.value)}
+              onPressEnter={handleFilter}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* BOTTOM: active chips (left) + actions (right) */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minHeight: 32 }}>
+        <span style={{ fontSize: 12, color: '#9ca3af' }}>Active:</span>
+        {chips.length === 0
+          ? <span style={{ fontSize: 12, color: '#cbd5e1' }}>none</span>
+          : chips.map(chip => (
+              <Tag
+                key={chip.field}
+                closable
+                onClose={(e) => { e.preventDefault(); removeChip(chip.field); }}
+                style={{ borderRadius: 6, fontSize: 12 }}
+              >
+                {chip.text}
+              </Tag>
+            ))
+        }
+        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+          <Button onClick={handleReset} disabled={busy}>Reset</Button>
+          <Tooltip title="Apply filters and refresh the table data">
+            <Button type="primary" onClick={handleFilter} loading={busy}>Filter</Button>
+          </Tooltip>
+        </div>
+      </div>
+
+    </div>
+  );
+};
+
+ctx.render(<MarkerFilterControl />);
