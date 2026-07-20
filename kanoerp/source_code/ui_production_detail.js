@@ -535,14 +535,13 @@ const Section3Quantity = function(props) {
   );
 };
 
-// SectionMarker — shows THREE things:
+// SectionMarker — shows TWO things:
 //   1. marker_remarks — free-text notes field on production, specific to markers.
-//   2. remarks — the same production.remarks field Section4Remarks shows,
-//      surfaced here too per request.
-//   3. the actual relational marker breakdown (production_marker → marker →
+//   2. the actual relational marker breakdown (production_marker → marker →
 //      marker_details), with an "Add marker" button that lazy-loads
 //      ui_production_addmarker and opens its modal.
-// Both text fields and the marker breakdown come from the same reload() call.
+// (production.remarks is NOT repeated here — it already has its own
+// Remarks accordion section; showing it twice was redundant.)
 // On save, re-fetches locally (updates immediately without waiting on a
 // host-level refreshKey bump), and also nudges ctx.resource.refresh() if
 // available so other embedding contexts pick up the change too.
@@ -550,7 +549,6 @@ const SectionMarker = function(props) {
   const sL = useState(true);  const loading = sL[0];  const setLoading = sL[1];
   const sM = useState([]);    const markers = sM[0];  const setMarkers = sM[1];
   const sMR = useState('');   const markerRemarks = sMR[0]; const setMarkerRemarks = sMR[1];
-  const sRM = useState('');   const remarks = sRM[0]; const setRemarks = sRM[1];
   const sB = useState(false); const busy = sB[0];     const setBusy = sB[1];
 
   function reload() {
@@ -559,7 +557,6 @@ const SectionMarker = function(props) {
       .then(function(r) {
         setMarkers(r[0] || []);
         setMarkerRemarks((r[1] && r[1].marker_remarks) || '');
-        setRemarks((r[1] && r[1].remarks) || '');
         setLoading(false);
       })
       .catch(function() { setLoading(false); });
@@ -609,13 +606,6 @@ const SectionMarker = function(props) {
       : ce('div', { className: 'pd-remarks', dangerouslySetInnerHTML: { __html: markerRemarks } })
   );
 
-  const remarksBlock = ce('div', { style: { marginBottom: 16 } },
-    subTitle('Remarks'),
-    htmlIsEmpty(remarks)
-      ? ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No remarks')
-      : ce('div', { className: 'pd-remarks', dangerouslySetInnerHTML: { __html: remarks } })
-  );
-
   const markerListBlock = ce('div', null,
     subTitle('Markers'),
     addBtn,
@@ -631,7 +621,7 @@ const SectionMarker = function(props) {
         )
   );
 
-  return ce('div', null, markerNotesBlock, remarksBlock, markerListBlock);
+  return ce('div', null, markerNotesBlock, markerListBlock);
 };
 
 const Section4Remarks = function(props) {
