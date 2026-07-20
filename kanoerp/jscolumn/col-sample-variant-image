@@ -1,0 +1,54 @@
+const sample_id = ctx.record?.fk_sample_variant_id ?? "";
+
+if (!sample_id) {
+  ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No image</span>';
+  return;
+}
+
+const uid = "sv_refimg_" + sample_id;
+const sql =
+  "SELECT attachments.url AS img_url, attachments.filename AS img_filename " +
+  "FROM t_wda3bnmr9c9, attachments " +
+  "WHERE t_wda3bnmr9c9.f_57nmxuosclw = " + sample_id + " " +
+  "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+  "ORDER BY attachments.id ASC";
+
+ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(rows) {
+    rows = rows || [];
+
+    if (!rows.length) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No image</span>';
+      return;
+    }
+
+    var origin = window.location.origin;
+    var first = rows[0];
+    var url = first.img_url || (first.img_filename ? origin + '/storage/uploads/' + first.img_filename : '');
+
+    if (!url) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No image</span>';
+      return;
+    }
+
+    var extra = rows.length > 1
+      ? '<div style="font-size:10px;color:#9ca3af;margin-top:3px;">+' + (rows.length - 1) + ' more</div>'
+      : '';
+
+    ctx.element.innerHTML =
+      '<div style="padding:2px;">' +
+        '<img ' +
+          'src="' + url + '" ' +
+          'style="width:100%;max-width:160px;height:120px;object-fit:cover;border-radius:6px;cursor:pointer;display:block;" ' +
+          'onclick="window.open(\'' + url + '\',\'_blank\')" ' +
+          'onerror="this.parentElement.innerHTML=\'<span style=&quot;color:#d1d5db;font-size:11px;&quot;>Load error</span>\'" ' +
+        '/>' +
+        extra +
+      '</div>';
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
