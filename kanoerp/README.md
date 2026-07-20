@@ -114,8 +114,29 @@ table below blindly.
 These have been stated and re-confirmed many times. Any new code must respect them.
 If a solution requires one of the "blocked" items below, it is wrong — find another way.
 
-- **`window.*` is fully blocked.** No `window.print`, `window.open`, `window.innerWidth`,
-  `window.addEventListener`, `window.location`. Never propose a `window.*`-based fix.
+- **`window.*` access is a per-property allow/deny list, NOT a blanket
+  block.** *(Corrected 2026-07 — the previous blanket "fully blocked" claim
+  in this README was wrong, discovered while auditing `view_sample_details`,
+  which uses `window.location.origin` and `window.open()` and works
+  perfectly live. Confirmed by direct testing with a throwaway diagnostic
+  jblock — see `probe_window_document.js` in session history if this needs
+  re-verifying after a platform change.)* Tested, one property/method at a
+  time:
+  - **Allowed:** `window.location.origin` (read), `window.open(url, target)`
+    (the SES sandbox itself permits the call — but browsers separately
+    block popups not triggered by a genuine user gesture, e.g. calling it
+    from inside a `useEffect` on page load gets silently suppressed by the
+    *browser*, not the sandbox; calling it from a real `onClick` handler
+    works, since that's a real click), `window.addEventListener`.
+  - **Blocked:** `window.location.href` (read — note `.origin` above IS
+    allowed, only `.href` isn't), `window.innerWidth`, `window.print`.
+  - **Not yet tested:** anything not listed above — don't assume either way,
+    test it with the same throwaway-jblock technique before relying on it.
+  - This means some of this codebase's existing workarounds (e.g. building
+    a PDF by hand instead of `window.print`, per the bullet below) were
+    solving a real, still-current constraint (`window.print` is genuinely
+    blocked) — don't revert those. But don't assume every `window.*` call
+    needs a workaround either; check the specific property/method first.
 - **`document` is not freely available in all contexts** — only use it where already
   proven to work. The one proven pattern: CSV/PDF download via
   `document.createElement('a')` + `Blob` + `.click()` (used in the working CSV export
