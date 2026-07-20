@@ -1,0 +1,115 @@
+const prod_id = ctx.record?.id ?? "";
+
+if (!prod_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+// Query 1: Materials (fabric + accessories combined) from production_material
+ctx.sql.save({
+  uid: "rm_material_" + prod_id,
+  sql: `SELECT production_material.id AS id, production_material.fk_material_details_code AS material_code, ` +
+       `production_material.status AS status, production_material.shipment_date AS shipment_date, ` +
+       `production_material.quantity_need AS quantity_need, raw_material.type AS material_type ` +
+       `FROM production_material, material_details, raw_material ` +
+       `WHERE production_material.fk_production_id = ${prod_id} ` +
+       `AND production_material.fk_material_details_code = material_details.code ` +
+       `AND material_details.fk_material_code = raw_material.code`,
+  dataSourceKey: "main"
+}).then(() => {
+  return ctx.sql.runById("rm_material_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+}).then(function (materials) {
+
+  // Query 2: Sample
+  return ctx.sql.save({
+    uid: "rm_sample_" + prod_id,
+    sql: `SELECT fk_sample_product_code, status, shipment_date FROM production_sample WHERE fk_production_id = ${prod_id}`,
+    dataSourceKey: "main"
+  }).then(() => {
+    return ctx.sql.runById("rm_sample_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+  }).then(function (samples) {
+
+    // ── HELPERS ──────────────────────────────────────────────
+    function statusColor(status) {
+      if (!status) return '#d9d9d9';
+      const s = status.toLowerCase();
+      if (s === 'sent')     return '#22c55e';
+      if (s === 'ready')    return '#84cc16';
+      if (s === 'ordered')  return '#f97316';
+      if (s === 'pending')  return '#f97316';
+      return '#d9d9d9';
+    }
+
+    function statusBadge(status, shipment_date) {
+      const color = statusColor(status);
+      const label = status || 'unknown';
+      const dateStr = (status && status.toLowerCase() === 'sent' && shipment_date)
+        ? `<div style="font-size:9px; color:#888; margin-top:1px;">${String(shipment_date).substring(0, 10)}</div>`
+        : '';
+      return `
+        <span style="display:inline-block; background:${color}22; color:${color}; border:1px solid ${color}66;
+          border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; line-height:18px;">${label}</span>
+        ${dateStr}
+      `;
+    }
+
+    function sectionLabel(text) {
+      return `<div style="font-size:9px; font-weight:700; color:#aaa; text-transform:uppercase; letter-spacing:0.5px; margin-top:6px; margin-bottom:2px;">${text}</div>`;
+    }
+
+    // Split materials into fabric vs accessories based on raw_material.type
+    const fabrics = (materials || []).filter(m => String(m.material_type || '').toLowerCase() === 'fabric');
+    const accessories = (materials || []).filter(m => String(m.material_type || '').toLowerCase() !== 'fabric');
+
+    // ── NO DATA ───────────────────────────────────────────────
+    const hasAny = fabrics.length || accessories.length || (samples && samples.length);
+    if (!hasAny) {
+      ctx.element.innerHTML = '<div style="font-size:11px; color:#d9d9d9;">—</div>';
+      return;
+    }
+
+    // ── BUILD HTML ────────────────────────────────────────────
+    let html = `<div style="font-size:11px; font-family:system-ui,sans-serif; line-height:1.4;">`;
+
+    // FABRIC
+    if (fabrics.length) {
+      html += sectionLabel('Fabric');
+      fabrics.forEach(f => {
+        html += `
+          <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:6px; padding:2px 0; border-bottom:1px solid #f5f5f5;">
+            <div style="font-weight:600; color:#333; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${f.material_code || '—'}</div>
+            <div style="flex-shrink:0; text-align:right;">${statusBadge(f.status, f.shipment_date)}</div>
+          </div>`;
+      });
+    }
+
+    // ACCESSORIES
+    if (accessories.length) {
+      html += sectionLabel('Accessories');
+      accessories.forEach(a => {
+        html += `
+          <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:6px; padding:2px 0; border-bottom:1px solid #f5f5f5;">
+            <div style="font-weight:600; color:#333; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${a.material_code || '—'}</div>
+            <div style="flex-shrink:0; text-align:right;">${statusBadge(a.status, a.shipment_date)}</div>
+          </div>`;
+      });
+    }
+
+    // SAMPLE
+    if (samples && samples.length) {
+      const s = samples[0];
+      html += sectionLabel('Sample');
+      html += `
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:6px; padding:2px 0;">
+          <div style="font-weight:600; color:#333; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${s.fk_sample_product_code || '—'}</div>
+          <div style="flex-shrink:0; text-align:right;">${statusBadge(s.status, s.shipment_date)}</div>
+        </div>`;
+    }
+
+    html += `</div>`;
+    ctx.element.innerHTML = html;
+
+  }); // end sample
+}).catch(function (err) {
+  ctx.element.innerHTML = '<span style="color:#ef4444; font-size:11px;">ERR: ' + err.message + '</span>';
+});
