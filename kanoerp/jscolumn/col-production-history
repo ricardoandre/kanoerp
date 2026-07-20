@@ -1,0 +1,73 @@
+// =====================================================
+// COLUMN CODE — PRODUCTION HISTORY (merged)
+// Merges history of: production + its production_sample + production_material
+// (sub-records matched via fk_production_id). Sample-history card format.
+// Shows source tag + category (category only when present).
+// Per-row uid so list rows don't collide.
+// =====================================================
+
+const production_id = ctx.record?.id ?? "";
+if (!production_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+const uid = "production_history_all_" + production_id;
+const sql =
+  "SELECT users.nickname AS name, history.create_date AS history_date, " +
+  "       history.status, history.message, history.category, history.table_name AS source " +
+  "FROM history, users " +
+  "WHERE history.fk_user_id = users.id " +
+  "  AND ( " +
+  "    (history.table_name='production' AND history.table_id=" + production_id + ") " +
+  "    OR (history.table_name='production_sample' AND history.table_id IN " +
+  "        (SELECT id FROM production_sample WHERE fk_production_id=" + production_id + ")) " +
+  "    OR (history.table_name='production_material' AND history.table_id IN " +
+  "        (SELECT id FROM production_material WHERE fk_production_id=" + production_id + ")) " +
+  "  ) " +
+  "ORDER BY history_date DESC " +
+  "LIMIT 3";
+ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(rows) {
+    rows = rows || [];
+    if (!rows.length) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No history</span>';
+      return;
+    }
+    function fmtDate(d) {
+      if (!d) return '';
+      return String(d).substring(0, 16).replace('T', ' ');
+    }
+    var SRC = {
+      production:          { label: 'Production', color: '#64748b' },
+      production_sample:   { label: 'Sample',     color: '#6366f1' },
+      production_material: { label: 'Material',   color: '#0891b2' },
+    };
+    function tag(text, color) {
+      return '<span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;' +
+        'color:' + color + ';background:' + color + '1a;border:1px solid ' + color + '40;' +
+        'border-radius:10px;padding:0 6px;white-space:nowrap;">' + text + '</span>';
+    }
+    var html = '<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:6px;max-width:100%;">';
+    rows.forEach(function(row) {
+      var src = SRC[row.source] || { label: row.source || '', color: '#94a3b8' };
+      var cat = (row.category != null && String(row.category).trim() !== '') ? String(row.category) : '';
+      html +=
+        '<div style="border-left:2px solid #e2e8f0;padding:3px 0 3px 7px;">' +
+          '<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-bottom:1px;">' +
+            '<span style="font-size:11px;font-weight:700;color:#1e293b;">' + (row.name || '—') + '</span>' +
+            tag(src.label, src.color) +
+            (cat ? tag(cat, '#475569') : '') +
+          '</div>' +
+          '<span style="font-size:10px;color:#94a3b8;display:block;margin-bottom:2px;">' + fmtDate(row.history_date) + ' - ' + (row.status || '') + '</span>' +
+          '<div style="font-size:11px;color:#374151;line-height:1.5;white-space:normal;overflow-wrap:break-word;word-break:break-word;">' + (row.message || '') + '</div>' +
+        '</div>';
+    });
+    html += '</div>';
+    ctx.element.innerHTML = html;
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
