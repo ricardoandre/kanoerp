@@ -1,5 +1,14 @@
 // ui_material_out — shared Material Out logic + UI.
-// Input:  openModal({ ctx, pmId, onSaved })   — opens entry modal (instant), writes ledger on save
+// Input:  openModal({ ctx, pmId, onSaved })   — ASYNC. Fetches summary via ctx.sql
+//           FIRST, then opens the modal with already-loaded data (same pattern as
+//           ui_prepare_fabric's fetchFabricRows→openFabricModal). Do NOT lazy-fetch
+//           via ctx.sql from inside a component that mounts after openModal returns:
+//           when called from a JSAction (act_material_out), ctx.sql is scoped to the
+//           action's live execution window and goes null once the action script
+//           finishes — a post-mount useEffect calling ctx.sql then throws
+//           "Cannot read properties of null (reading 'sql')". ctx.api is NOT scoped
+//           this way (stable resource client), so save/cancel handlers inside the
+//           open modal are fine to keep using ctx.api after the action returns.
 //         fetchSummary(ctx, pmId)              — returns { materialCode, isAcc, ledgerRows } | null | {error}
 //           ledgerRows[i] = { ledger_id, transaction_date, status, count, total_amount, details:[num,...] }
 //         renderSummary(data)                  — simple totals box: "date (x rol)" .... "y yard" per entry,
@@ -19,7 +28,7 @@
 //   status/type tags   → soft tinted background, no border, no shadow, cursor default
 // Depends on: none.
 
-const { useState, useEffect } = React;
+const { useState } = React;
 const { Modal } = antd;
 const ce = React.createElement;
 
@@ -47,9 +56,14 @@ function ledgerStatusLabel(s) {
 }
 
 async function runSql(ctx, uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
+  // NOTE: deliberately NOT gated by ctx.flowSettingsEnabled (unlike the README §4.2
+  // "canonical" template). In this JSAction-on-native-table context that flag is
+  // false, so a gated .save() never registers dynamic per-record uids (e.g.
+  // 'pm_out_lookup_123') — runById then fails against an unregistered uid with
+  // "Cannot read properties of null (reading 'sql')" (NocoBase's internal flow-sql
+  // config lookup, not our ctx, coming back null). Always calling .save() first
+  // — same as loadCode's pattern, which does work in this context — fixes it.
+  await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
   return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
     .then(r => r || []).catch(() => []);
 }
@@ -223,7 +237,7 @@ function cancelLedger(ctx, ledgerId, onDone) {
   });
 }
 
-// ===== entry modal (per-record data via props) =====
+// ===== entry modal (per-record data via props; data is already loaded — see openModal) =====
 function MaterialOutContent(props) {
   const ctx = props.ctx;
   const materialCode = props.materialCode;
@@ -373,48 +387,16 @@ function MaterialOutContent(props) {
   );
 }
 
-// ===== loader: opens instantly, fetches inside the modal =====
-function MaterialOutLoader(props) {
-  const ctx = props.ctx;
-  const pmId = props.pmId;
-  const onSaved = props.onSaved;
-  const [state, setState] = useState({ loading: true, summary: null, err: null });
-
-  useEffect(function() {
-    let alive = true;
-    fetchSummary(ctx, pmId)
-      .then(function(s) { if (alive) setState({ loading: false, summary: s, err: null }); })
-      .catch(function(e) { if (alive) setState({ loading: false, summary: null, err: (e && e.message) || 'load failed' }); });
-    return function() { alive = false; };
-  }, [pmId]);
-
-  if (state.loading) {
-    return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…');
-  }
-  const s = state.summary;
-  if (!s) {
-    return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, state.err || 'Could not load production material info.');
-  }
-  if (s.error === 'no_material_code') {
-    return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, 'This production material has no material code set.');
-  }
-
-  const isAcc = s.isAcc;
-  const todayStr = dayjs ? dayjs().format('YYYY-MM-DD') : new Date().toISOString().substring(0, 10);
-  return ce(MaterialOutContent, {
-    ctx: ctx,
-    materialCode: s.materialCode,
-    productionMaterialId: pmId,
-    unitItem: isAcc ? 'pack' : 'rol',
-    unitTotal: isAcc ? 'pcs' : 'yard',
-    todayStr: todayStr,
-    ledgerHistory: s.ledgerRows,
-    onSaved: onSaved,
-  });
-}
-
-// ===== entry point: opens modal immediately, loader fetches inside =====
-function openModal(args) {
+// ===== entry point: FETCHES FIRST (ctx.sql), THEN opens modal with loaded data.
+//   This mirrors ui_prepare_fabric's fetchFabricRows→openFabricModal split.
+//   Do not revert to "open instantly, fetch inside a mounted component" — when this
+//   is invoked from a JSAction (act_material_out on the native table), ctx.sql is
+//   only valid for the duration of the action's own execution; a post-mount fetch
+//   fires after that window closes and ctx.sql is null by then. Fetching here,
+//   before Modal.confirm is called, keeps the ctx.sql call inside the caller's
+//   still-live await chain regardless of whether the caller is a JSAction or a
+//   long-lived jblock/component. =====
+async function openModal(args) {
   const ctx = args.ctx;
   const pmId = args.pmId;
   const onSaved = args.onSaved;
@@ -422,11 +404,34 @@ function openModal(args) {
   if (!ctx) { return; }
   if (!pmId) { ctx.message.warning('No production material record found.'); return; }
 
+  const hideLoading = ctx.message.loading ? ctx.message.loading('Loading material info…', 0) : null;
+  let s;
+  try {
+    s = await fetchSummary(ctx, pmId);
+  } finally {
+    if (hideLoading) hideLoading();
+  }
+
+  if (!s) { ctx.message.error('Could not load production material info.'); return; }
+  if (s.error === 'no_material_code') { ctx.message.error('This production material has no material code set.'); return; }
+
+  const isAcc = s.isAcc;
+  const todayStr = dayjs ? dayjs().format('YYYY-MM-DD') : new Date().toISOString().substring(0, 10);
+
   Modal.confirm({
     title: 'Record Material Out',
     width: 480,
     icon: null,
-    content: ce(MaterialOutLoader, { ctx: ctx, pmId: pmId, onSaved: onSaved }),
+    content: ce(MaterialOutContent, {
+      ctx: ctx,
+      materialCode: s.materialCode,
+      productionMaterialId: pmId,
+      unitItem: isAcc ? 'pack' : 'rol',
+      unitTotal: isAcc ? 'pcs' : 'yard',
+      todayStr: todayStr,
+      ledgerHistory: s.ledgerRows,
+      onSaved: onSaved,
+    }),
     okButtonProps: { style: { display: 'none' } },
     cancelButtonProps: { style: { display: 'none' } },
     maskClosable: true,
