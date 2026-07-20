@@ -1,0 +1,94 @@
+const sample_id = ctx.record?.id ?? "";
+
+if (!sample_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  return String(d).substring(0, 16).replace('T', ' ');
+}
+
+const uidSample  = "sample_history_" + sample_id;
+const uidVarIds  = "sample_var_ids_" + sample_id;
+
+const sqlSample =
+  "SELECT users.nickname AS name, create_date AS history_date, status, message, category " +
+  "FROM history, users " +
+  "WHERE table_name='sample' AND table_id=" + sample_id + " " +
+  "AND fk_user_id=users.id";
+
+const sqlVarIds =
+  "SELECT id FROM sample_variant WHERE fk_sample_variant_id=" + sample_id;
+
+ctx.sql.save({ uid: uidSample, sql: sqlSample, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uidSample, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(sampleRows) {
+    sampleRows = sampleRows || [];
+
+    return ctx.sql.save({ uid: uidVarIds, sql: sqlVarIds, dataSourceKey: "main" })
+      .then(function() {
+        return ctx.sql.runById(uidVarIds, { type: "selectRows", dataSourceKey: "main" });
+      })
+      .then(function(varRows) {
+        const variantIds = (varRows || []).map(function(r) { return r.id; }).filter(Boolean);
+
+        if (!variantIds.length) {
+          return sampleRows;
+        }
+
+        const uidVarHist = "sample_var_history_" + sample_id;
+        const sqlVarHist =
+          "SELECT users.nickname AS name, create_date AS history_date, status, message, category " +
+          "FROM history, users " +
+          "WHERE table_name='sample_variant' AND table_id IN (" + variantIds.join(',') + ") " +
+          "AND fk_user_id=users.id";
+
+        return ctx.sql.save({ uid: uidVarHist, sql: sqlVarHist, dataSourceKey: "main" })
+          .then(function() {
+            return ctx.sql.runById(uidVarHist, { type: "selectRows", dataSourceKey: "main" });
+          })
+          .then(function(varHistRows) {
+            return sampleRows.concat(varHistRows || []);
+          });
+      });
+  })
+  .then(function(rows) {
+    rows = rows || [];
+
+    if (!rows.length) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No history</span>';
+      return;
+    }
+
+    // Sort combined by date DESC, limit to 3
+    rows.sort(function(a, b) {
+      return new Date(b.history_date) - new Date(a.history_date);
+    });
+    rows = rows.slice(0, 3);
+
+    var html = '<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:6px;max-width:100%;">';
+
+    rows.forEach(function(row) {
+      var categoryTag = row.category
+        ? '<span style="font-size:9px;font-weight:600;color:#7c3aed;background:#f5f3ff;border-radius:4px;padding:1px 6px;display:inline-block;margin-top:2px;">' + row.category + '</span>'
+        : '';
+      html +=
+        '<div style="border-left:2px solid #e2e8f0;padding:3px 0 3px 7px;">' +
+          '<div style="font-size:11px;font-weight:700;color:#1e293b;">' + (row.name || '—') + '</div>' +
+          categoryTag +
+          '<div style="font-size:10px;color:#94a3b8;margin-top:2px;">' + fmtDate(row.history_date) + '</div>' +
+          (row.status ? '<div style="font-size:10px;color:#64748b;margin-top:1px;">' + row.status + '</div>' : '') +
+          (row.message ? '<div style="font-size:11px;color:#374151;line-height:1.5;white-space:normal;overflow-wrap:break-word;word-break:break-word;margin-top:2px;">' + row.message + '</div>' : '') +
+        '</div>';
+    });
+
+    html += '</div>';
+    ctx.element.innerHTML = html;
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
