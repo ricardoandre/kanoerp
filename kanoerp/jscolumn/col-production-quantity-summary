@@ -1,0 +1,138 @@
+const prod_id = ctx.record?.id ?? "";
+const planning = ctx.record?.planning_rol ?? 0;
+
+// Step 1: fetch first production_material for this production
+ctx.sql.save({
+  uid: "qty_view_pm_" + prod_id,
+  sql: `SELECT id FROM production_material WHERE fk_production_id = ${prod_id} ORDER BY id ASC LIMIT 1`,
+  dataSourceKey: "main"
+}).then(() => {
+  return ctx.sql.runById("qty_view_pm_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+}).then(function (pmRows) {
+
+  const pmId = pmRows?.[0]?.id ?? null;
+
+  // Step 2: fetch material_ledger summary (rol count + total yard) for that production_material
+  var ledgerPromise;
+  if (pmId) {
+    ledgerPromise = ctx.sql.save({
+      uid: "qty_view_ledger_hdr_" + prod_id,
+      sql: `SELECT id FROM material_ledger WHERE fk_production_material_id = ${pmId}`,
+      dataSourceKey: "main"
+    }).then(() => {
+      return ctx.sql.runById("qty_view_ledger_hdr_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+    }).then(function (ledgerHdrRows) {
+      const ledgerIds = (ledgerHdrRows || []).map(r => r.id).filter(Boolean);
+      if (!ledgerIds.length) return { rolCount: 0, totalYard: 0 };
+
+      return ctx.sql.save({
+        uid: "qty_view_ledger_det_" + prod_id,
+        sql: `SELECT COUNT(*) AS rol_count, COALESCE(SUM(details), 0) AS total_yard
+              FROM material_ledger_details
+              WHERE fk_material_ledger_id IN (${ledgerIds.join(',')})`,
+        dataSourceKey: "main"
+      }).then(() => {
+        return ctx.sql.runById("qty_view_ledger_det_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+      }).then(function (detRows) {
+        return {
+          rolCount: Number(detRows?.[0]?.rol_count) || 0,
+          totalYard: Number(detRows?.[0]?.total_yard) || 0,
+        };
+      });
+    });
+  } else {
+    ledgerPromise = Promise.resolve({ rolCount: 0, totalYard: 0 });
+  }
+
+  return ledgerPromise.then(function (materialSummary) {
+
+    // Step 3: do/cut quantity
+    return ctx.sql.save({
+      uid: "do_cut_qty_" + prod_id,
+      sql: `SELECT SUM(quantity) AS do_qty2, SUM(cut_quantity) AS cut_qty
+            FROM production_quantity_details
+            WHERE fk_production_id = ${prod_id}`,
+      dataSourceKey: "main"
+    }).then(() => {
+      return ctx.sql.runById("do_cut_qty_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+    }).then(function (doRows) {
+      const doQty2 = doRows?.[0]?.do_qty2 ?? 0;
+      const cutQty = doRows?.[0]?.cut_qty ?? 0;
+
+      return ctx.sql.save({
+        uid: "sent_qty_" + prod_id,
+        sql: `SELECT SUM(quantity) AS sent_qty
+              FROM production_result
+              WHERE fk_production_id = ${prod_id}`,
+        dataSourceKey: "main"
+      }).then(() => {
+        return ctx.sql.runById("sent_qty_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+      }).then(function (sentRows) {
+        const sentQty = sentRows?.[0]?.sent_qty ?? 0;
+
+        return ctx.sql.save({
+          uid: "qc_qty_" + prod_id,
+          sql: `SELECT SUM(quantity) AS qc_qty
+                FROM qc_result
+                WHERE fk_production_id = ${prod_id}`,
+          dataSourceKey: "main"
+        }).then(() => {
+          return ctx.sql.runById("qc_qty_" + prod_id, { type: "selectRows", dataSourceKey: "main" });
+        }).then(function (qcRows) {
+          const qcQty = qcRows?.[0]?.qc_qty ?? 0;
+
+          // differences
+          const diffCut  = cutQty - doQty2;
+          const diffSent = sentQty - cutQty;
+          const diffQc   = qcQty - sentQty;
+          const diffColor = (val) => val < 0 ? '#ff4d4f' : '#52c41a';
+          const diffHtml = (val) => val === 0 ? '' : ` <span style="color:${diffColor(val)};">(${val})</span>`;
+
+          ctx.element.innerHTML = `
+            <div style="
+              display: flex;
+              flex-direction: column;
+              gap: 2px;
+              font-size: 12px;
+              line-height: 1.4;
+            ">
+              <div>
+                <span style="color: #888;">Planning:</span>
+                <span style="font-weight: 500; margin-left: 4px;">${planning}</span>
+              </div>
+              <div>
+                <span style="color: #888;">Final:</span>
+                <span style="font-weight: 500; margin-left: 4px;">${materialSummary.rolCount} (${materialSummary.totalYard}yd)</span>
+              </div>
+              <br/>
+              <div>
+                <span style="color: #888;">DO:</span>
+                <span style="font-weight: 600; margin-left: 4px;">${doQty2}</span>
+              </div>
+              <div>
+                <span style="color: #888;">Cut:</span>
+                <span style="font-weight: 600; margin-left: 4px;">
+                  ${cutQty}${diffHtml(diffCut)}
+                </span>
+              </div>
+              <div>
+                <span style="color: #888;">Sent:</span>
+                <span style="font-weight: 600; margin-left: 4px; color: #1890ff;">
+                  ${sentQty}${diffHtml(diffSent)}
+                </span>
+              </div>
+              <div>
+                <span style="color: #888;">QC:</span>
+                <span style="font-weight: 600; margin-left: 4px; color: #52c41a;">
+                  ${qcQty}${diffHtml(diffQc)}
+                </span>
+              </div>
+            </div>
+          `;
+        }); // end qcRows.then
+      }); // end sentRows.then
+    }); // end doRows.then
+  }); // end materialSummary.then
+}).catch(err => {
+  ctx.element.innerHTML = 'SQL ERROR: ' + err.message;
+});
