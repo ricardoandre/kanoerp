@@ -1,0 +1,68 @@
+const prod_id = ctx.record?.id ?? "";
+
+if (!prod_id) {
+  ctx.element.innerHTML = '';
+} else {
+
+  // resource-based reads (non-admin-safe) instead of raw ctx.sql, which is
+  // admin/root-gated and fails silently for non-admin roles — see
+  // ui_production_addmarker.js header for the full explanation.
+  ctx.api.resource('production_marker').list({
+    filter: { fk_production_id: prod_id },
+    fields: ['fk_marker_id'],
+    pageSize: 100,
+  }).then(function (res) {
+    const links = (res && res.data && res.data.data) || [];
+    const markerIds = links.map(l => l.fk_marker_id).filter(Boolean);
+    if (!markerIds.length) {
+      ctx.element.innerHTML = '<div style="font-size:12px; color:#c9c9c9;">-</div>';
+      return;
+    }
+
+    return ctx.api.resource('marker').list({
+      filter: { id: { $in: markerIds } },
+      fields: ['id', 'length'],
+      pageSize: 100,
+    }).then(function (mres) {
+      const markers = (mres && mres.data && mres.data.data) || [];
+      // sort by id ascending — BigInt-safe, since snowflake ids can exceed
+      // Number.MAX_SAFE_INTEGER and a plain numeric subtract can silently
+      // lose precision.
+      markers.sort(function (a, b) {
+        const ba = BigInt(a.id), bb = BigInt(b.id);
+        return ba < bb ? -1 : ba > bb ? 1 : 0;
+      });
+
+      return ctx.api.resource('marker_details').list({
+        filter: { fk_marker_id: { $in: markerIds } },
+        fields: ['fk_marker_id', 'quantity'],
+        appends: ['sku_option'],
+        pageSize: 500,
+      }).then(function (dres) {
+        const details = (dres && dres.data && dres.data.data) || [];
+        const byMarker = {};
+        details.forEach(function (d) {
+          const key = String(d.fk_marker_id);
+          const so = d.sku_option || {};
+          (byMarker[key] = byMarker[key] || []).push({ display: so.display || '-', sort: so.sort || 0, quantity: d.quantity });
+        });
+        Object.keys(byMarker).forEach(function (k) {
+          byMarker[k].sort(function (a, b) { return a.sort - b.sort; });
+        });
+
+        ctx.element.innerHTML = `
+          <div style="font-size:12px; display:flex; flex-direction:column; gap:2px;">
+            ${markers.map(mk => `
+              <div style="display:flex; gap:6px; align-items:baseline;">
+                <span style="font-weight:600; color:#374151; white-space:nowrap;">${mk.length ?? '-'}cm</span>
+                <span style="color:#8c8c8c;">${(byMarker[String(mk.id)] || []).map(s => s.display + ':' + s.quantity).join(' ')}</span>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      });
+    });
+  }).catch(function (err) {
+    ctx.element.innerHTML = 'ERROR: ' + ((err && err.message) || err);
+  });
+}
