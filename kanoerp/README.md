@@ -550,6 +550,57 @@ just theoretically risky, from building `ui_production_addmarker.js`:
   your content component — see the top of `MarkerContent` in
   `ui_production_addmarker.js` for the current working example.
 
+### 6.2 Filter Control blocks — a third, separate pattern (JSX + a different `ctx`)
+ 
+*(Confirmed 2026-07, via `filter-production` and `filter-production-marker` —
+screenshot-verified working live.)* NocoBase has a third code-block type
+beyond the `jblock`/`JSAction`/`source_code` trio described elsewhere in this
+README: a **filter control** block, wired up as an extra block on a page
+sitting alongside a native NocoBase table block, that pushes an advanced
+filter into that table's own resource. It has its own compile context, and
+it does **not** follow the conventions in §3/§4/§6 above — those rules were
+written for `jblock`/`JSAction`/`source_code` and do not apply here:
+ 
+- **JSX is allowed and used** (`<div style={cardStyle}>...</div>`) — the
+  "never JSX" rule elsewhere in this README is specific to the
+  `new Function('React','antd','dayjs','ctx', src)` compile path used by
+  `jblock`/`JSAction`/`source_code`; filter control blocks are evidently
+  transpiled differently.
+- **`ctx.antd` / `ctx.React`**, not `ctx.libs.antd` / `ctx.libs.React`.
+- **`ctx.model.uid`** — this block's own uid, used as the SQL `uid` for its
+  counter query and as the filter-group key it registers on the target table.
+- **`ctx.engine.getModel(targetBlockUid)`** — resolves another block on the
+  same page by uid, returning an object with `.resource` (supports
+  `.addFilterGroup(key, filterObject)`, `.refresh()`, and a `.filters` map
+  keyed by group) and optionally `.rerender()`.
+- **`ctx.useResource('SQLResource')`** + `ctx.resource.setDataSourceKey('main')`
+  + `.setFilterByTk(ctx.model.uid)` + `.refresh()` + `.getData()` — used for
+  the block's own count/statistics query (e.g. per-status counts shown on
+  the quick-filter buttons), run via `ctx.sql.save`/`ctx.model.uid` same as
+  the admin-gated pattern in §3 — **this block type has not been confirmed
+  to work for non-admin roles**; the screenshot verification was as an admin
+  user. Treat the count numbers (not the filtering itself, which goes through
+  `.resource.addFilterGroup`) as suspect for non-admin users until tested.
+**Per-page configuration required, easy to break silently:** both known
+examples hardcode a `productionBlockUid` (or equivalent) constant at the top
+— the uid of the native table block the filter should control, which is
+different on every page. Copying the file to a new page without updating
+that constant fails with a caught, user-facing error ("Target block not
+found") rather than silently doing nothing, which is good defensive design —
+but it's a real footgun worth flagging to anyone duplicating one of these.
+ 
+**Do not "fix" a filter control block by porting it onto the `ce`/`ctx.libs`
+conventions used elsewhere** — that would very likely break it, not
+standardize it. If a new filter control block is needed, copy
+`filter-production` or `filter-production-marker` as the template, not
+anything from the `source_code`/`jblock` side of this codebase.
+ 
+**Not yet added to the registry tables in §8** — these two files exist at
+`jblock/filter-production` and `jblock/filter-production-marker` per the
+repo's folder structure, but since their conventions are entirely different
+from the rest of that table's `jblock` rows, consider whether they deserve
+their own registry subsection (mirroring how §8 already splits "dev tools"
+out from domain `jblock` rows) next time the registry is touched.
 ---
 
 ## 7. Database schema — see separate file, not here
