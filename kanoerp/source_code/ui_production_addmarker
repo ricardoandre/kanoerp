@@ -12,12 +12,30 @@
 // production info." / "Cannot read properties of null (reading 'sql')"
 // failures, not the concurrent-dynamic-uid race theorized earlier.
 //
-// FIX (this pass): the in-modal "Marker Notes" editor was reading/writing
-// production.remarks — WRONG. production has two separate real columns:
-// `remarks` (general, shown in the detail view's Remarks accordion) and
-// `marker_remarks` (marker-specific notes, shown in the detail view's
-// Marker section). This modal now reads/writes `marker_remarks` only, so
-// saving marker notes here no longer silently overwrites general remarks.
+// FIX (marker notes field): the "Marker Notes" editor reads/writes
+// production.marker_remarks — NOT production.remarks. production has two
+// separate real columns: `remarks` (general, shown in the detail view's own
+// Remarks accordion) and `marker_remarks` (marker-specific, shown here and
+// in the detail view's Marker section). Keep these distinct; do not read or
+// write `remarks` from this file.
+//
+// FIX (stale value on reopen): markerRemarksValue is set INSIDE the same
+// fetchSummary().then() callback that flips loading to false — not in a
+// separate useEffect keyed on state.data. The RichTextEditor below is an
+// uncontrolled component (mounts once, sets its own innerHTML on mount,
+// ignores later prop changes — that's what avoids cursor-jump while
+// typing). It first mounts on the render where loading becomes false; if
+// the value arrives in a LATER render, the editor has already mounted with
+// an empty string and never picks it up — the save itself works, but
+// reopening shows blank. Setting the value in the same batched update as
+// loading:false avoids that race.
+//
+// EMBEDDED MODE (new): MarkerContent now accepts `embedded: true`, for
+// reuse inside ui_production_edit.js's "Markers" card in the Edit
+// Production drawer — same component, same data/write logic, just without
+// the modal-only chrome (title bar + close button, and the product info
+// box, which is redundant next to the edit drawer's own Details card).
+// Standalone usage via openModal() is unaffected (embedded defaults false).
 //
 // EXPORTS (contract):
 //   openModal({ ctx, productionId, onSaved })
@@ -34,6 +52,9 @@
 //                    markers:[{linkId,markerId,length,sizes}],
 //                    linkableMarkers:[{markerId,length,sizes,matchReason}],
 //                    skuOptions:[{id,display}] } | null
+//   MarkerContent({ ctx, productionId, onSaved, embedded })
+//       — the full marker management UI as a plain React component, usable
+//         standalone (via openModal) or embedded in a host's own layout.
 //
 // MARKER <-> PRODUCT MAPPING: markers may map to MULTIPLE products via the
 // `product_marker` collection (plain fk_marker_id + fk_product_code columns,
@@ -301,7 +322,8 @@ function confirmUnlink(ctx, linkId, onDone) {
 }
 
 // ── injected scoped CSS (proven pattern — a <style> tag rendered inline,
-// never document.head access) to make Modal.confirm sit like a right drawer ──
+// never document.head access) to make Modal.confirm sit like a right drawer.
+// Only relevant to standalone (non-embedded) usage. ──
 const PMK_CSS =
   ".pamk-drawer-modal{top:0 !important;padding-bottom:0 !important;margin:0 !important;" +
   "position:fixed !important;right:0 !important;height:100vh !important;max-width:420px !important;" +
@@ -449,11 +471,12 @@ function ManualLookup(props) {
   );
 }
 
-// ── main content, loads inside the modal ──
+// ── main content, loads inside the modal OR embedded in a host layout ──
 function MarkerContent(props) {
   const ctx = props.ctx;
   const productionId = props.productionId;
   const onSaved = props.onSaved;
+  const embedded = !!props.embedded;
   const [state, setState] = useState({ loading: true, data: null, err: null });
   const [pending, setPending] = useState([]); // queued new markers (not saved yet)
   const [saving, setSaving] = useState(false);
@@ -464,17 +487,9 @@ function MarkerContent(props) {
   function setMarkerRemarksDirty(v) { markerRemarksDirtyRef.current = v; setMarkerRemarksDirtyState(v); }
   const [savingMarkerRemarks, setSavingMarkerRemarks] = useState(false);
 
-  // IMPORTANT: markerRemarksValue is set HERE, inside the same fetch
-  // callback that flips loading to false — not in a separate useEffect
-  // keyed on state.data. The RichTextEditor below is an uncontrolled
-  // component (mounts once, sets its own innerHTML on mount, ignores later
-  // prop changes — that's what avoids cursor-jump while typing). It first
-  // mounts on the render where loading becomes false. If the value arrives
-  // in a LATER render (via a separate effect), the editor has already
-  // mounted with an empty string and never picks up the real value —
-  // save works, but reopening/reloading shows blank. Setting it here, in
-  // the same tick as setState({loading:false,...}), means both land in the
-  // same batched render, so the editor mounts with the correct value.
+  // markerRemarksValue is set HERE, inside the same fetchSummary().then()
+  // callback that flips loading to false — see FIX note at top of file for
+  // why (uncontrolled RichTextEditor + split-effect race = stale value).
   function load() {
     setState(s => Object.assign({}, s, { loading: true }));
     fetchSummary(ctx, productionId)
@@ -491,7 +506,7 @@ function MarkerContent(props) {
     setSavingMarkerRemarks(true);
     try {
       // marker_remarks — NOT remarks. See FIX note at top of file: these are
-      // two separate real columns on production; this modal only ever
+      // two separate real columns on production; this component only ever
       // touches the marker-specific one.
       await ctx.api.resource('production').update({ filterByTk: state.data.productionId, values: { marker_remarks: markerRemarksValue } });
       ctx.message.success('Marker notes saved.');
@@ -549,9 +564,9 @@ function MarkerContent(props) {
   }
 
   return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
-    ce(PmkStyles, null),
+    embedded ? null : ce(PmkStyles, null),
 
-    ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid #e5e7eb' } },
+    embedded ? null : ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid #e5e7eb' } },
       ce('span', { style: { fontSize: 15, fontWeight: 600, color: '#111827' } }, 'Production Marker'),
       ce('button', {
         onClick: () => Modal.destroyAll(), title: 'Close',
@@ -559,7 +574,9 @@ function MarkerContent(props) {
       }, '\u00D7')
     ),
 
-    box([
+    // product info box — omitted when embedded, since the host's own
+    // Details card already shows product/konveksi
+    embedded ? null : box([
       ce('div', { key: 'pc', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
         ce('span', { style: { color: '#64748b' } }, 'Product Code'), ce('span', { style: { fontWeight: 600 } }, d.productCode || '-')),
       ce('div', { key: 'pn', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 } },
@@ -629,7 +646,7 @@ function MarkerContent(props) {
       : null,
 
     ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 } },
-      ce('button', { onClick: () => Modal.destroyAll(), style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Close'),
+      embedded ? null : ce('button', { onClick: () => Modal.destroyAll(), style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Close'),
       ce(Button, { type: 'primary', loading: saving, onClick: saveAll }, 'Save New Markers')
     )
   );
