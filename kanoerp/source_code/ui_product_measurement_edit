@@ -1,0 +1,333 @@
+// ui_product_measurement_edit — "Edit Product Measurement" Drawer.
+//
+// Stored as a `source_code` row named 'ui_product_measurement_edit'.
+// Sibling of ui_product_measurement_add — same grid/paste/rich-text UI, but
+// loads an existing set on open and updates it instead of creating one.
+// Unlike the list card + detail view (which only show measurement columns
+// that actually have a value), Edit always shows ALL 16 columns, since the
+// whole point is being able to fill in ones that were left blank.
+//
+// Reads via ctx.api.resource() (not raw ctx.sql), same non-admin-safe
+// pattern as ui_product_measurement_add / view_product_measurement.
+//
+// EXPORTS: { ProductMeasurementEditDrawer, EditMeasurementFormBody }
+//   ProductMeasurementEditDrawer({ open, measurementId, onClose, onSaved,
+//     DrawerShell? }) — thin wrapper: Drawer (or DrawerShell if passed) +
+//     the footer lifted from EditMeasurementFormBody. Same contract as
+//     always; DrawerShell is optional and additive.
+//   EditMeasurementFormBody({ open, measurementId, onClose, onSaved,
+//     onFooterChange? }) — content only, no Drawer/footer chrome. Exported
+//     separately so a loader can mount it inside its own persistent
+//     DrawerShell instance (keeps one Drawer mounted across the whole
+//     loading→loaded lifecycle instead of swapping Drawer instances, which
+//     is what caused a "popup" snap when hosted from a loader that returned
+//     null while ui_product_measurement_edit itself was still loading).
+//     onFooterChange(node): called whenever the footer (Cancel/Save
+//     buttons, reflecting current busy/loading state) should update.
+//     Optional — omit if you don't need the sticky-footer slot.
+//
+// Depends on: none.
+const { useState, useEffect, useMemo, useRef } = React;
+const { Drawer, Select, Input, InputNumber, Spin, Alert, Table, Checkbox } = antd;
+const ce = React.createElement;
+
+// ── resource-based read helpers ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function chunk(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, 150);
+  return batches.reduce(function (p, batch) {
+    return p.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter })).then(rows => acc.concat(rows));
+    });
+  }, Promise.resolve([]));
+}
+const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
+
+function fetchProductOptions() { return fetchAllPages('product', { fields: ['code', 'name'], sort: ['name'] }); }
+function fetchSkuOptions() { return fetchAllPages('sku_option', { fields: ['id', 'display', 'sort'], sort: ['sort'] }); }
+
+// ── measurement fields (product_measurement_variant SQL columns, fixed order) ──
+const MEASURE_FIELDS = [
+  { key: 'bust',              primary: 'Bust',          secondary: 'Lingkar Dada' },
+  { key: 'shoulder',          primary: 'Shoulder',      secondary: 'Bahu' },
+  { key: 'waist',             primary: 'Waist',         secondary: 'Lingkar Pinggang' },
+  { key: 'hips',              primary: 'Hips',          secondary: 'Lingkar Pinggul' },
+  { key: 'length',            primary: 'Length',        secondary: 'Panjang' },
+  { key: 'length2',           primary: 'Length 2',      secondary: 'Panjang 2' },
+  { key: 'bottom_hole',       primary: 'Bottom Hole',   secondary: 'Lingkar Bawah' },
+  { key: 'neck',              primary: 'Neck',          secondary: 'Lingkar Leher' },
+  { key: 'arm_hole',          primary: 'Arm Hole',      secondary: 'Lingkar Ketiak' },
+  { key: 'bottom_sleeve',     primary: 'Bottom Sleeve', secondary: 'Lebar Lengan' },
+  { key: 'mid_sleeve',        primary: 'Mid Sleeve',    secondary: 'Pangkal Lengan' },
+  { key: 'sleeve_length',     primary: 'Sleeve Length', secondary: 'Panjang Lengan' },
+  { key: 'thigh',             primary: 'Thigh',         secondary: 'Lebar Paha' },
+  { key: 'est_main_fabric',   primary: 'Est Fabric',    secondary: 'Est Bahan' },
+  { key: 'est_main_fabric_2', primary: 'Est Fabric 2',  secondary: 'Est Bahan 2' },
+  { key: 'est_furing',        primary: 'Est Furing',    secondary: 'Est Furing' },
+  { key: 'bust2',              primary: 'Bust 2',        secondary: 'Lingkar Dada 2' },
+  { key: 'waist2',             primary: 'Waist 2',       secondary: 'Lingkar Pinggang 2' },
+  { key: 'elastic',            primary: 'Elastic',       secondary: 'Karet' },
+];
+const PASTE_COLUMNS = MEASURE_FIELDS;
+function emptyValues() { return MEASURE_FIELDS.reduce((acc, f) => { acc[f.key] = null; return acc; }, {}); }
+
+const PMS_CSS =
+  ".pmm-form-drawer .ant-drawer-content-wrapper{width:min(1080px,96vw)!important;}" +
+  "@media(max-width:700px){.pmm-form-drawer .ant-drawer-content-wrapper{width:100%!important;}}" +
+  ".pms-grid-wrap{border:1px solid #cbd5e1;}" +
+  ".pms-grid-wrap .ant-table,.pms-grid-wrap .ant-table-container,.pms-grid-wrap .ant-table-content{border-radius:0!important;}" +
+  ".pms-grid-wrap table{border-collapse:separate!important;border-spacing:0!important;}" +
+  ".pms-grid-wrap .ant-table-thead>tr>th{border-radius:0!important;border:1px solid #cbd5e1!important;background:#f1f5f9!important;padding:4px 3px!important;white-space:normal;text-align:center!important;}" +
+  ".pms-grid-wrap .ant-table-tbody>tr>td{border:1px solid #e2e8f0!important;padding:0!important;background:#fff;}" +
+  ".pms-grid-wrap .ant-table-tbody>tr.pms-row-alt>td{background:#f8fafc;}" +
+  ".pms-grid-wrap .ant-table-tbody>tr:hover>td{background:#eef2ff!important;}" +
+  ".pms-grid-wrap .ant-table-cell-fix-left,.pms-grid-wrap .ant-table-cell-fix-right{background:#fff!important;}" +
+  ".pms-grid-wrap .ant-table-tbody>tr>td.pms-size-cell{padding:6px 14px!important;}" +
+  ".pms-grid-wrap .ant-input-number,.pms-grid-wrap .ant-input{border-radius:0!important;border:none!important;box-shadow:none!important;width:100%;background:transparent!important;}" +
+  ".pms-grid-wrap .ant-input-number-input{padding:0 4px!important;height:28px!important;line-height:28px!important;text-align:center;background:transparent!important;}" +
+  ".pms-grid-wrap .ant-input-number-focused,.pms-grid-wrap .ant-input:focus{background:#e0e7ff!important;}" +
+  ".pms-rte-toolbar button{border:1px solid #e2e8f0;background:#fff;border-radius:4px;width:26px;height:24px;font-size:12px;cursor:pointer;color:#374151;}" +
+  ".pms-rte-toolbar button:hover{background:#f1f5f9;}" +
+  ".pms-rte-body{min-height:64px;max-height:160px;overflow-y:auto;padding:8px 10px;font-size:13px;outline:none;}" +
+  ".pms-rte-body:empty:before{content:attr(data-placeholder);color:#b0b7c3;}";
+const PmsStyles = () => ce('style', null, PMS_CSS);
+
+function RichTextEditor(props) {
+  const ref = useRef(null); const seeded = useRef(false);
+  useEffect(function () { seeded.current = false; }, [props.resetKey]);
+  useEffect(function () { if (ref.current && !seeded.current) { ref.current.innerHTML = props.value || ''; seeded.current = true; } });
+  function exec(cmd) { if (ref.current) ref.current.focus(); try { document.execCommand(cmd, false, null); } catch (e) {} if (ref.current) props.onChange(ref.current.innerHTML); }
+  function handleInput() { if (ref.current) props.onChange(ref.current.innerHTML); }
+  const btn = (cmd, label, title) => ce('button', { key: cmd, title: title, onMouseDown: e => e.preventDefault(), onClick: () => exec(cmd) }, label);
+  return ce('div', { style: { border: '1px solid #d9d9d9', borderRadius: 4, overflow: 'hidden' } },
+    ce('div', { className: 'pms-rte-toolbar', style: { display: 'flex', gap: 4, padding: '5px 6px', background: '#f8fafc', borderBottom: '1px solid #e2e8f0' } },
+      btn('bold', 'B', 'Bold'), ce('span', { style: { fontStyle: 'italic' } }, btn('italic', 'I', 'Italic')), btn('underline', 'U', 'Underline'),
+      btn('insertUnorderedList', '•≡', 'Bullet list'), btn('insertOrderedList', '1≡', 'Numbered list')),
+    ce('div', { ref: ref, className: 'pms-rte-body', contentEditable: true, suppressContentEditableWarning: true, onInput: handleInput, 'data-placeholder': props.placeholder || 'Notes…' }));
+}
+
+// ── load an existing set: header, linked products, size rows (ALL columns) ──
+function fetchMeasurementForEdit(id) {
+  return Promise.all([
+    ctx.api.resource('product_measurement').get({ filterByTk: id, fields: ['id', 'name', 'remarks'] }).then(r => r.data.data),
+    fetchAllPages('product', { filter: { fk_product_measurement_id: id }, fields: ['code', 'name'] }),
+    fetchAllPages('product_measurement_variant', { filter: { fk_product_measurement_variant_id: id }, fields: ['id'].concat(MEASURE_FIELDS.map(f => f.key)), appends: ['sku_option'] }),
+  ]).then(function (r) {
+    const pm = r[0]; const products = r[1]; const varRows = r[2];
+    const gridRows = varRows.map(v => {
+      const sk = v.sku_option || {};
+      const values = {}; MEASURE_FIELDS.forEach(f => { values[f.key] = v[f.key]; });
+      return { variant_id: v.id, sku_id: sk.id, sku_display: sk.display || '—', sku_sort: sk.sort || 0, values: values };
+    }).sort((a, b) => a.sku_sort - b.sku_sort);
+    return { name: pm.name || '', remarks: pm.remarks || '', productCodes: products.map(p => p.code), gridRows: gridRows };
+  });
+}
+
+async function updateProductMeasurement(id, form) {
+  await ctx.api.resource('product_measurement').update({ filterByTk: id, values: { name: form.name, remarks: form.remarks || '' } });
+
+  const toUpdate = form.gridRows.filter(r => r.variant_id);
+  const toCreate = form.gridRows.filter(r => !r.variant_id);
+  const currentVariantIds = new Set(toUpdate.map(r => r.variant_id));
+  const toDelete = form.originalVariantIds.filter(vid => !currentVariantIds.has(vid));
+
+  for (const row of toUpdate) {
+    await ctx.api.resource('product_measurement_variant').update({ filterByTk: row.variant_id, values: Object.assign({}, row.values, { sku_option: { id: row.sku_id } }) });
+  }
+  for (const row of toCreate) {
+    const values = Object.assign({}, row.values, { sku_option: { id: row.sku_id }, fk_product_measurement_variant_id: id });
+    await ctx.api.resource('product_measurement_variant').create({ values });
+  }
+  for (const vid of toDelete) { await ctx.api.resource('product_measurement_variant').destroy({ filterByTk: vid }); }
+
+  const currentCodes = new Set(form.selectedProducts);
+  const addedCodes = form.selectedProducts.filter(c => !form.originalProductCodes.includes(c));
+  const removedCodes = form.originalProductCodes.filter(c => !currentCodes.has(c));
+  for (const code of addedCodes) { await ctx.api.resource('product').update({ filterByTk: code, values: { fk_product_measurement_id: id } }); }
+  for (const code of removedCodes) { await ctx.api.resource('product').update({ filterByTk: code, values: { fk_product_measurement_id: null } }); }
+}
+
+// =====================================================
+// FORM BODY — content only, no Drawer/footer chrome. Exported separately so
+// a loader can mount it inside its own persistent DrawerShell instance
+// (keeps one Drawer mounted across the whole loading→loaded lifecycle,
+// instead of swapping Drawer instances, which is what caused a "popup"
+// snap in the first place).
+// props: { open, measurementId, onClose, onSaved, onFooterChange }
+//   onFooterChange(node): called whenever the footer (Cancel/Save buttons,
+//   reflecting current busy/loading state) should update. Optional.
+// =====================================================
+function EditMeasurementFormBody(props) {
+  const open = props.open, measurementId = props.measurementId, onClose = props.onClose, onSaved = props.onSaved, onFooterChange = props.onFooterChange;
+
+  const sLoading = useState(true);  const loading = sLoading[0];      const setLoading = sLoading[1];
+  const sName = useState('');       const name = sName[0];            const setName = sName[1];
+  const sRemarks = useState('');    const remarks = sRemarks[0];      const setRemarks = sRemarks[1];
+  const sResetKey = useState(0);    const resetKey = sResetKey[0];    const setResetKey = sResetKey[1];
+  const sOpts = useState([]);       const prodOpts = sOpts[0];        const setProdOpts = sOpts[1];
+  const sSku = useState([]);        const skuOptions = sSku[0];       const setSkuOptions = sSku[1];
+  const sSel = useState([]);        const selected = sSel[0];         const setSelected = sSel[1];
+  const sOrigCodes = useState([]);  const originalProductCodes = sOrigCodes[0]; const setOrigCodes = sOrigCodes[1];
+  const sOrigVids = useState([]);   const originalVariantIds = sOrigVids[0]; const setOrigVids = sOrigVids[1];
+  const sGrid = useState([]);       const gridRows = sGrid[0];        const setGridRows = sGrid[1];
+  const sAddSkus = useState([]);    const addSkuIds = sAddSkus[0];    const setAddSkuIds = sAddSkus[1];
+  const sBusy = useState(false);    const busy = sBusy[0];            const setBusy = sBusy[1];
+  const sActive = useState(null);   const activeCell = sActive[0];    const setActiveCell = sActive[1];
+
+  useEffect(function () { fetchProductOptions().then(setProdOpts).catch(() => {}); fetchSkuOptions().then(setSkuOptions).catch(() => {}); }, []);
+
+  useEffect(function () {
+    if (!open || !measurementId) return;
+    setLoading(true); setAddSkuIds([]); setActiveCell(null);
+    fetchMeasurementForEdit(measurementId).then(function (data) {
+      setName(data.name); setRemarks(data.remarks);
+      setSelected(data.productCodes); setOrigCodes(data.productCodes);
+      setGridRows(data.gridRows); setOrigVids(data.gridRows.map(r => r.variant_id));
+      setResetKey(k => k + 1); setLoading(false);
+    }).catch(function (e) { ctx.message.error('Failed to load: ' + ((e && e.message) || e)); setLoading(false); });
+  }, [open, measurementId]);
+
+  const availableSkuOptions = useMemo(() => skuOptions.filter(s => !gridRows.some(r => r.sku_id === s.id)), [skuOptions, gridRows]);
+
+  function setCell(skuId, key, val) { setGridRows(prev => prev.map(r => r.sku_id === skuId ? Object.assign({}, r, { values: Object.assign({}, r.values, { [key]: val }) }) : r)); }
+  function removeRow(skuId) { setGridRows(prev => prev.filter(r => r.sku_id !== skuId)); }
+  function handleAddSizes() {
+    if (!addSkuIds.length) return;
+    setGridRows(prev => {
+      const existingIds = new Set(prev.map(r => r.sku_id));
+      const toAdd = addSkuIds.filter(id => !existingIds.has(id)).map(id => skuOptions.find(s => s.id === id)).filter(Boolean)
+        .map(opt => ({ variant_id: null, sku_id: opt.id, sku_display: opt.display, sku_sort: opt.sort, values: emptyValues() }));
+      if (!toAdd.length) return prev;
+      const merged = prev.concat(toAdd); merged.sort((a, b) => a.sku_sort - b.sku_sort); return merged;
+    });
+    setAddSkuIds([]);
+  }
+
+  function applyPastedGrid(text, anchorRowIdx, anchorColIdx) {
+    const lines = text.replace(/\r/g, '').split('\n');
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (!lines.length) return;
+    setGridRows(prev => {
+      const next = prev.map(r => Object.assign({}, r, { values: Object.assign({}, r.values) }));
+      lines.forEach(function (line, r) {
+        const rowIdx = anchorRowIdx + r; if (rowIdx < 0 || rowIdx >= next.length) return;
+        line.split('\t').forEach(function (cell, c) {
+          const colIdx = anchorColIdx + c; if (colIdx < 0 || colIdx >= PASTE_COLUMNS.length) return;
+          const trimmed = cell.trim(); if (trimmed === '') return;
+          const num = parseFloat(trimmed.replace(',', '.')); if (!isNaN(num)) next[rowIdx].values[PASTE_COLUMNS[colIdx].key] = num;
+        });
+      });
+      return next;
+    });
+  }
+  function handleGridPaste(e) {
+    if (!activeCell) return;
+    const text = e.clipboardData && e.clipboardData.getData ? e.clipboardData.getData('text/plain') : ''; if (!text) return;
+    e.preventDefault();
+    const rowIdx = gridRows.findIndex(r => r.sku_id === activeCell.skuId);
+    const colIdx = PASTE_COLUMNS.findIndex(f => f.key === activeCell.colKey);
+    if (rowIdx === -1 || colIdx === -1) return;
+    applyPastedGrid(text, rowIdx, colIdx);
+    ctx.message.success('Pasted.');
+  }
+
+  async function handleSave() {
+    if (!name || !name.trim()) return ctx.message.warning('Enter a name.');
+    if (!selected.length) return ctx.message.warning('Select at least one product.');
+    if (!gridRows.length) return ctx.message.warning('Add at least one size to the grid.');
+    setBusy(true);
+    try {
+      await updateProductMeasurement(measurementId, { name: name.trim(), remarks: remarks, gridRows: gridRows, selectedProducts: selected, originalProductCodes: originalProductCodes, originalVariantIds: originalVariantIds });
+      ctx.message.success('Measurement set updated.');
+      if (onSaved) onSaved();
+    } catch (e) { setBusy(false); ctx.message.error('Save failed: ' + ((e && e.message) || e)); return; }
+    setBusy(false);
+  }
+
+  // report the current footer up to whoever's hosting us — runs every
+  // render (no deps array) so it always reflects the latest busy/loading
+  // state and closes over the latest handleSave; cheap, just two buttons.
+  useEffect(function () {
+    if (!onFooterChange) return;
+    onFooterChange(ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+      ce('button', { onClick: onClose, style: { padding: '6px 16px', fontSize: 13, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 6, background: '#fff' } }, 'Cancel'),
+      ce('button', { onClick: handleSave, disabled: busy || loading, style: { padding: '6px 20px', fontSize: 13, fontWeight: 700, cursor: (busy || loading) ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 6, color: '#fff', background: (busy || loading) ? '#c7c9d9' : '#4f46e5' } }, busy ? 'Saving…' : 'Save changes')
+    ));
+  });
+
+  const productLabel = code => { const p = prodOpts.find(x => x.code === code); return (p && p.name) ? (code + ' — ' + p.name) : code; };
+
+  const sizeColumn = { title: 'Size', dataIndex: 'sku_display', key: 'sku_display', fixed: 'left', width: 88, onCell: () => ({ className: 'pms-size-cell' }), render: v => ce('span', { style: { fontWeight: 700 } }, v) };
+  const removeColumn = { title: '', key: '_remove', width: 28, fixed: 'right', render: (_, record) => ce('button', { onClick: () => removeRow(record.sku_id), title: 'Remove size', style: { border: 'none', background: 'transparent', color: '#cbd5e1', cursor: 'pointer', fontSize: 12 } }, '✕') };
+  const fieldColumns = MEASURE_FIELDS.map(f => ({
+    title: ce('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1.25 } }, ce('div', { style: { fontWeight: 700, fontSize: 10, color: '#334155' } }, f.primary), ce('div', { style: { fontSize: 9, color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')')),
+    dataIndex: ['values', f.key], key: f.key, width: 90,
+    render: (v, record) => ce(InputNumber, { size: 'small', controls: false, value: record.values[f.key], onChange: val => setCell(record.sku_id, f.key, val), style: { width: '100%' }, min: 0, onFocus: () => setActiveCell({ skuId: record.sku_id, colKey: f.key }) }),
+  }));
+  const gridColumns = [sizeColumn].concat(fieldColumns).concat([removeColumn]);
+
+  return ce(React.Fragment, null,
+    ce(PmsStyles, null),
+    loading ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null)) :
+    ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, display: 'flex', flexDirection: 'column', gap: 14 } },
+      ce('div', { style: { display: 'flex', gap: 12 } },
+        ce('div', { style: { flex: 1 } }, fieldLabel('Name'), ce(Input, { value: name, onChange: e => setName(e.target.value), placeholder: 'e.g. O420005/06' })),
+        ce('div', { style: { flex: 2 } }, fieldLabel('Products'), ce(Select, { mode: 'multiple', showSearch: true, value: selected, onChange: setSelected, style: { width: '100%' }, placeholder: 'Select 1 or more products', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: prodOpts.map(p => ({ value: p.code, label: p.code + ' — ' + (p.name || '') })) }))),
+
+      ce('div', null, fieldLabel('Remarks'), ce(RichTextEditor, { value: remarks, onChange: setRemarks, resetKey: resetKey, placeholder: 'e.g. rib 21cm/5 baju' })),
+
+      ce('div', null,
+        ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 6 } },
+          fieldLabel('Measurements — all columns shown (' + gridRows.length + ' size row(s))'),
+          ce('div', { style: { display: 'flex', gap: 6 } },
+            ce(Select, { size: 'small', mode: 'multiple', showSearch: true, value: addSkuIds, onChange: setAddSkuIds, style: { width: 220 }, placeholder: 'Tick sizes to add…', maxTagCount: 2, filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: availableSkuOptions.map(s => ({ value: s.id, label: s.display })) }),
+            ce('button', { onClick: handleAddSizes, disabled: !addSkuIds.length, style: { padding: '2px 12px', fontSize: 12, fontWeight: 600, cursor: addSkuIds.length ? 'pointer' : 'not-allowed', border: '1px solid #d9d9d9', borderRadius: 4, background: addSkuIds.length ? '#fff' : '#f5f5f5', color: '#374151' } }, '+ Add sizes'))),
+        ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 6 } }, 'Tip: click a cell, then paste (Ctrl/Cmd+V) a block copied from Excel — matches the SQL column order.'),
+        gridRows.length > 0
+          ? ce('div', { className: 'pms-grid-wrap', onPaste: handleGridPaste }, ce(Table, { size: 'small', bordered: false, dataSource: gridRows, columns: gridColumns, rowKey: 'sku_id', pagination: false, scroll: { x: 1550 }, rowClassName: (record, index) => index % 2 === 1 ? 'pms-row-alt' : '' }))
+          : ce('div', { style: { padding: '14px 4px', fontSize: 12, color: '#9ca3af', fontStyle: 'italic', border: '1px dashed #e2e8f0', borderRadius: 4, textAlign: 'center' } }, 'No sizes — tick sizes above to add some.')),
+      ce('div', { style: { height: 20 } })));
+}
+
+// =====================================================
+// THIN WRAPPER — Drawer (or DrawerShell if props.DrawerShell is passed) +
+// the footer lifted from EditMeasurementFormBody. Same contract as always:
+// { open, measurementId, onClose, onSaved }. Any existing caller not
+// passing DrawerShell gets byte-identical rendering to before this split.
+// =====================================================
+function ProductMeasurementEditDrawer(props) {
+  const sFooter = useState(null); const footer = sFooter[0]; const setFooter = sFooter[1];
+  const bodyNode = ce(EditMeasurementFormBody, { open: props.open, measurementId: props.measurementId, onClose: props.onClose, onSaved: props.onSaved, onFooterChange: setFooter });
+
+  if (props.DrawerShell) {
+    return ce(props.DrawerShell, {
+      open: props.open, onClose: props.onClose, title: 'Edit Product Measurement',
+      width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', footer: footer,
+    }, bodyNode);
+  }
+  return ce(Drawer, {
+    open: props.open, title: 'Edit Product Measurement', placement: 'right', onClose: props.onClose, rootClassName: 'pmm-form-drawer',
+    footer: footer,
+  }, bodyNode);
+}
+
+return { ProductMeasurementEditDrawer, EditMeasurementFormBody };
