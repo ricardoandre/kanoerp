@@ -9,6 +9,10 @@
 // loading happen inside useEffect with try/catch, so any failure (e.g.
 // ctx.getVar not behaving as expected in this popup context) shows up as
 // a visible error message instead of a blank screen.
+//
+// FIX (2026-07): loadCode was still on raw ctx.sql — admin/root-gated,
+// silently fails for non-admin roles (see README §3). Swapped to the
+// resource-based version used everywhere else in this codebase.
 // =====================================================
 const { React, antd, dayjs } = ctx.libs;
 const { useEffect, useState } = React;
@@ -16,14 +20,17 @@ const { Spin, Typography } = antd;
 const { Text } = Typography;
 const ce = React.createElement;
 
-// shared code loader (same convention as view_production_material.js)
+// shared code loader (resource-based, non-admin-safe)
 const _codeCache = {};
 async function loadCode(name) {
   if (_codeCache[name]) return _codeCache[name];
-  const uid = 'code_' + name;
-  const rows = await ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }));
-  const src = (rows && rows[0] && rows[0].code) || '';
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
   if (!src) throw new Error("source_code row '" + name + "' was not found or is empty.");
   _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
   return _codeCache[name];
