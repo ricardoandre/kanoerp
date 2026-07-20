@@ -1,0 +1,86 @@
+const variant_id = ctx.record?.id ?? "";
+
+if (!variant_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+const uid = "sv_info_" + variant_id;
+const sql =
+  "SELECT sample_variant.status AS status, sample_variant.sewing_date AS sewing_date, " +
+  "sample_variant.sewing_pic AS sewing_pic, sample_variant.fk_fabric_code AS fk_fabric_code, " +
+  "sample_variant.fk_fabric_code2 AS fk_fabric_code2, sample.name AS sample_name " +
+  "FROM sample_variant, sample " +
+  "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+  "AND sample_variant.id = " + variant_id;
+
+ctx.sql.save({
+  uid: uid,
+  sql: sql,
+  dataSourceKey: "main"
+}).then(function () {
+  return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+}).then(function (rows) {
+  if (!rows || !rows.length) {
+    ctx.element.innerHTML = '<span style="color:#ccc;font-size:11px;">—</span>';
+    return;
+  }
+  var r = rows[0];
+
+  var STATUS_COLOR = {
+    sewing: '#d97706', qc: '#84cc16', approval: '#84cc16', done: '#22c55e', cancel: '#ef4444',
+  };
+  var STATUS_LABEL = {
+    sewing: 'Sewing', qc: 'QC', approval: 'Approval', done: 'Done', cancel: 'Cancel',
+  };
+
+  // Fetch sewing_pic label from fields table
+  return ctx.sql.save({
+    uid: 'sv_info_sewingpic_opts',
+    sql: "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample_variant' AND name = 'sewing_pic'",
+    dataSourceKey: "main"
+  }).then(function() {
+    return ctx.sql.runById('sv_info_sewingpic_opts', { type: "selectRows", dataSourceKey: "main" });
+  }).then(function(frows) {
+    var sewingPicMap = {};
+    try {
+      var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
+      var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
+      arr.forEach(function(o) { if (o.value != null) sewingPicMap[String(o.value)] = o.label; });
+    } catch(e) {}
+
+    var status      = String(r.status || '').toLowerCase();
+    var statusColor = STATUS_COLOR[status] || '#9ca3af';
+    var statusLabel = STATUS_LABEL[status] || (r.status || '—');
+    var sewingPicLabel = sewingPicMap[String(r.sewing_pic || '')] || (r.sewing_pic || '—');
+    var fabricLine = [r.fk_fabric_code, r.fk_fabric_code2].filter(Boolean).join(' / ');
+    var dateStr = r.sewing_date ? String(r.sewing_date).substring(0, 10) : '';
+
+    function row(label, value, alwaysShow) {
+      if (!value && !alwaysShow) return '';
+      var displayValue = value || '—';
+      return (
+        '<div style="display:flex;gap:4px;padding:2px 0;border-bottom:1px solid #f5f5f5;align-items:flex-start;">' +
+          '<span style="font-size:10px;color:#9ca3af;min-width:56px;flex-shrink:0;padding-top:1px;">' + label + '</span>' +
+          '<span style="font-size:11px;color:#1e293b;font-weight:500;word-break:break-word;">' + displayValue + '</span>' +
+        '</div>'
+      );
+    }
+
+    ctx.element.innerHTML =
+      '<div style="font-family:system-ui,sans-serif;font-size:11px;line-height:1.4;">' +
+        '<div style="margin-bottom:5px;">' +
+          '<span style="display:inline-block;background:' + statusColor + '22;color:' + statusColor + ';' +
+            'border:1px solid ' + statusColor + '66;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">' +
+            statusLabel +
+          '</span>' +
+        '</div>' +
+        row('Sample', r.sample_name, true) +
+        row('Fabric', fabricLine, true) +
+        row('Date', dateStr, true) +
+        row('PIC', sewingPicLabel) +
+      '</div>';
+  });
+}).catch(function (err) {
+  ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+});
