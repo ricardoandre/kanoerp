@@ -14,6 +14,17 @@
 // view, not just detail popups — was broken for non-admin roles until now.
 // Do not revert to raw SQL. fetchProductImages uses appends:['image'] in a
 // bulk .list() call instead of introspecting the `fields` metadata table.
+//
+// NOTE (2026-07, cont'd): fetchList/fetchListSummaries/fetchProductImages now
+// go through fetchAllPages() and fetchByIn() (see "scaling helpers" below,
+// same helpers as view_production_material) instead of single list() calls
+// with large pageSize / large $in arrays. NocoBase's resource list() is a GET
+// request, so a big filter (many IDs, or many string codes) gets JSON-encoded
+// straight into the URL — past a few hundred items this blows nginx's
+// `large_client_header_buffers` and throws 414 Request-URI Too Large, no
+// matter how high that buffer is set. Also fixes a silent-truncation bug:
+// the old pageSize:2000 single calls would quietly drop rows past 2000
+// rather than erroring. Designed to hold at 10,000+ productions.
 // =====================================================
 const { React, antd, dayjs } = ctx.libs;
 const { useState, useEffect } = React;
@@ -58,26 +69,66 @@ const doneColor = (val, ref) => (ref > 0 && val === ref) ? '#22c55e' : '#f97316'
 function fmtDate(d) { if (!d) return '—'; const p = dayjs(d); return p.isValid() ? p.format('DD MMM YYYY') : '—'; }
 function daysLeft(d) { if (!d) return null; return Math.ceil((new Date(d) - new Date()) / 86400000); }
 
+// ── scaling helpers (2026-07) — same pattern as ui_production_material ──
+// fetchAllPages: loops list() until a page comes back short, so no single
+// request ever needs a huge pageSize. Safe for any table size.
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+
+// chunk: splits an array into fixed-size batches.
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// fetchByIn: queries resourceName WHERE field IN (values), batching values
+// into groups of BATCH_SIZE so no single request's $in filter grows large
+// enough to blow the URL length limit (nginx 414). Each batch is itself
+// paginated via fetchAllPages, since a batch of IDs/codes can still match
+// more rows than the batch size (e.g. one-to-many joins). Batches run
+// sequentially to avoid hammering the server with many large concurrent
+// requests.
+const BATCH_SIZE = 150;
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, BATCH_SIZE);
+  return batches.reduce(function (promise, batch) {
+    return promise.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter }))
+        .then(function (rows) { return acc.concat(rows); });
+    });
+  }, Promise.resolve([]));
+}
+
 // ── data layer ──
 function fetchList() {
-  return ctx.api.resource('production').list({
+  return fetchAllPages('production', {
     fields: ['id', 'production_ref', 'status', 'is_new', 'est_production_start', 'est_production_finish', 'created_at', 'fk_product_code', 'fk_konveksi_code'],
     sort: ['-created_at'],
-    pageSize: 2000,
-  }).then(function (prodRes) {
-    const prodRows = (prodRes && prodRes.data && prodRes.data.data) || [];
+  }).then(function (prodRows) {
 
     const productCodes = [...new Set(prodRows.map(r => r.fk_product_code).filter(Boolean))];
     const konveksiCodes = [...new Set(prodRows.map(r => r.fk_konveksi_code).filter(Boolean))];
 
-    const productP = productCodes.length
-      ? ctx.api.resource('product').list({ filter: { code: { $in: productCodes } }, fields: ['code', 'name'], pageSize: 2000 })
-          .then(res => (res && res.data && res.data.data) || [])
-      : Promise.resolve([]);
-    const konveksiP = konveksiCodes.length
-      ? ctx.api.resource('konveksi').list({ filter: { code: { $in: konveksiCodes } }, fields: ['code', 'name'], pageSize: 2000 })
-          .then(res => (res && res.data && res.data.data) || [])
-      : Promise.resolve([]);
+    const productP = fetchByIn('product', 'code', productCodes, { fields: ['code', 'name'] });
+    const konveksiP = fetchByIn('konveksi', 'code', konveksiCodes, { fields: ['code', 'name'] });
 
     return Promise.all([productP, konveksiP]).then(function (r) {
       const productByCode = {}; r[0].forEach(p => { productByCode[p.code] = p; });
@@ -107,35 +158,11 @@ function fetchListSummaries(rows) {
   const ids = (rows || []).map(r => r.id);
   if (!ids.length) return Promise.resolve({});
 
-  const doP = ctx.api.resource('production_quantity_details').list({
-    filter: { fk_production_id: { $in: ids } },
-    fields: ['fk_production_id', 'quantity', 'cut_quantity'],
-    pageSize: 5000,
-  }).then(res => (res && res.data && res.data.data) || []);
-
-  const sentP = ctx.api.resource('production_result').list({
-    filter: { fk_production_id: { $in: ids } },
-    fields: ['fk_production_id', 'quantity'],
-    pageSize: 5000,
-  }).then(res => (res && res.data && res.data.data) || []);
-
-  const qcP = ctx.api.resource('qc_result').list({
-    filter: { fk_production_id: { $in: ids } },
-    fields: ['fk_production_id', 'quantity'],
-    pageSize: 5000,
-  }).then(res => (res && res.data && res.data.data) || []);
-
-  const pmP = ctx.api.resource('production_material').list({
-    filter: { fk_production_id: { $in: ids } },
-    fields: ['id', 'fk_production_id', 'fk_material_details_code', 'status'],
-    pageSize: 5000,
-  }).then(res => (res && res.data && res.data.data) || []);
-
-  const sampleP = ctx.api.resource('production_sample').list({
-    filter: { fk_production_id: { $in: ids } },
-    fields: ['fk_production_id', 'status'],
-    pageSize: 5000,
-  }).then(res => (res && res.data && res.data.data) || []);
+  const doP = fetchByIn('production_quantity_details', 'fk_production_id', ids, { fields: ['fk_production_id', 'quantity', 'cut_quantity'] });
+  const sentP = fetchByIn('production_result', 'fk_production_id', ids, { fields: ['fk_production_id', 'quantity'] });
+  const qcP = fetchByIn('qc_result', 'fk_production_id', ids, { fields: ['fk_production_id', 'quantity'] });
+  const pmP = fetchByIn('production_material', 'fk_production_id', ids, { fields: ['id', 'fk_production_id', 'fk_material_details_code', 'status'] });
+  const sampleP = fetchByIn('production_sample', 'fk_production_id', ids, { fields: ['fk_production_id', 'status'] });
 
   return Promise.all([doP, sentP, qcP, pmP, sampleP]).then(function (r) {
     const doRows = r[0], sentRows = r[1], qcRows = r[2], pmRows = r[3], sampleRows = r[4];
@@ -143,18 +170,12 @@ function fetchListSummaries(rows) {
     // batched material_details -> raw_material lookup for the pm rows'
     // material types (fabric vs accessories), same pattern as other files
     const materialCodes = [...new Set(pmRows.map(m => m.fk_material_details_code).filter(Boolean))];
-    const mdP = materialCodes.length
-      ? ctx.api.resource('material_details').list({ filter: { code: { $in: materialCodes } }, fields: ['code', 'fk_material_code'], pageSize: 2000 })
-          .then(res => (res && res.data && res.data.data) || [])
-      : Promise.resolve([]);
+    const mdP = fetchByIn('material_details', 'code', materialCodes, { fields: ['code', 'fk_material_code'] });
 
     return mdP.then(function (mdRows) {
       const mdByCode = {}; mdRows.forEach(m => { mdByCode[m.code] = m; });
       const rawCodes = [...new Set(mdRows.map(m => m.fk_material_code).filter(Boolean))];
-      const rmP = rawCodes.length
-        ? ctx.api.resource('raw_material').list({ filter: { code: { $in: rawCodes } }, fields: ['code', 'type'], pageSize: 2000 })
-            .then(res => (res && res.data && res.data.data) || [])
-        : Promise.resolve([]);
+      const rmP = fetchByIn('raw_material', 'code', rawCodes, { fields: ['code', 'type'] });
 
       return rmP.then(function (rmRows) {
         const rmByCode = {}; rmRows.forEach(rm => { rmByCode[rm.code] = rm; });
@@ -206,12 +227,10 @@ function fetchListSummaries(rows) {
 }
 
 function fetchProductImages() {
-  return ctx.api.resource('product').list({
+  return fetchAllPages('product', {
     fields: ['code'],
     appends: ['image'],
-    pageSize: 2000,
-  }).then(function (res) {
-    const rows = (res && res.data && res.data.data) || [];
+  }).then(function (rows) {
     const map = {};
     rows.forEach(function (p) {
       const img = p.image;
