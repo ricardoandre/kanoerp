@@ -1,0 +1,50 @@
+const sample_id = ctx.record?.id ?? "";
+
+if (!sample_id) {
+  ctx.element.innerHTML = '';
+  return;
+}
+
+const uid = "sample_comments_" + sample_id;
+const sql =
+  "SELECT users.nickname AS name, sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+  "FROM sample_comment, users " +
+  "WHERE sample_comment.fk_sample_id = " + sample_id + " " +
+  "AND sample_comment.created_by_id = users.id " +
+  "ORDER BY sample_comment.created_at DESC LIMIT 3";
+
+ctx.sql.save({ uid: uid, sql: sql, dataSourceKey: "main" })
+  .then(function() {
+    return ctx.sql.runById(uid, { type: "selectRows", dataSourceKey: "main" });
+  })
+  .then(function(rows) {
+    rows = rows || [];
+
+    if (!rows.length) {
+      ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No comments</span>';
+      return;
+    }
+
+    function fmtDate(d) {
+      if (!d) return '';
+      var s = String(d).substring(0, 16).replace('T', ' ');
+      return s;
+    }
+
+    var html = '<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:6px;max-width:100%;">';
+
+    rows.forEach(function(row) {
+      html +=
+        '<div style="border-left:2px solid #e2e8f0;padding:3px 0 3px 7px;">' +
+          '<span style="font-size:11px;font-weight:700;color:#1e293b;display:block;">' + (row.name || '—') + '</span>' +
+          '<span style="font-size:10px;color:#94a3b8;display:block;margin-bottom:2px;">' + fmtDate(row.comment_date) + '</span>' +
+          '<div style="font-size:11px;color:#374151;line-height:1.5;white-space:normal;overflow-wrap:break-word;word-break:break-word;">' + (row.comment || '') + '</div>' +
+        '</div>';
+    });
+
+    html += '</div>';
+    ctx.element.innerHTML = html;
+  })
+  .catch(function(err) {
+    ctx.element.innerHTML = '<span style="color:#ef4444;font-size:11px;">ERR: ' + err.message + '</span>';
+  });
