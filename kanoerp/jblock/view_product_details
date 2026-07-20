@@ -46,8 +46,10 @@ function card(children, extraStyle) {
 
 const MEASURE_FIELDS = [
   { key: 'bust',              label: 'Lr. Dada (Bust)' },
+  { key: 'bust2',             label: 'Lr. Dada 2 (Bust 2)' },
   { key: 'shoulder',          label: 'Bahu (Shoulder)' },
   { key: 'waist',             label: 'Ling. Pinggang (Waist)' },
+  { key: 'waist2',            label: 'Ling. Pinggang 2 (Waist 2)' },
   { key: 'hips',              label: 'Ling. Pinggul (Hips)' },
   { key: 'length',            label: 'Panjang (Length)' },
   { key: 'length2',           label: 'Panjang2 (Length 2)' },
@@ -58,6 +60,7 @@ const MEASURE_FIELDS = [
   { key: 'mid_sleeve',        label: 'Pangkal Lengan (Mid Sleeve)' },
   { key: 'sleeve_length',     label: 'Pj Lengan (Sleeve Len)' },
   { key: 'thigh',             label: 'Lr Paha (Thigh)' },
+  { key: 'elastic',           label: 'Elastic' },
   { key: 'est_main_fabric',   label: 'Est Bahan (Fabric)' },
   { key: 'est_furing',        label: 'Est Furing' },
   { key: 'est_main_fabric_2', label: 'Est Bahan 2' },
