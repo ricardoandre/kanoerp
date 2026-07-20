@@ -1,0 +1,607 @@
+// ui_store_transfer — bulk Stock Transfer entry via Excel-style paste grid.
+// Creates TWO stock_ledger rows per line item: one negative-quantity row
+// against the sending store, one positive-quantity row against the
+// receiving store. type is fixed to 'stock_transfer' (not user-selectable).
+// Code resolution mirrors ui_store_stock_in_import (three tiers):
+//   1. Direct match against an existing product_variant.code
+//   2. Future format "product.code-variant" (e.g. A460060-XS)
+//   3. Legacy concatenated code, prefix-matched against product + sku_option,
+//      accepted only if that combo already exists as a product_variant row.
+// CONDITION (good / minor_defect):
+//   - Codes that resolve as-is (tiers 1-3) => condition = 'good'.
+//   - Codes starting with legacy 'D' that DON'T resolve as-is are treated as
+//     minor-defect legacy codes:
+//       a) D + normal code, e.g. DA410006XS -> A410006XS
+//       b) D + letter-substituted code, per LEGACY_DEFECT_LETTER_MAP,
+//          e.g. DK230001XS -> body "K230001XS" -> substitute K->O -> O230001XS
+//     Extend LEGACY_DEFECT_LETTER_MAP as more historical letter quirks surface.
+//   - User can override the detected condition per row via the Condition column.
+// Input:  openModal({ ctx, onSaved })
+// Output: creates stock_ledger rows (2 per valid line) keyed on product_variant,
+//         each carrying a `condition` field ('good' | 'minor_defect').
+// Depends on: none.
+// NOTE: resolveVariantCodeBase below is now duplicated in a second consumer
+// (see ui_store_stock_in_import) — candidate for extraction to
+// lib_variant_resolve per the extract-on-second-use convention. The
+// condition-detection wrapper (resolveVariantCode) is currently transfer-specific;
+// fold it into the same shared lib if ui_store_stock_in_import needs condition too.
+const { useState, useEffect } = React;
+const { Modal, Select } = antd;
+const ce = React.createElement;
+const ALL_SIZE_MATCH = ['all size', 'allsize', 'all-size', 'all'];
+const LEDGER_TYPE = 'stock_transfer';
+// Legacy defect-code first-letter substitutions: legacyFirstLetter -> canonicalFirstLetter
+// Add new entries here as more quirks are discovered — do not scatter special-casing elsewhere.
+const LEGACY_DEFECT_LETTER_MAP = { K: 'O' };
+const CONDITION_OPTIONS = [
+  { value: 'good', label: 'Good' },
+  { value: 'minor_defect', label: 'Minor Defect' },
+];
+// ===== §4.2 canonical SQL helper =====
+async function runSql(ctx, uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+async function fetchStores(ctx) {
+  return runSql(ctx, 'sti_stores', "SELECT id, store_code, name, status FROM store ORDER BY name ASC");
+}
+async function fetchProducts(ctx) {
+  return runSql(ctx, 'sti_products', "SELECT code, name, model FROM product ORDER BY code ASC");
+}
+async function fetchSkuOptions(ctx) {
+  return runSql(ctx, 'sti_sku_options', "SELECT id, value, display FROM sku_option ORDER BY sort ASC");
+}
+async function fetchProductVariants(ctx) {
+  return runSql(ctx, 'sti_variants',
+    "SELECT id, code, fk_product_code, fk_sku_option_id FROM product_variant"
+  );
+}
+// ===== pure resolution (no SQL — operates on preloaded lists) =====
+function findAllSizeOption(skuOptions) {
+  return skuOptions.find(function (o) {
+    const v = String(o.value || '').trim().toLowerCase();
+    const d = String(o.display || '').trim().toLowerCase();
+    return ALL_SIZE_MATCH.indexOf(v) !== -1 || ALL_SIZE_MATCH.indexOf(d) !== -1;
+  }) || null;
+}
+function findSkuOptionByValue(skuOptions, suffix) {
+  return skuOptions.find(function (o) {
+    return String(o.value).trim().toLowerCase() === suffix.trim().toLowerCase();
+  }) || null;
+}
+// Base 3-tier resolver — resolves a code AS GIVEN, no defect-code awareness.
+function resolveVariantCodeBase(rawCode, products, skuOptions, allSizeOption, variantByCode, variantByCombo) {
+  const code = String(rawCode || '').trim();
+  if (!code) return null;
+  // 1) direct match against an existing product_variant.code
+  const direct = variantByCode[code];
+  if (direct) {
+    const product = products.find(function (p) { return p.code === direct.fk_product_code; });
+    const skuOption = skuOptions.find(function (o) { return o.id === direct.fk_sku_option_id; });
+    return { code: code, status: 'ok', variant: direct, product: product, skuOption: skuOption };
+  }
+  // 2) future format: product.code-variant (split on first "-")
+  const dashIdx = code.indexOf('-');
+  if (dashIdx !== -1) {
+    const prefix = code.slice(0, dashIdx);
+    const suffix = code.slice(dashIdx + 1);
+    const product = products.find(function (p) { return p.code === prefix; });
+    if (product) {
+      const skuOption = suffix === '' ? allSizeOption : findSkuOptionByValue(skuOptions, suffix);
+      if (!skuOption) {
+        return { code: code, status: 'variant_value_not_found', product: product };
+      }
+      const combo = variantByCombo[product.code + '|' + skuOption.id];
+      if (combo) {
+        return { code: code, status: 'ok', variant: combo, product: product, skuOption: skuOption };
+      }
+      return { code: code, status: 'variant_not_registered', product: product, skuOption: skuOption };
+    }
+    // prefix didn't match a product — fall through to legacy attempt below,
+    // in case the "-" is coincidental rather than an intentional separator
+  }
+  // 3) legacy concatenated code — prefix-match against products, require an
+  //    existing product_variant combo (no auto-creation here)
+  const candidates = [];
+  products.forEach(function (p) {
+    if (code.indexOf(p.code) === 0) {
+      const suffix = code.slice(p.code.length);
+      const skuOption = suffix === '' ? allSizeOption : findSkuOptionByValue(skuOptions, suffix);
+      if (skuOption) {
+        const combo = variantByCombo[p.code + '|' + skuOption.id];
+        if (combo) candidates.push({ product: p, skuOption: skuOption, variant: combo });
+      }
+    }
+  });
+  if (candidates.length === 1) {
+    return { code: code, status: 'ok', variant: candidates[0].variant, product: candidates[0].product, skuOption: candidates[0].skuOption };
+  }
+  if (candidates.length > 1) {
+    return { code: code, status: 'ambiguous', candidates: candidates };
+  }
+  return { code: code, status: 'not_found' };
+}
+// Condition-aware wrapper — this is what the rest of the file calls.
+// Tries the code as-is first (condition: good). If that fails AND the code
+// starts with legacy 'D', tries defect-code interpretations (condition: minor_defect).
+function resolveVariantCode(rawCode, products, skuOptions, allSizeOption, variantByCode, variantByCombo) {
+  const code = String(rawCode || '').trim();
+  if (!code) return null;
+  const direct = resolveVariantCodeBase(code, products, skuOptions, allSizeOption, variantByCode, variantByCombo);
+  if (direct.status === 'ok' || direct.status === 'ambiguous') {
+    return Object.assign({}, direct, { condition: 'good' });
+  }
+  if (/^D/i.test(code)) {
+    const body = code.slice(1);
+    // a) straightforward: D + normal code
+    const bodyRes = resolveVariantCodeBase(body, products, skuOptions, allSizeOption, variantByCode, variantByCombo);
+    if (bodyRes.status === 'ok') {
+      return Object.assign({}, bodyRes, { code: code, condition: 'minor_defect', legacyMatch: body });
+    }
+    // b) letter-substitution quirk, e.g. K -> O
+    const firstLetter = body.charAt(0).toUpperCase();
+    const mappedLetter = LEGACY_DEFECT_LETTER_MAP[firstLetter];
+    if (mappedLetter) {
+      const substituted = mappedLetter + body.slice(1);
+      const subRes = resolveVariantCodeBase(substituted, products, skuOptions, allSizeOption, variantByCode, variantByCombo);
+      if (subRes.status === 'ok') {
+        return Object.assign({}, subRes, { code: code, condition: 'minor_defect', legacyMatch: substituted });
+      }
+    }
+    // looked like a legacy defect code but nothing matched — flag it for the UI
+    return { code: code, status: 'not_found', condition: 'minor_defect', suspectedLegacyDefect: true };
+  }
+  return Object.assign({}, direct, { condition: 'good' });
+}
+// ===== paste grid =====
+function emptyRow() { return { code: '', quantity: '' }; }
+function makeInitialRows(n) {
+  const arr = [];
+  for (let i = 0; i < n; i++) arr.push(emptyRow());
+  return arr;
+}
+const STATUS_META = {
+  ok: { color: '#22c55e', label: 'OK' },
+  ambiguous: { color: '#f59e0b', label: 'Pick match' },
+  not_found: { color: '#ef4444', label: 'No match' },
+  variant_value_not_found: { color: '#ef4444', label: 'Variant not found' },
+  variant_not_registered: { color: '#ef4444', label: 'Variant not registered' },
+  bad_qty: { color: '#f97316', label: 'Bad qty' },
+};
+function PasteGrid(props) {
+  const rows = props.rows;
+  const setRows = props.setRows;
+  const derived = props.derived;
+  const resolvedChoice = props.resolvedChoice;
+  const setResolvedChoice = props.setResolvedChoice;
+  const conditionOverride = props.conditionOverride;
+  const setConditionOverride = props.setConditionOverride;
+  function updateCell(rowIndex, field, value) {
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      next[rowIndex][field] = value;
+      const last = next[next.length - 1];
+      if (last.code !== '' || last.quantity !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+  function handlePaste(e, rowIndex, colIndex) {
+    const text = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+    if (!text) return;
+    e.preventDefault();
+    const lines = text.replace(/\r/g, '').split('\n').filter(function (l, i, arr) { return !(i === arr.length - 1 && l === ''); });
+    setRows(function (prev) {
+      const next = prev.map(function (r) { return { ...r }; });
+      lines.forEach(function (line, li) {
+        const cells = line.split('\t');
+        const targetRow = rowIndex + li;
+        while (next.length <= targetRow) next.push(emptyRow());
+        cells.forEach(function (cellVal, ci) {
+          const targetCol = colIndex + ci;
+          const val = cellVal.trim();
+          if (targetCol === 0) next[targetRow].code = val;
+          else if (targetCol === 1) next[targetRow].quantity = val;
+        });
+      });
+      const last = next[next.length - 1];
+      if (last.code !== '' || last.quantity !== '') next.push(emptyRow());
+      return next;
+    });
+  }
+  function removeRow(rowIndex) {
+    setRows(function (prev) {
+      const next = prev.filter(function (_, i) { return i !== rowIndex; });
+      return next.length ? next : [emptyRow()];
+    });
+    setConditionOverride(function (prev) {
+      const next = {};
+      Object.keys(prev).forEach(function (k) {
+        const ki = parseInt(k, 10);
+        if (ki < rowIndex) next[ki] = prev[k];
+        else if (ki > rowIndex) next[ki - 1] = prev[k];
+      });
+      return next;
+    });
+  }
+  return ce('div', { style: { border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
+    ce('div', { style: { display: 'grid', gridTemplateColumns: '32px 1.1fr 0.55fr 0.95fr 1.5fr 28px', background: '#fafafa', borderBottom: '2px solid #e8e8e8', fontSize: 11, fontWeight: 600, color: '#555' } },
+      ce('div', { style: { padding: '6px 4px' } }, '#'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Code'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Quantity'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Condition'),
+      ce('div', { style: { padding: '6px 8px' } }, 'Parsed / Match'),
+      ce('div', null)
+    ),
+    ce('div', { style: { maxHeight: 420, overflowY: 'auto' } },
+      rows.map(function (row, i) {
+        const d = derived && derived[i];
+        const meta = d ? STATUS_META[d.status] : null;
+        const hasContent = row.code !== '' || row.quantity !== '';
+        const currentCondition = conditionOverride[i] != null ? conditionOverride[i] : (d ? d.condition : 'good') || 'good';
+        return ce('div', {
+          key: i,
+          style: { display: 'grid', gridTemplateColumns: '32px 1.1fr 0.55fr 0.95fr 1.5fr 28px', borderBottom: '1px solid #f0f0f0', alignItems: 'flex-start' }
+        },
+          ce('div', { style: { padding: '6px 4px', fontSize: 11, color: '#aaa' } }, i + 1),
+          ce('input', {
+            value: row.code,
+            onChange: function (e) { updateCell(i, 'code', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 0); },
+            placeholder: 'e.g. O230034L, A460060-XS, or legacy DA410006XS',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box' }
+          }),
+          ce('input', {
+            value: row.quantity,
+            onChange: function (e) { updateCell(i, 'quantity', e.target.value); },
+            onPaste: function (e) { handlePaste(e, i, 1); },
+            placeholder: '0',
+            style: { width: '100%', height: 32, padding: '6px 8px', fontSize: 12, border: 'none', outline: 'none', boxSizing: 'border-box', textAlign: 'right' }
+          }),
+          ce('div', { style: { padding: '4px 6px' } },
+            hasContent
+              ? ce(Select, {
+                  size: 'small', style: { width: '100%' }, value: currentCondition,
+                  onChange: function (val) { setConditionOverride(function (prev) { const next = { ...prev }; next[i] = val; return next; }); },
+                  options: CONDITION_OPTIONS,
+                })
+              : null
+          ),
+          ce('div', { style: { padding: '6px 8px' } },
+            !d ? null :
+            d.status === 'ambiguous'
+              ? ce(Select, {
+                  size: 'small', style: { width: '100%' }, placeholder: 'Select match',
+                  onChange: function (val) { setResolvedChoice(function (prev) { const next = { ...prev }; next[i] = val; return next; }); },
+                  options: d.candidates.map(function (c, ci) {
+                    return { value: ci, label: c.product.code + ' — ' + (c.product.name || '') + ' — ' + (c.skuOption.display || c.skuOption.value) };
+                  })
+                })
+              : d.status === 'ok'
+                ? ce('div', { style: { fontSize: 11 } },
+                    ce('span', { style: { fontWeight: 600, color: '#22c55e' } },
+                      d.product.code + ' + ' + (d.skuOption ? (d.skuOption.display || d.skuOption.value) : '')
+                    ),
+                    ce('div', { style: { color: '#94a3b8' } }, [d.product.name, d.product.model].filter(Boolean).join(' · ')),
+                    d.legacyMatch ? ce('div', { style: { color: '#a855f7' } }, 'legacy defect code → ' + d.legacyMatch) : null
+                  )
+                : d.status === 'variant_not_registered'
+                  ? ce('div', { style: { fontSize: 11 } },
+                      ce('span', { style: { color: meta.color, fontWeight: 600 } }, meta.label),
+                      ce('div', { style: { color: '#94a3b8' } }, d.product.code + ' + ' + (d.skuOption.display || d.skuOption.value) + ' — import it via Product Variant first')
+                    )
+                  : d.status === 'not_found' && d.suspectedLegacyDefect
+                    ? ce('div', { style: { fontSize: 11 } },
+                        ce('span', { style: { color: meta.color, fontWeight: 600 } }, 'Defect code, no match'),
+                        ce('div', { style: { color: '#94a3b8' } }, 'Looked like a legacy "D" defect code but no matching product/variant was found')
+                      )
+                    : ce('span', { style: { fontSize: 11, color: meta ? meta.color : '#ccc' } }, meta ? meta.label : '')
+          ),
+          hasContent
+            ? ce('button', { onClick: function () { removeRow(i); }, style: { border: 'none', background: 'none', color: '#ccc', cursor: 'pointer', fontSize: 11, marginTop: 6 } }, '✕')
+            : ce('div', null)
+        );
+      })
+    )
+  );
+}
+// ===== validation summary banner =====
+function ValidationSummary(props) {
+  const counts = props.counts;
+  const errorCount = counts.not_found + counts.ambiguous + counts.variant_value_not_found + counts.variant_not_registered + counts.bad_qty;
+  const bg = errorCount > 0 ? '#fef2f2' : '#f0fdf4';
+  const border = errorCount > 0 ? '#fca5a5' : '#86efac';
+  const titleColor = errorCount > 0 ? '#b91c1c' : '#166534';
+  const parts = [];
+  if (counts.ok) parts.push(counts.ok + ' ready');
+  if (counts.ambiguous) parts.push(counts.ambiguous + ' ambiguous');
+  if (counts.not_found) parts.push(counts.not_found + ' not found');
+  if (counts.variant_value_not_found) parts.push(counts.variant_value_not_found + ' variant value not found');
+  if (counts.variant_not_registered) parts.push(counts.variant_not_registered + ' variant not registered');
+  if (counts.bad_qty) parts.push(counts.bad_qty + ' bad quantity');
+  if (counts.minor_defect) parts.push(counts.minor_defect + ' minor defect');
+  return ce('div', { style: { background: bg, border: '1px solid ' + border, borderRadius: 4, padding: '8px 12px', marginBottom: 10, fontSize: 12 } },
+    ce('div', { style: { fontWeight: 700, color: titleColor, marginBottom: 2 } },
+      errorCount > 0 ? (errorCount + ' row(s) need attention') : 'All rows parsed successfully'
+    ),
+    ce('div', { style: { color: '#64748b' } }, parts.join(' · '))
+  );
+}
+// ===== main content =====
+function TransferContent(props) {
+  const ctx = props.ctx;
+  const stores = props.stores;
+  const products = props.products;
+  const skuOptions = props.skuOptions;
+  const productVariants = props.productVariants;
+  const todayStr = props.todayStr;
+  const onSaved = props.onSaved;
+  const allSizeOption = findAllSizeOption(skuOptions);
+  const variantByCode = {};
+  const variantByCombo = {};
+  productVariants.forEach(function (v) {
+    variantByCode[v.code] = v;
+    variantByCombo[v.fk_product_code + '|' + v.fk_sku_option_id] = v;
+  });
+  const [storeId, setStoreId] = useState(null);
+  const [relatedStoreId, setRelatedStoreId] = useState(null);
+  const [transactionDate, setTransactionDate] = useState(todayStr);
+  const [remarks, setRemarks] = useState('');
+  const [rows, setRows] = useState(makeInitialRows(15));
+  const [rowStatuses, setRowStatuses] = useState(null);
+  const [resolvedChoice, setResolvedChoice] = useState({});
+  const [conditionOverride, setConditionOverride] = useState({});
+  const [validating, setValidating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  function handleClose() { Modal.destroyAll(); }
+  function activeRows() {
+    return rows.map(function (r, i) { return { i: i, row: r }; }).filter(function (x) { return x.row.code.trim() !== '' || x.row.quantity.trim() !== ''; });
+  }
+  function handleValidate() {
+    const active = activeRows();
+    if (!active.length) { ctx.message.warning('Paste or enter at least one row.'); return; }
+    setValidating(true);
+    try {
+      const next = new Array(rows.length).fill(null);
+      active.forEach(function (x) {
+        next[x.i] = resolveVariantCode(x.row.code, products, skuOptions, allSizeOption, variantByCode, variantByCombo);
+      });
+      setRowStatuses(next);
+      setResolvedChoice({});
+    } finally {
+      setValidating(false);
+    }
+  }
+  const derived = rowStatuses
+    ? rows.map(function (row, i) {
+        const res = rowStatuses[i];
+        if (!res) return null;
+        if (res.status === 'ambiguous') {
+          const idx = resolvedChoice[i];
+          if (idx != null && res.candidates[idx]) {
+            const c = res.candidates[idx];
+            return { code: res.code, status: 'ok', variant: c.variant, product: c.product, skuOption: c.skuOption, condition: res.condition || 'good' };
+          }
+          return res;
+        }
+        return res;
+      })
+    : null;
+  function finalStatus(d, rowInput) {
+    if (!d) return null;
+    if (d.status !== 'ok') return d.status;
+    const qty = parseInt(rowInput.quantity.trim(), 10);
+    // transfer quantity is always entered as a positive amount to move
+    if (!rowInput.quantity.trim() || isNaN(qty) || qty <= 0) return 'bad_qty';
+    return 'ok';
+  }
+  const counts = { ok: 0, ambiguous: 0, not_found: 0, variant_value_not_found: 0, variant_not_registered: 0, bad_qty: 0, minor_defect: 0 };
+  const finalRows = derived
+    ? rows.map(function (row, i) {
+        const d = derived[i];
+        if (!d) return null;
+        const status = finalStatus(d, row);
+        if (status && counts.hasOwnProperty(status)) counts[status]++;
+        const condition = conditionOverride[i] != null ? conditionOverride[i] : (d.condition || 'good');
+        if (status === 'ok' && condition === 'minor_defect') counts.minor_defect++;
+        return { d: d, status: status, condition: condition };
+      })
+    : null;
+  function buildSaveList() {
+    if (!finalRows) return [];
+    const list = [];
+    finalRows.forEach(function (fr, i) {
+      if (!fr || fr.status !== 'ok') return;
+      const qty = parseInt(rows[i].quantity.trim(), 10);
+      list.push({ variantId: fr.d.variant.id, code: fr.d.code, quantity: qty, condition: fr.condition });
+    });
+    return list;
+  }
+  async function handleSave() {
+    if (!relatedStoreId) { ctx.message.warning('Please select the receiving store.'); return; }
+    if (storeId && storeId === relatedStoreId) { ctx.message.warning('Sending and receiving store must be different.'); return; }
+    if (!transactionDate) { ctx.message.warning('Please select a transaction date.'); return; }
+    const toSave = buildSaveList();
+    if (!toSave.length) { ctx.message.warning('Validate first — no valid rows to save.'); return; }
+    setSaving(true);
+    let ok = 0;
+    const failed = [];
+    try {
+      for (const item of toSave) {
+        let outSaved = false;
+        try {
+          // sending store: negative quantity (only when a sending store is selected)
+          if (storeId) {
+            await ctx.api.resource('stock_ledger').create({
+              values: {
+                store: { id: storeId },
+                related_store: { id: relatedStoreId },
+                product_variant: { id: item.variantId },
+                quantity: -item.quantity,
+                type: LEDGER_TYPE,
+                condition: item.condition,
+                transaction_date: transactionDate,
+                remarks: remarks || undefined,
+              }
+            });
+          }
+          outSaved = true;
+          // receiving store: positive quantity
+          await ctx.api.resource('stock_ledger').create({
+            values: {
+              store: { id: relatedStoreId },
+              related_store: storeId ? { id: storeId } : undefined,
+              product_variant: { id: item.variantId },
+              quantity: item.quantity,
+              type: LEDGER_TYPE,
+              condition: item.condition,
+              transaction_date: transactionDate,
+              remarks: remarks || undefined,
+            }
+          });
+          ok++;
+        } catch (rowErr) {
+          console.error('Row save error:', item.code, rowErr, 'outSaved=', outSaved);
+          failed.push(item.code + (outSaved ? ' (partial — out row saved, in row failed)' : ''));
+        }
+      }
+      Modal.destroyAll();
+      ctx.notification.success({
+        message: 'Stock Transfer Saved',
+        description: ok + ' line(s) transferred successfully' + (failed.length ? ('. ' + failed.length + ' failed: ' + failed.join(', ')) : '.'),
+        duration: 8,
+      });
+      if (onSaved) onSaved();
+    } catch (e) {
+      console.error('Save error:', e);
+      setSaving(false);
+      ctx.message.error('Failed to save: ' + (e.message || 'unknown error'));
+    }
+  }
+  const readyCount = buildSaveList().length;
+  const activeCount = activeRows().length;
+  const gridDerived = finalRows
+    ? finalRows.map(function (fr) { return fr ? Object.assign({}, fr.d, { status: fr.status, condition: fr.condition }) : null; })
+    : null;
+  const storeOptions = stores.map(function (s) { return { value: s.id, label: s.store_code ? (s.store_code + ' — ' + s.name) : s.name }; });
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13 } },
+    ce('div', { style: { display: 'flex', gap: 10, marginBottom: 10 } },
+      ce('div', { style: { flex: 1 } },
+        ce('label', { style: { display: 'block', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, 'From (Sending Store, optional)'),
+        ce(Select, {
+          value: storeId, onChange: setStoreId, style: { width: '100%' }, allowClear: true,
+          placeholder: 'Select sending store (leave blank if none)',
+          options: storeOptions.filter(function (o) { return o.value !== relatedStoreId; }),
+          showSearch: true,
+          filterOption: function (input, option) { return (option.label || '').toLowerCase().indexOf(input.toLowerCase()) !== -1; },
+        })
+      ),
+      ce('div', { style: { flex: 1 } },
+        ce('label', { style: { display: 'block', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, 'To (Receiving Store) *'),
+        ce(Select, {
+          value: relatedStoreId, onChange: setRelatedStoreId, style: { width: '100%' },
+          placeholder: 'Select receiving store',
+          options: storeOptions.filter(function (o) { return o.value !== storeId; }),
+          showSearch: true,
+          filterOption: function (input, option) { return (option.label || '').toLowerCase().indexOf(input.toLowerCase()) !== -1; },
+        })
+      )
+    ),
+    ce('div', { style: { display: 'flex', gap: 10, marginBottom: 10 } },
+      ce('div', { style: { flex: 1 } },
+        ce('label', { style: { display: 'block', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, 'Transaction Date'),
+        ce('input', {
+          type: 'date', value: transactionDate,
+          onChange: function (e) { setTransactionDate(e.target.value); },
+          onClick: function (e) { try { e.currentTarget.showPicker(); } catch (err) {} },
+          style: { width: '100%', height: 32, padding: '0 10px', fontSize: 13, border: '1px solid #d9d9d9', borderRadius: 4, outline: 'none', boxSizing: 'border-box', background: '#fff', cursor: 'pointer' }
+        })
+      ),
+      ce('div', { style: { flex: 2 } },
+        ce('label', { style: { display: 'block', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, 'Remarks (optional)'),
+        ce('input', {
+          value: remarks,
+          onChange: function (e) { setRemarks(e.target.value); },
+          placeholder: 'e.g. weekly restock',
+          style: { width: '100%', height: 32, padding: '0 10px', fontSize: 13, border: '1px solid #d9d9d9', borderRadius: 4, outline: 'none', boxSizing: 'border-box' }
+        })
+      )
+    ),
+    ce('div', { style: { background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#6d28d9', borderRadius: 4, padding: '6px 10px', fontSize: 11, marginBottom: 10 } },
+      'Legacy "D" codes are auto-detected as Minor Defect (e.g. DA410006XS → A410006XS, DK230001XS → O230001XS). Override the Condition column per row if needed.'
+    ),
+    !allSizeOption
+      ? ce('div', { style: { background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e', borderRadius: 4, padding: '6px 10px', fontSize: 11, marginBottom: 10 } },
+          '⚠ No "All Size" sku_option found — codes with no variant suffix will not resolve until one exists.'
+        )
+      : null,
+    ce(PasteGrid, {
+      rows: rows,
+      setRows: function (fn) { setRowStatuses(null); setRows(fn); },
+      derived: gridDerived,
+      resolvedChoice: resolvedChoice, setResolvedChoice: setResolvedChoice,
+      conditionOverride: conditionOverride, setConditionOverride: setConditionOverride,
+    }),
+    finalRows ? ce(ValidationSummary, { counts: counts }) : null,
+    ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '12px 0' } },
+      ce('span', { style: { fontSize: 12, color: '#888' } },
+        finalRows ? (readyCount + ' of ' + activeCount + ' row(s) ready') : (activeCount + ' row(s) entered')
+      ),
+      ce('button', {
+        onClick: handleValidate, disabled: validating || !activeCount,
+        style: { padding: '5px 14px', fontSize: 12, cursor: (validating || !activeCount) ? 'not-allowed' : 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }
+      }, validating ? 'Validating…' : 'Validate')
+    ),
+    ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, borderTop: '1px solid #eee', paddingTop: 12 } },
+      ce('button', { onClick: handleClose, style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' } }, 'Cancel'),
+      ce('button', {
+        onClick: handleSave, disabled: saving || !finalRows || !readyCount,
+        style: { padding: '5px 16px', fontSize: 12, cursor: (saving || !finalRows || !readyCount) ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 4, fontWeight: 600, color: '#fff', background: (saving || !finalRows || !readyCount) ? '#d9d9d9' : '#22c55e' }
+      }, saving ? 'Saving…' : ('Transfer ' + readyCount + ' Line(s)'))
+    ),
+    ce('div', { style: { height: 20 } })
+  );
+}
+// ===== loader: opens instantly, fetches reference data inside =====
+function TransferLoader(props) {
+  const ctx = props.ctx;
+  const onSaved = props.onSaved;
+  const [state, setState] = useState({ loading: true, stores: [], products: [], skuOptions: [], productVariants: [], err: null });
+  useEffect(function () {
+    let alive = true;
+    Promise.all([fetchStores(ctx), fetchProducts(ctx), fetchSkuOptions(ctx), fetchProductVariants(ctx)])
+      .then(function (res) {
+        if (alive) setState({ loading: false, stores: res[0], products: res[1], skuOptions: res[2], productVariants: res[3], err: null });
+      })
+      .catch(function (e) {
+        if (alive) setState({ loading: false, stores: [], products: [], skuOptions: [], productVariants: [], err: (e && e.message) || 'load failed' });
+      });
+    return function () { alive = false; };
+  }, []);
+  if (state.loading) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…');
+  if (state.err) return ce('div', { style: { padding: 24, color: '#ef4444', fontSize: 13 } }, state.err);
+  const todayStr = dayjs ? dayjs().format('YYYY-MM-DD') : new Date().toISOString().substring(0, 10);
+  return ce(TransferContent, {
+    ctx: ctx, stores: state.stores, products: state.products, skuOptions: state.skuOptions,
+    productVariants: state.productVariants, todayStr: todayStr, onSaved: onSaved,
+  });
+}
+// ===== entry point =====
+function openModal(args) {
+  const ctx = args.ctx;
+  const onSaved = args.onSaved;
+  if (!ctx) return;
+  Modal.confirm({
+    title: 'Bulk Stock Transfer',
+    width: 820,
+    icon: null,
+    content: ce(TransferLoader, { ctx: ctx, onSaved: onSaved }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: true,
+    onCancel() {},
+  });
+}
+return { openModal };
