@@ -1,0 +1,407 @@
+const { React, antd } = ctx.libs;
+const { useEffect, useState } = React;
+const { Spin, Typography, Row, Col } = antd;
+const { Text } = Typography;
+
+const VARIANT_STATUS_COLOR = {
+  sewing: '#d97706', qc: '#84cc16', approval: '#84cc16', done: '#22c55e', cancel: '#ef4444',
+};
+const VARIANT_STATUS_BG = {
+  sewing: '#fffbeb', qc: '#f7fee7', approval: '#f7fee7', done: '#f0fdf4', cancel: '#fef2f2',
+};
+const VARIANT_STATUS_LABEL = {
+  sewing: 'Sewing', qc: 'QC', approval: 'Approval', done: 'Done', cancel: 'Cancel',
+};
+const SAMPLE_STATUS_COLOR = {
+  ideas: '#f97316', pola: '#f97316', first_sample: '#d97706',
+  pricing: '#84cc16', color: '#84cc16', done: '#22c55e', cancel: '#ef4444',
+};
+const SAMPLE_STATUS_LABEL = {
+  ideas: 'Ideas', pola: 'Pola', first_sample: 'First Sample',
+  pricing: 'Pricing', color: 'Color Sample', done: 'Done', cancel: 'Cancel',
+};
+
+// QC checklist status enum (sample_qc_check.status)
+const QC_CHECK_STATUS_COLOR = {
+  pending: '#f97316', not_applicable: '#06b6d4', approved: '#22c55e', fail: '#ef4444',
+};
+const QC_CHECK_STATUS_LABEL = {
+  pending: 'Pending', not_applicable: 'N/A', approved: 'Approved', fail: 'Fail',
+};
+
+const hostRecord =
+  (await ctx.getVar?.('ctx.record')) ||
+  (await ctx.getVar?.('ctx.popup.record')) ||
+  ctx.record || null;
+
+const SampleVariantDetailView = function() {
+  const [loading, setLoading]       = useState(true);
+  const [detail, setDetail]         = useState(null);
+  const [images, setImages]         = useState([]);
+  const [bigImg, setBigImg]         = useState(0);
+  const [qcImages, setQcImages]     = useState([]);
+  const [qcBigImg, setQcBigImg]     = useState(0);
+  const [qcChecklist, setQcChecklist] = useState([]);
+  const [history, setHistory]       = useState([]);
+  const [materials, setMaterials]   = useState([]);
+  const [comments, setComments]     = useState([]);
+  const [showAllComments, setShowAllComments] = useState(false);
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  const [sewingPicMap, setSewingPicMap] = useState({});
+  const [errorText, setErrorText]   = useState('');
+
+  useEffect(function() {
+    let active = true;
+
+    async function bootstrap() {
+      if (!hostRecord?.id) { setErrorText('Record unavailable.'); setLoading(false); return; }
+      const id = hostRecord.id;
+      const sql = ctx.sql;
+
+      function q(uid, sqlStr) {
+        return sql.save({ uid, sql: sqlStr, dataSourceKey: 'main' })
+          .catch(() => {})
+          .then(() => sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
+          .then(r => r || []);
+      }
+
+      try {
+        // Q1: variant info + parent sample info
+        const rows = await q('svd_main_' + id,
+          "SELECT sample_variant.id AS id, sample_variant.status AS status, " +
+          "sample_variant.sewing_pic AS sewing_pic, sample_variant.sewing_date AS sewing_date, " +
+          "sample_variant.fk_fabric_code AS fk_fabric_code, sample_variant.fk_fabric_code2 AS fk_fabric_code2, " +
+          "sample_variant.qc_remarks AS qc_remarks, " +
+          "sample.id AS sample_id, sample.name AS sample_name, sample.status AS sample_status, " +
+          "sample.type AS sample_type, sample.description AS description, sample.remarks AS remarks, " +
+          "collection.name AS col_name " +
+          "FROM sample_variant, sample, collection " +
+          "WHERE sample_variant.id = " + id + " " +
+          "AND sample_variant.fk_sample_variant_id = sample.id " +
+          "AND sample.fk_collection_id = collection.id"
+        );
+        if (!rows.length) { setErrorText('No variant found.'); setLoading(false); return; }
+        if (active) setDetail(rows[0]);
+
+        const sampleId = rows[0].sample_id;
+
+        // Q2: images from parent sample
+        const imgRows = await q('svd_img_' + id,
+          "SELECT attachments.url AS img_url, attachments.filename AS img_filename " +
+          "FROM t_wda3bnmr9c9, attachments " +
+          "WHERE t_wda3bnmr9c9.f_57nmxuosclw = " + sampleId + " " +
+          "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd ORDER BY attachments.id ASC"
+        );
+        const origin = window.location.origin;
+        if (active) setImages(imgRows.map(r =>
+          r.img_url || (r.img_filename ? origin + '/storage/uploads/' + r.img_filename : null)
+        ).filter(Boolean));
+
+        // Q2b: QC measurement images (resource API — avoids guessing the junction table name)
+        try {
+          const qcRes = await ctx.api.resource('sample_variant').get({
+            filterByTk: id,
+            appends: ['qc_measurements'],
+          });
+          const qcAttachments = qcRes?.data?.data?.qc_measurements || [];
+          if (active) setQcImages(qcAttachments.map(a =>
+            a.url || (a.filename ? origin + '/storage/uploads/' + a.filename : null)
+          ).filter(Boolean));
+        } catch(e) { /* qc_measurements may not be populated / relation may differ */ }
+
+        // Q2c: QC checklist (name + status only)
+        const qcCheckRows = await q('svd_qc_checklist_' + id,
+          "SELECT sample_qc_checklist.name AS name, sample_qc_check.status AS status " +
+          "FROM sample_qc_check, sample_qc_checklist " +
+          "WHERE sample_qc_check.fk_sample_variant_id = " + id + " " +
+          "AND sample_qc_check.fk_sample_qc_checklist_id = sample_qc_checklist.id " +
+          "ORDER BY sample_qc_checklist.sort ASC"
+        );
+        if (active) setQcChecklist(qcCheckRows);
+
+        // Q3: comments from parent sample
+        const crows = await q('svd_comments_' + id,
+          "SELECT users.nickname AS name, sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
+          "FROM sample_comment, users " +
+          "WHERE sample_comment.fk_sample_id = " + sampleId + " AND sample_comment.created_by_id = users.id " +
+          "ORDER BY sample_comment.created_at DESC LIMIT 10"
+        );
+        if (active) setComments(crows);
+
+        // Q3b: materials from parent sample
+const matRows = await q('svd_materials_' + id,
+  "SELECT sample_material.fk_raw_material_code AS material_code, sample_material.quantity AS quantity, " +
+  "raw_material.type AS material_type, raw_material.composition AS composition " +
+  "FROM sample_material " +
+  "LEFT JOIN raw_material ON sample_material.fk_raw_material_code = raw_material.code " +
+  "WHERE sample_material.fk_sample_id = " + sampleId + " ORDER BY sample_material.id ASC"
+);
+if (active) setMaterials(matRows);
+
+        // Q2: history for this variant
+        const hrows = await q('svd_history_' + id,
+          "SELECT users.nickname AS nickname, history.create_date AS create_date, " +
+          "history.status AS status, history.category AS category, history.message AS message " +
+          "FROM history, users " +
+          "WHERE history.table_name = 'sample_variant' AND history.table_id = " + id + " " +
+          "AND history.fk_user_id = users.id " +
+          "ORDER BY history.create_date DESC"
+        );
+        if (active) setHistory(hrows);
+
+        // Q3: sewing_pic labels
+        const sprows = await q('svd_sewingpic',
+          "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample_variant' AND name = 'sewing_pic'"
+        );
+        const sm = {};
+        try {
+          const arr = JSON.parse(sprows[0]?.options || '{}').uiSchema?.enum || [];
+          arr.forEach(o => { if (o.value) sm[o.value] = o.label || o.value; });
+        } catch(e) {}
+        if (active) setSewingPicMap(sm);
+
+      } catch(err) {
+        if (active) setErrorText(err?.message || 'Failed to load.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    bootstrap();
+    return () => { active = false; };
+  }, [hostRecord?.id]);
+
+  if (loading) return React.createElement('div', { style: { padding: 80, textAlign: 'center' } }, React.createElement(Spin, { size: 'large' }));
+  if (errorText) return React.createElement('div', { style: { padding: 24 } }, React.createElement(Text, { type: 'danger' }, errorText));
+
+  const d = detail;
+  const status = String(d.status || '').toLowerCase();
+  const color  = VARIANT_STATUS_COLOR[status] || '#9ca3af';
+  const bg     = VARIANT_STATUS_BG[status]    || '#f3f4f6';
+  const label  = VARIANT_STATUS_LABEL[status] || d.status || '—';
+
+  const sampleStatus = String(d.sample_status || '').toLowerCase();
+  const sampleColor  = SAMPLE_STATUS_COLOR[sampleStatus] || '#9ca3af';
+  const sampleLabel  = SAMPLE_STATUS_LABEL[sampleStatus] || d.sample_status || '—';
+
+  const secTitle = { fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#9ca3af', marginBottom: 10 };
+
+  const card = (children, extra) => React.createElement('div', {
+    style: Object.assign({ borderRadius: 14, border: '1px solid #e5e7eb', background: '#fff', padding: '18px 20px', height: '100%' }, extra || {})
+  }, children);
+
+  const metaItem = (lbl, val) => !val ? null : React.createElement('div', { style: { marginBottom: 10 } },
+    React.createElement('div', { style: { fontSize: 11, color: '#9ca3af', fontWeight: 500 } }, lbl),
+    React.createElement('div', { style: { fontSize: 13, color: '#111827', fontWeight: 500, marginTop: 2 } }, val)
+  );
+
+  const htmlBlock = (lbl, html) => !html ? null : React.createElement('div', { style: { marginBottom: 16 } },
+    React.createElement('div', { style: secTitle }, lbl),
+    React.createElement('div', { style: { fontSize: 13, color: '#374151', lineHeight: 1.8 }, dangerouslySetInnerHTML: { __html: html } })
+  );
+
+  // Compact QC checklist list: name (left) + status pill (right) only
+  const qcChecklistBlock = () => React.createElement('div', { style: { marginBottom: 16 } },
+    React.createElement('div', { style: secTitle }, 'QC Checklist'),
+    qcChecklist.length === 0
+      ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No checklist items')
+      : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          qcChecklist.map(function(c, i) {
+            const sKey = String(c.status || '').toLowerCase();
+            const sColor = QC_CHECK_STATUS_COLOR[sKey] || '#9ca3af';
+            const sLabel = QC_CHECK_STATUS_LABEL[sKey] || c.status || '—';
+            return React.createElement('div', {
+              key: i,
+              style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '6px 12px', background: '#f8fafc', borderRadius: 8 }
+            },
+              React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: '#1e293b', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, c.name || '—'),
+              React.createElement('span', {
+                style: { flexShrink: 0, fontSize: 11, fontWeight: 700, color: sColor, background: sColor + '18', border: '1px solid ' + sColor + '44', borderRadius: 999, padding: '2px 10px' }
+              }, sLabel)
+            );
+          })
+        )
+  );
+
+  function fmtDate(dt) {
+    if (!dt) return '';
+    return String(dt).substring(0, 16).replace('T', ' ');
+  }
+
+  // Reusable image gallery renderer (used for both Reference Images and QC Measurements)
+  function imageGallery(list, activeIdx, setActiveIdx, emptyLabel) {
+    return list.length === 0
+      ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '20px 0' } }, emptyLabel)
+      : React.createElement('div', null,
+          React.createElement('img', {
+            src: list[activeIdx] || list[0],
+            onClick: () => window.open(list[activeIdx] || list[0], '_blank'),
+            style: { width: '100%', maxHeight: 320, objectFit: 'contain', borderRadius: 8, background: '#f8fafc', cursor: 'pointer', marginBottom: list.length > 1 ? 8 : 0 }
+          }),
+          list.length > 1
+            ? React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                list.map((url, i) => React.createElement('img', {
+                  key: i, src: url, onClick: () => setActiveIdx(i),
+                  style: { width: 52, height: 52, objectFit: 'cover', borderRadius: 6, cursor: 'pointer', flexShrink: 0, border: activeIdx === i ? '2px solid #6366f1' : '2px solid #e5e7eb', opacity: activeIdx === i ? 1 : 0.65 }
+                }))
+              )
+            : null
+        );
+  }
+
+  return React.createElement('div', { style: { fontFamily: 'sans-serif', display: 'flex', flexDirection: 'column', gap: 12 } },
+
+    // ── SECTION 1: HIGHLIGHT ──
+    React.createElement('div', {
+      style: { borderRadius: 14, overflow: 'hidden', border: '1px solid ' + color + '55', boxShadow: '0 0 0 3px ' + color + '18' }
+    },
+      React.createElement('div', { style: { height: 5, background: color } }),
+      React.createElement('div', { style: { padding: '18px 22px', background: '#fff' } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 14 } },
+          React.createElement('span', { style: { fontSize: 20, fontWeight: 700, color: '#111827' } },
+            [d.fk_fabric_code, d.fk_fabric_code2].filter(Boolean).join(' / ') || 'Variant'
+          ),
+          React.createElement('span', { style: { padding: '3px 12px', borderRadius: 999, fontSize: 12, fontWeight: 600, background: bg, color: color, border: '1px solid ' + color + '44' } }, label),
+          React.createElement('span', { style: { padding: '3px 12px', borderRadius: 999, fontSize: 12, fontWeight: 600, background: sampleColor + '18', color: sampleColor, border: '1px solid ' + sampleColor + '44' } }, sampleLabel)
+        ),
+        React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px 24px' } },
+          metaItem('Sample', d.sample_name),
+          metaItem('Collection', d.col_name),
+          metaItem('Sewing PIC', sewingPicMap[d.sewing_pic] || d.sewing_pic),
+          metaItem('Sewing Date', d.sewing_date ? String(d.sewing_date).substring(0, 10) : null),
+        )
+      )
+    ),
+
+    // ── SECTION 2: IMAGES + DESCRIPTION/REMARKS ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // Images
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'Reference Images'),
+          imageGallery(images, bigImg, setBigImg, 'No images')
+        ))
+      ),
+
+      // Description + Remarks (with Materials above)
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          materials.length > 0
+  ? React.createElement('div', { style: { marginBottom: 16 } },
+      React.createElement('div', { style: secTitle }, 'Materials'),
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+        materials.map(function(m, mi) {
+          const isFab = String(m.material_type || '').toLowerCase() === 'fabric';
+          return React.createElement('div', {
+            key: mi,
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '6px 12px', background: '#f8fafc', borderRadius: 8 }
+          },
+            React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: '#1e293b' } }, m.material_code),
+            (isFab && m.composition)
+              ? React.createElement('span', { style: { fontSize: 11, color: '#64748b', fontStyle: 'italic', textAlign: 'right', flexShrink: 0, marginLeft: 8 } }, m.composition)
+              : null
+          );
+        })
+      )
+    )
+  : null,
+          htmlBlock('Description', d.description),
+          htmlBlock('Remarks', d.remarks),
+          !d.description && !d.remarks
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No description or remarks')
+            : null
+        ))
+      )
+    ),
+
+    // ── SECTION 2B: QC MEASUREMENTS + (QC CHECKLIST + QC REMARKS) ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // QC Measurement Images
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'QC Measurements'),
+          imageGallery(qcImages, qcBigImg, setQcBigImg, 'No QC measurement images')
+        ))
+      ),
+
+      // QC Checklist + QC Remarks (merged into one card/section)
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          qcChecklistBlock(),
+          htmlBlock('QC Remarks', d.qc_remarks),
+          !d.qc_remarks && qcChecklist.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No QC checklist or remarks')
+            : null
+        ))
+      )
+    ),
+
+    // ── SECTION 3: COMMENTS + HISTORY ──
+    React.createElement(Row, { gutter: [12, 12] },
+
+      // Comments
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'Comments'),
+          comments.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '8px 0' } }, 'No comments')
+            : React.createElement('div', null,
+                React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+                  (showAllComments ? comments : comments.slice(0, 5)).map(function(c, i) {
+                    return React.createElement('div', { key: i, style: { borderLeft: '3px solid #e2e8f0', paddingLeft: 12 } },
+                      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
+                        React.createElement('span', { style: { fontWeight: 700, fontSize: 12, color: '#1e293b' } }, c.name || '—'),
+                        React.createElement('span', { style: { fontSize: 10, color: '#94a3b8' } }, fmtDate(c.comment_date))
+                      ),
+                      React.createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.6 }, dangerouslySetInnerHTML: { __html: c.comment || '' } })
+                    );
+                  })
+                ),
+                comments.length > 5
+                  ? React.createElement('button', {
+                      onClick: () => setShowAllComments(!showAllComments),
+                      style: { marginTop: 10, fontSize: 11, color: '#6366f1', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600, padding: 0 }
+                    }, showAllComments ? 'Show less' : 'View ' + (comments.length - 5) + ' more')
+                  : null
+              )
+        ))
+      ),
+
+      // History
+      React.createElement(Col, { xs: 24, md: 12 },
+        card(React.createElement('div', null,
+          React.createElement('div', { style: secTitle }, 'History'),
+          history.length === 0
+            ? React.createElement('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic', padding: '8px 0' } }, 'No history')
+            : React.createElement('div', null,
+                React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                  (showAllHistory ? history : history.slice(0, 5)).map(function(h, i) {
+                    return React.createElement('div', { key: i, style: { borderLeft: '3px solid #e2e8f0', paddingLeft: 12 } },
+                      React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 } },
+                        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flex: 1, minWidth: 0 } },
+                          React.createElement('span', { style: { fontWeight: 700, fontSize: 12, color: '#1e293b' } }, h.nickname || '—'),
+                          h.category ? React.createElement('span', { style: { fontSize: 10, fontWeight: 600, color: '#7c3aed', background: '#f5f3ff', borderRadius: 4, padding: '1px 6px', whiteSpace: 'nowrap' } }, h.category) : null
+                        ),
+                        React.createElement('span', { style: { fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0 } }, fmtDate(h.create_date))
+                      ),
+                      h.status ? React.createElement('div', { style: { fontSize: 11, color: '#64748b', marginTop: 4 } }, 'Status: ' + h.status) : null,
+                      h.message ? React.createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.5, marginTop: 2 } }, h.message) : null
+                    );
+                  })
+                ),
+                history.length > 5
+                  ? React.createElement('button', {
+                      onClick: () => setShowAllHistory(!showAllHistory),
+                      style: { marginTop: 10, fontSize: 11, color: '#6366f1', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600, padding: 0 }
+                    }, showAllHistory ? 'Show less' : 'View ' + (history.length - 5) + ' more')
+                  : null
+              )
+        ))
+      )
+    )
+  );
+};
+
+ctx.render(React.createElement(SampleVariantDetailView));
