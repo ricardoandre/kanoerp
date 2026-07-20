@@ -1,0 +1,409 @@
+// jblock — STORE CURRENT STOCK REPORT
+//
+// Controls: Store (required — no report until picked), View By (Model /
+// Product, defaults to Product). Both sit in a wrapping flex row with a
+// mobile-safe minWidth (not a fixed/large one), so on a narrow phone
+// viewport they stack cleanly to full width instead of forcing
+// horizontal scroll.
+//
+// Available stock per product_variant = SUM(stock_ledger.quantity, ALL
+//   types — stock_transfer, production_in, adjustment — no type filter,
+//   since stock_transfer rows are already signed +/- and the others are
+//   just added as entered, but restricted to condition='good' rows only)
+//   - SUM(store_sales.quantity, also restricted to condition='good' rows)
+//   — all scoped to the selected store. No date range: this is a
+//   point-in-time cumulative snapshot, not a trailing-window report.
+//   (store_stock_in table no longer exists — removed from this report.)
+//
+// condition='good' is applied directly in the stock_ledger and
+// store_sales queries (that's where the column actually lives — product
+// itself has no condition field). Any stock_ledger or store_sales row
+// with a different condition (e.g. damaged/defective stock) is excluded
+// from both the ledger sum and the sales sum, so it never enters the
+// available-stock calculation at all — it's not merely hidden from
+// display, it's excluded from the arithmetic. A variant whose only
+// movement was non-'good' condition will show 0 stock here (and so be
+// filtered out by the 0-stock rule below) rather than showing its true
+// full-condition total.
+//
+// This is an AVAILABLE-stock report: 0-stock items are filtered out
+// entirely (at every level — top-level cards AND the breakdown rows inside
+// a card). Negative stock (oversold / data mismatch) is kept and shown in
+// red, as a flag rather than something to hide.
+//
+// Cards are sorted by total sales (most_sales first — bestseller first).
+// Thumbnail is displayed at a fixed 1080:1640 portrait aspect ratio (not
+// the image's real pixel size).
+//
+// CARD LAYOUT (mobile-friendly): cards sit in a CSS grid —
+// repeat(auto-fill, minmax(140px, 1fr)) — instead of a fixed-168px flex-
+// wrap row. This means the browser packs as many ~140px+ columns as
+// actually fit the viewport and stretches them evenly to fill it, so a
+// phone naturally gets 2 (sometimes 3) comfortably-sized columns with no
+// leftover dead space and no horizontal scrollbar, while a desktop window
+// still gets many columns — all from one rule, no separate breakpoints
+// to maintain.
+//
+// Product view: header = product code, sub-header = product name, image =
+//   that product's own photo, breakdown below = stock per size (variant).
+// Model view: header = MODEL name (no product code/name shown), image =
+//   the best-selling PRODUCT under that model (a model has no photo of its
+//   own), breakdown below = stock per PRODUCT under that model (not per
+//   size). Overlay total = the model's total stock (summed across every
+//   product under it, each already computed from condition='good' rows
+//   only),
+//   which can differ from the sum shown in the breakdown only if some of
+//   those products were individually filtered out for having 0 stock
+//   while the model total itself is still nonzero (shouldn't normally
+//   diverge, but noting it since the filtering is applied at both levels
+//   independently).
+//
+// ASSUMPTIONS (confirm / correct if wrong):
+//   - Only products/models with at least one stock_ledger or store_sales
+//     record at this store are considered at all (before the 0-stock
+//     filter is even applied) — not every product in the system, since
+//     that list could be enormous.
+//   - "Most sales" ranking uses ALL-TIME cumulative sales quantity at this
+//     store (no trailing-window control on this report, unlike the sales
+//     report).
+//   - condition='good' is an exact, case-sensitive match against the
+//     `condition` column value as stored on each stock_ledger / store_sales
+//     row (not on product). A row with any other condition value (or NULL)
+//     contributes to neither the ledger sum nor the sales sum.
+//
+// Depends on: none.
+
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Select } = antd;
+const ce = React.createElement;
+
+// ── helpers ──
+// §4.2 canonical SQL helper — only (re-)registers the uid when in flow
+// settings/dev mode, and always catches save errors (e.g. "uid already
+// exists" when a uid is reused across re-renders/store changes — this file
+// especially, since fetchLedgerByVariant/etc build a uid per storeId and
+// re-run it every time the store selection changes back and forth).
+async function runSql(uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+
+function fetchStores() {
+  return runSql('vscs_stores', "SELECT id, store_code, name FROM store ORDER BY name ASC");
+}
+function fetchProducts() {
+  return runSql('vscs_products', "SELECT code, name, model FROM product ORDER BY code ASC");
+}
+function fetchSkuOptions() {
+  return runSql('vscs_sku_options', "SELECT id, value, display, sort FROM sku_option ORDER BY sort ASC");
+}
+function fetchProductVariants() {
+  return runSql('vscs_variants', "SELECT id, code, fk_product_code, fk_sku_option_id FROM product_variant");
+}
+
+// product.image is a relation via an obfuscated junction table — introspect
+// it from the fields table rather than assuming a column name.
+function fetchImages() {
+  return runSql('vscs_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'")
+    .then(function (rows) {
+      if (!rows.length) return {};
+      let opt = {};
+      try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return {}; }
+      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
+      if (!through || !fk || !ok) return {};
+      return runSql('vscs_imgjoin',
+        "SELECT product.code AS code, attachments.url AS url, attachments.filename AS filename FROM product " +
+        "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
+        "JOIN attachments ON attachments.id = " + through + "." + ok + " ORDER BY attachments.id ASC")
+        .then(function (irows) {
+          const map = {};
+          irows.forEach(r => { if (!map[r.code]) map[r.code] = r.url || (r.filename ? '/storage/uploads/' + r.filename : ''); });
+          return map;
+        });
+    }).catch(() => ({}));
+}
+
+// stock_ledger now covers ALL inbound/outbound movement at a store —
+// stock_transfer (already signed +/-), production_in, and adjustment — so
+// available stock is simply the full ledger sum minus sales. No type
+// filter needed. (store_stock_in table has been removed from the schema.)
+// `condition` is a reserved word in most SQL dialects, so it's quoted
+// with backticks here. Only condition='good' rows count toward
+// available stock — this is where the filter actually lives, since
+// `condition` is a column on stock_ledger, not on product.
+function fetchLedgerByVariant(storeId) {
+  return runSql('vscs_ledger_' + storeId,
+    "SELECT fk_product_variant_id AS variant_id, COALESCE(SUM(quantity),0) AS qty FROM stock_ledger " +
+    "WHERE fk_store_id = " + Number(storeId) + " AND `condition` = 'good' GROUP BY fk_product_variant_id"
+  ).catch(() => []);
+}
+// `condition` is a column on store_sales too — same reserved-word
+// quoting, same condition='good' restriction.
+function fetchSalesByVariant(storeId) {
+  return runSql('vscs_sales_' + storeId,
+    "SELECT fk_product_variant_id AS variant_id, COALESCE(SUM(quantity),0) AS qty FROM store_sales " +
+    "WHERE fk_store_id = " + Number(storeId) + " AND `condition` = 'good' GROUP BY fk_product_variant_id"
+  ).catch(() => []);
+}
+
+function toMap(rows) {
+  const m = {};
+  rows.forEach(r => { m[String(r.variant_id)] = num(r.qty); });
+  return m;
+}
+
+// ── aggregation ──
+// builds per-product and per-model rollups from the two per-variant maps
+function buildAggregates(ledgerMap, salesMap, products, skuOptions, productVariants) {
+  const productByCode = {};
+  products.forEach(p => { productByCode[p.code] = p; });
+  const skuById = {};
+  skuOptions.forEach(s => { skuById[s.id] = s; });
+
+  // union of every variant id that appears in either map
+  const variantIds = {};
+  Object.keys(ledgerMap).forEach(k => { variantIds[k] = 1; });
+  Object.keys(salesMap).forEach(k => { variantIds[k] = 1; });
+
+  const variantById = {};
+  productVariants.forEach(v => { variantById[String(v.id)] = v; });
+
+  const perProduct = {}; // code -> { code, name, model, totalStock, totalSales, variants: [] }
+
+  Object.keys(variantIds).forEach(function (vid) {
+    const v = variantById[vid];
+    if (!v) return; // orphaned variant id, skip
+    const product = productByCode[v.fk_product_code];
+    if (!product) return;
+    const sku = skuById[v.fk_sku_option_id];
+    const ledger = ledgerMap[vid] || 0;
+    const sales = salesMap[vid] || 0;
+    const stock = ledger - sales;
+
+    if (!perProduct[product.code]) {
+      perProduct[product.code] = { code: product.code, name: product.name, model: product.model, totalStock: 0, totalSales: 0, variants: [] };
+    }
+    const pp = perProduct[product.code];
+    pp.totalStock += stock;
+    pp.totalSales += sales;
+    pp.variants.push({
+      skuOptionId: v.fk_sku_option_id,
+      label: sku ? (sku.display || sku.value) : '?',
+      sort: sku ? num(sku.sort) : 999,
+      stock: stock,
+    });
+  });
+
+  const productList = Object.keys(perProduct).map(function (code) {
+    const pp = perProduct[code];
+    pp.variants.sort((a, b) => a.sort - b.sort);
+    return pp;
+  });
+
+  // roll products up into models
+  const perModel = {}; // model -> { model, totalStock, totalSales, products: [] }
+  productList.forEach(function (pp) {
+    const key = pp.model || '(no model)';
+    if (!perModel[key]) perModel[key] = { model: key, totalStock: 0, totalSales: 0, products: [] };
+    perModel[key].totalStock += pp.totalStock;
+    perModel[key].totalSales += pp.totalSales;
+    perModel[key].products.push(pp);
+  });
+
+  const modelList = Object.keys(perModel).map(function (key) {
+    const m = perModel[key];
+    // best-selling product within this model: highest sales, tie-break by
+    // higher stock, then code asc, for a deterministic pick
+    const sorted = m.products.slice().sort(function (a, b) {
+      if (b.totalSales !== a.totalSales) return b.totalSales - a.totalSales;
+      if (b.totalStock !== a.totalStock) return b.totalStock - a.totalStock;
+      return a.code < b.code ? -1 : (a.code > b.code ? 1 : 0);
+    });
+    m.bestProduct = sorted[0] || null;
+    return m;
+  });
+
+  productList.sort((a, b) => b.totalSales - a.totalSales || b.totalStock - a.totalStock);
+  modelList.sort((a, b) => b.totalSales - a.totalSales || b.totalStock - a.totalStock);
+
+  return { productList: productList, modelList: modelList };
+}
+
+// ── card ──
+// generic — caller decides what "header"/"subHeader"/breakdown rows mean
+// (product code+name+sizes in Product view, model name+per-product totals
+// in Model view). Width is no longer fixed — the parent grid controls
+// column width, this just fills its grid cell (see Root's card
+// container).
+function StockCard(props) {
+  const imageUrl = props.imageUrl;
+  const overlayTotal = props.overlayTotal;
+  const header = props.header;
+  const subHeader = props.subHeader; // optional, omitted entirely if falsy
+  const breakdown = props.breakdown; // [{ label, value }]
+
+  const stockColor = overlayTotal < 0 ? '#ef4444' : (overlayTotal === 0 ? '#9ca3af' : '#166534');
+
+  return ce('div', { style: { width: '100%', border: '1px solid #e5e7eb', borderRadius: 10, overflow: 'hidden', background: '#fff', display: 'flex', flexDirection: 'column' } },
+    // 1080:1640 portrait proportion — not the image's real pixel size, just
+    // the display aspect ratio for the card thumbnail.
+    ce('div', { style: { position: 'relative', width: '100%', aspectRatio: '1080 / 1640', background: '#f3f4f6' } },
+      imageUrl
+        ? ce('img', { src: imageUrl, alt: header, style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' } })
+        : ce('div', { style: { width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#cbd5e1', fontSize: 11 } }, 'No image'),
+      ce('div', {
+        style: {
+          position: 'absolute', top: 6, left: 6, background: 'rgba(17,24,39,0.78)', color: '#fff',
+          fontSize: 11, fontWeight: 700, padding: '3px 8px', borderRadius: 999, lineHeight: '14px',
+        }
+      }, ce('span', { style: { color: stockColor === '#ef4444' ? '#fca5a5' : (stockColor === '#9ca3af' ? '#d1d5db' : '#86efac') } }, String(overlayTotal)), ' in stock')
+    ),
+    ce('div', { style: { padding: '8px 10px 10px' } },
+      ce('div', { style: { fontSize: 12, fontWeight: 700, color: '#111827', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, header),
+      subHeader ? ce('div', { style: { fontSize: 11, color: '#6b7280', marginBottom: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, subHeader) : null,
+      ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, borderTop: '1px solid #f3f4f6', paddingTop: 6, marginTop: subHeader ? 0 : 6 } },
+        breakdown.length
+          ? breakdown.map((b, i) => ce('div', { key: i, style: { display: 'flex', justifyContent: 'space-between', gap: 6, fontSize: 11 } },
+              ce('span', { style: { color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, b.label),
+              ce('span', { style: { fontWeight: 600, color: b.value < 0 ? '#ef4444' : '#374151', flexShrink: 0 } }, String(b.value))
+            ))
+          : ce('div', { style: { fontSize: 11, color: '#cbd5e1' } }, 'No breakdown data')
+      )
+    )
+  );
+}
+
+// ── root ──
+function Root() {
+  const [stores, setStores] = useState([]);
+  const [storeId, setStoreId] = useState(null);
+  const [viewBy, setViewBy] = useState('product');
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [imageMap, setImageMap] = useState({});
+  const [refData, setRefData] = useState(null); // { products, skuOptions, productVariants }
+  const [agg, setAgg] = useState(null); // { productList, modelList }
+
+  useEffect(function () {
+    fetchStores().then(setStores).catch(function (e) { setErr((e && e.message) || String(e)); });
+    fetchImages().then(setImageMap);
+    Promise.all([fetchProducts(), fetchSkuOptions(), fetchProductVariants()])
+      .then(function (r) { setRefData({ products: r[0], skuOptions: r[1], productVariants: r[2] }); })
+      .catch(function (e) { setErr((e && e.message) || String(e)); });
+  }, []);
+
+  useEffect(function () {
+    if (!storeId || !refData) { setAgg(null); return; }
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    Promise.all([fetchLedgerByVariant(storeId), fetchSalesByVariant(storeId)])
+      .then(function (r) {
+        if (!alive) return;
+        const ledgerMap = toMap(r[0]), salesMap = toMap(r[1]);
+        setAgg(buildAggregates(ledgerMap, salesMap, refData.products, refData.skuOptions, refData.productVariants));
+      })
+      .catch(function (e) {
+        if (!alive) return;
+        setErr((e && e.message) || String(e));
+        setAgg(null);
+      })
+      .finally(function () { if (alive) setLoading(false); });
+    return function () { alive = false; };
+  }, [storeId, refData]);
+
+  const fieldLabel = t => ce('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3af', marginBottom: 4 } }, t);
+
+  let cards = null;
+  if (agg) {
+    if (viewBy === 'product') {
+      // this is an "available stock" report — 0-stock items aren't available,
+      // so drop them (negative stock is kept visible as an anomaly flag)
+      cards = agg.productList
+        .filter(function (pp) { return pp.totalStock !== 0; })
+        .map(function (pp) {
+          const breakdown = pp.variants
+            .filter(function (v) { return v.stock !== 0; })
+            .map(function (v) { return { label: v.label, value: v.stock }; });
+          return ce(StockCard, {
+            key: pp.code, imageUrl: imageMap[pp.code] || null, overlayTotal: pp.totalStock,
+            header: pp.code, subHeader: pp.name, breakdown: breakdown,
+          });
+        });
+    } else {
+      // Model view: header is the MODEL name (not a product code/name), and
+      // the list below breaks down stock BY PRODUCT under that model
+      // (not by size) — the image shown is still the best-selling
+      // product's photo, since a model has no image of its own.
+      cards = agg.modelList
+        .filter(function (m) { return m.totalStock !== 0; })
+        .map(function (m) {
+          const bp = m.bestProduct;
+          const breakdown = m.products.slice()
+            .filter(function (p) { return p.totalStock !== 0; })
+            .sort(function (a, b) { return b.totalStock - a.totalStock; })
+            .map(function (p) { return { label: p.code, value: p.totalStock }; });
+          return ce(StockCard, {
+            key: m.model, imageUrl: bp ? (imageMap[bp.code] || null) : null, overlayTotal: m.totalStock,
+            header: m.model, subHeader: null, breakdown: breakdown,
+          });
+        });
+    }
+  }
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, padding: 4 } },
+
+    // Filter row: minWidth kept small (not a large fixed value) so on a
+    // narrow phone viewport both controls comfortably wrap to their own
+    // full-width line instead of squeezing together or forcing
+    // horizontal scroll.
+    ce('div', { style: { display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' } },
+      ce('div', { style: { minWidth: 160, flex: '1 1 200px' } },
+        fieldLabel('Store'),
+        ce(Select, {
+          value: storeId, onChange: setStoreId, style: { width: '100%' }, allowClear: true,
+          placeholder: 'Select a store to view current stock',
+          options: stores.map(s => ({ value: s.id, label: s.store_code ? (s.store_code + ' — ' + s.name) : s.name })),
+          showSearch: true,
+          filterOption: (input, option) => (option.label || '').toLowerCase().indexOf(input.toLowerCase()) !== -1,
+        })
+      ),
+      ce('div', { style: { minWidth: 140, flex: '1 1 160px' } },
+        fieldLabel('View By'),
+        ce(Select, {
+          value: viewBy, onChange: setViewBy, style: { width: '100%' },
+          options: [
+            { value: 'model', label: 'Model' },
+            { value: 'product', label: 'Product' },
+          ]
+        })
+      )
+    ),
+
+    !storeId
+      ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Select a store to view current stock.')
+      : err
+        ? ce('div', { style: { padding: 16, color: '#ef4444', fontSize: 12 } }, err)
+        : loading && !agg
+          ? ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'Loading…')
+          : cards
+            ? ce('div', null,
+                loading ? ce('div', { style: { fontSize: 11, color: '#9ca3af', marginBottom: 8 } }, 'Refreshing…') : null,
+                cards.length
+                  // adaptive grid — as many ~140px+ columns as the viewport
+                  // actually fits, stretched to fill it evenly; naturally
+                  // gives phones 2(-3) columns and desktops many, with no
+                  // separate breakpoints to maintain.
+                  ? ce('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 } }, cards)
+                  : ce('div', { style: { padding: '40px 12px', textAlign: 'center', color: '#9ca3af', fontSize: 13 } }, 'No stock currently available at this store.')
+              )
+            : null
+  );
+}
+
+ctx.render(ce(Root));
