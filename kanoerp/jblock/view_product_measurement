@@ -1,0 +1,387 @@
+// =====================================================
+// jblock — PRODUCT MEASUREMENT  (runs on the ui_list_engine engine)
+//
+// Thin domain config: fetch, card layout, detail. New/Edit both come from
+// dedicated Drawer source_code rows (ui_product_measurement_add /
+// ui_product_measurement_edit) — same shell as production's New/Edit, so
+// this now behaves like every other view in the app instead of a one-off
+// Modal.confirm.
+//
+// Reads use ctx.api.resource() exclusively (fetchAllPages/fetchByIn), NOT raw
+// ctx.sql — ctx.sql.save() is admin/root-gated and silently fails for
+// non-admin roles (see the NOTE in view_production and README §3).
+//
+// SCHEMA:
+//   product_measurement            — id, name, remarks (richText/HTML).
+//   product_measurement_variant    — one row per size: id,
+//     fk_product_measurement_variant_id (→ product_measurement.id),
+//     belongsTo sku_option, + 16 numeric measurement columns.
+//   product                        — fk_product_measurement_id (→ set).
+// A measurement set's linked products and its size rows are both fetched in
+// ONE fetchList() pass (batched via fetchByIn), so the card + detail views
+// need no extra round trips — everything the read-only UI needs is already
+// on `row`. The Edit drawer re-fetches fresh on open instead (see
+// ui_product_measurement_edit), so it's never working off a stale cache.
+//
+// Card/detail measurement tables only show columns that actually have a
+// value somewhere in that set (getPopulatedFields below) — Edit is the one
+// place that always shows all 16, since that's where you'd fill blanks in.
+// =====================================================
+const { React, antd, dayjs } = ctx.libs;
+const { useState, useEffect } = React;
+const { Modal, Spin, message } = antd;
+const ce = React.createElement;
+
+// shared code loader — resource-based (non-admin-safe), same pattern as view_production.
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
+// ── scaling helpers (same pattern as view_production / view_production_material) ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function chunk(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
+const BATCH_SIZE = 150;
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, BATCH_SIZE);
+  return batches.reduce(function (promise, batch) {
+    return promise.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter }))
+        .then(function (rows) { return acc.concat(rows); });
+    });
+  }, Promise.resolve([]));
+}
+
+// ── measurement fields (product_measurement_variant SQL columns, fixed order) —
+// duplicated in ui_product_measurement_add/_edit and here (3 places now) —
+// a real candidate for a shared lib_measurement_fields row; left inline to
+// keep this change scoped to what was asked. ──
+const MEASURE_FIELDS = [
+  { key: 'bust',              primary: 'Bust',          secondary: 'Lingkar Dada' },
+  { key: 'shoulder',          primary: 'Shoulder',      secondary: 'Bahu' },
+  { key: 'waist',             primary: 'Waist',         secondary: 'Lingkar Pinggang' },
+  { key: 'hips',              primary: 'Hips',          secondary: 'Lingkar Pinggul' },
+  { key: 'length',            primary: 'Length',        secondary: 'Panjang' },
+  { key: 'length2',           primary: 'Length 2',      secondary: 'Panjang 2' },
+  { key: 'bottom_hole',       primary: 'Bottom Hole',   secondary: 'Lingkar Bawah' },
+  { key: 'neck',              primary: 'Neck',          secondary: 'Lingkar Leher' },
+  { key: 'arm_hole',          primary: 'Arm Hole',      secondary: 'Lingkar Ketiak' },
+  { key: 'bottom_sleeve',     primary: 'Bottom Sleeve', secondary: 'Lebar Lengan' },
+  { key: 'mid_sleeve',        primary: 'Mid Sleeve',    secondary: 'Pangkal Lengan' },
+  { key: 'sleeve_length',     primary: 'Sleeve Length', secondary: 'Panjang Lengan' },
+  { key: 'thigh',             primary: 'Thigh',         secondary: 'Lebar Paha' },
+  { key: 'est_main_fabric',   primary: 'Est Fabric',    secondary: 'Est Bahan' },
+  { key: 'est_main_fabric_2', primary: 'Est Fabric 2',  secondary: 'Est Bahan 2' },
+  { key: 'est_furing',        primary: 'Est Furing',    secondary: 'Est Furing' },
+  { key: 'bust2',              primary: 'Bust 2',        secondary: 'Lingkar Dada 2' },
+  { key: 'waist2',             primary: 'Waist 2',       secondary: 'Lingkar Pinggang 2' },
+  { key: 'elastic',            primary: 'Elastic',       secondary: 'Karet' },
+];
+const MEASURE_KEYS = MEASURE_FIELDS.map(f => f.key);
+
+function isPopulated(v) { return v !== null && v !== undefined && v !== ''; }
+// only the columns that have a value somewhere across this set's sizes —
+// used by the (read-only) card + detail views. Edit always shows all 16.
+function getPopulatedFields(variants) {
+  return MEASURE_FIELDS.filter(f => variants.some(v => isPopulated(v.values[f.key])));
+}
+function stripHtml(html) { return String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(); }
+function fmtNum(v) { return isPopulated(v) ? v : '—'; }
+
+// ── data layer — everything the card + detail views need comes from ONE
+// fetchList() pass: product_measurement rows, plus their linked products
+// (with photo) and size rows (with sku label), batched via fetchByIn. ──
+function fetchList() {
+  return fetchAllPages('product_measurement', { fields: ['id', 'name', 'remarks'], sort: ['-id'] })
+    .then(function (pmRows) {
+      const ids = pmRows.map(r => r.id);
+
+      const productsP = fetchByIn('product', 'fk_product_measurement_id', ids, {
+        fields: ['code', 'name', 'fk_product_measurement_id'], appends: ['image'],
+      });
+      const variantsP = fetchByIn('product_measurement_variant', 'fk_product_measurement_variant_id', ids, {
+        fields: ['id', 'fk_product_measurement_variant_id'].concat(MEASURE_KEYS), appends: ['sku_option'],
+      });
+
+      return Promise.all([productsP, variantsP]).then(function (r) {
+        const prodRows = r[0], varRows = r[1];
+
+        const productsByPm = {};
+        prodRows.forEach(function (p) {
+          const pid = String(p.fk_product_measurement_id);
+          const img = p.image; const imgRow = Array.isArray(img) ? img[0] : img;
+          const url = imgRow ? (imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '')) : '';
+          (productsByPm[pid] = productsByPm[pid] || []).push({ code: p.code, name: p.name, image: url });
+        });
+
+        const variantsByPm = {};
+        varRows.forEach(function (v) {
+          const pid = String(v.fk_product_measurement_variant_id);
+          const sk = v.sku_option || {};
+          const values = {};
+          MEASURE_FIELDS.forEach(function (f) { values[f.key] = v[f.key]; });
+          (variantsByPm[pid] = variantsByPm[pid] || []).push({ sku_id: sk.id, sku_display: sk.display || '—', sku_sort: sk.sort || 0, values: values });
+        });
+
+        return pmRows.map(function (pm) {
+          const pid = String(pm.id);
+          const products = (productsByPm[pid] || []).slice().sort((a, b) => String(a.code).localeCompare(String(b.code)));
+          const variants = (variantsByPm[pid] || []).slice().sort((a, b) => a.sku_sort - b.sku_sort);
+          return { id: pm.id, name: pm.name, remarks: pm.remarks || '', products: products, variants: variants };
+        });
+      });
+    });
+}
+
+// ── delete: cleans up children BEFORE the parent, so we never leave orphaned
+// product_measurement_variant rows or products still pointing at a deleted
+// set via fk_product_measurement_id (also avoids relying on unknown FK
+// cascade behavior in the DB). ──
+async function deleteMeasurement(id) {
+  const prodRows = (await ctx.api.resource('product').list({ filter: { fk_product_measurement_id: id }, fields: ['code'], pageSize: 1000 })).data.data || [];
+  const varRows = (await ctx.api.resource('product_measurement_variant').list({ filter: { fk_product_measurement_variant_id: id }, fields: ['id'], pageSize: 1000 })).data.data || [];
+  for (const p of prodRows) { await ctx.api.resource('product').update({ filterByTk: p.code, values: { fk_product_measurement_id: null } }); }
+  for (const v of varRows) { await ctx.api.resource('product_measurement_variant').destroy({ filterByTk: v.id }); }
+  return ctx.api.resource('product_measurement').destroy({ filterByTk: id });
+}
+
+// ── New / Edit drawer loaders (dedicated source_code rows, Drawer-based) ──
+function NewDrawerLoader(props) {
+  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
+  const sS = useState(null); const Shell = sS[0]; const setShell = sS[1];
+  useEffect(function () {
+    loadCode('lib_drawer_shell').then(setShell).catch(function () { setShell(false); });
+    loadCode('ui_product_measurement_add').then(setMod).catch(function () { setMod(false); });
+  }, []);
+  if (!Shell || !Shell.DrawerShell) return null; // brief, first-paint-only — cached after first use on the page
+  const DrawerShell = Shell.DrawerShell;
+  const ready = Mod && Mod.NewMeasurementFormBody;
+  return ce(DrawerShell, {
+    open: props.open, onClose: props.onClose, title: 'New Product Measurement',
+    width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', loading: !ready,
+  }, ready ? ce(Mod.NewMeasurementFormBody, { onClose: props.onClose, onCreated: props.onCreated, resetSignal: props.open }) : null);
+}
+
+function EditDrawerLoader(props) {
+  const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
+  const sS = useState(null); const Shell = sS[0]; const setShell = sS[1];
+  const sF = useState(null); const footer = sF[0]; const setFooter = sF[1];
+  useEffect(function () {
+    loadCode('lib_drawer_shell').then(setShell).catch(function () { setShell(false); });
+    loadCode('ui_product_measurement_edit').then(setMod).catch(function () { setMod(false); });
+  }, []);
+  if (!Shell || !Shell.DrawerShell) return null;
+  const DrawerShell = Shell.DrawerShell;
+  const ready = Mod && Mod.EditMeasurementFormBody;
+  return ce(DrawerShell, {
+    open: props.open, onClose: props.onClose, title: 'Edit Product Measurement',
+    width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', loading: !ready, footer: footer,
+  }, ready ? ce(Mod.EditMeasurementFormBody, { open: props.open, measurementId: props.measurementId, onClose: props.onClose, onSaved: props.onSaved, onFooterChange: setFooter }) : null);
+}
+
+// ── card renderer ──
+function renderCard(o) {
+  const row = o.row;
+  const selectMode = o.selectMode, selected = o.selected;
+  const products = row.products || [];
+  const variants = row.variants || [];
+  const img = products[0] && products[0].image;
+  const codesText = products.length ? products.map(p => p.code).join(', ') : '—';
+  const remarksText = stripHtml(row.remarks);
+  const populatedFields = getPopulatedFields(variants);
+
+  return ce('div', { className: 'pmm-cardbody' },
+    ce('div', { className: 'pmm-col-summary' },
+      selectMode
+        ? ce('div', { style: { width: 22, height: 22, borderRadius: 6, flexShrink: 0, border: '2px solid ' + (selected ? '#6366f1' : '#cbd5e1'), background: selected ? '#6366f1' : '#fff', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 } }, selected ? '✓' : '')
+        : null,
+      ce('div', { style: { width: 56, height: 56, borderRadius: 10, flexShrink: 0, background: '#f3f4f6', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+        img ? ce('img', { src: img, style: { width: '100%', height: '100%', objectFit: 'cover' } }) : ce('span', { style: { fontSize: 20, color: '#cbd5e1' } }, '📏')),
+      ce('div', { style: { flex: 1, minWidth: 0 } },
+        ce('div', { style: { fontWeight: 700, fontSize: 14, color: '#111827', marginBottom: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, row.name || '—'),
+        ce('div', { style: { fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, codesText),
+        ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 5 } },
+          variants.length
+            ? variants.map(v => ce('span', { key: v.sku_id, style: { fontSize: 10, fontWeight: 700, color: '#4338ca', background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 4, padding: '1px 6px' } }, v.sku_display))
+            : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, 'No sizes'))
+      )),
+    ce('div', { className: 'pmm-col-measure' },
+      (variants.length && populatedFields.length)
+        ? ce('div', { className: 'pmm-mini-grid' },
+            ce('table', null,
+              ce('thead', null, ce('tr', null,
+                ce('th', null, 'Size'),
+                populatedFields.map(f => ce('th', { key: f.key }, f.primary)))),
+              ce('tbody', null, variants.map(v => ce('tr', { key: v.sku_id },
+                ce('td', { className: 'pmm-mini-size' }, v.sku_display),
+                populatedFields.map(f => ce('td', { key: f.key }, fmtNum(v.values[f.key]))))))))
+        : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, '—')),
+    ce('div', { className: 'pmm-col-remarks' },
+      remarksText ? ce('div', { style: { fontSize: 12, color: '#6b7280' } }, remarksText) : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, 'No remarks')));
+}
+
+// ── detail: everything — products (bigger photo-on-top tiles), remarks
+// (rendered rich text), and the measurement grid for every size, limited to
+// columns that actually have a value. All sourced straight off `row`
+// (already fetched in fetchList, no extra round trip). ──
+function DetailBody(props) {
+  const row = props.row;
+  const products = row.products || [];
+  const variants = row.variants || [];
+  const populatedFields = getPopulatedFields(variants);
+  const fieldLabelEl = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
+
+  return ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, display: 'flex', flexDirection: 'column', gap: 18, paddingTop: 4 } },
+    ce('style', null,
+      ".pmd-grid-wrap{border:1px solid #cbd5e1;overflow-x:auto;}" +
+      ".pmd-grid-wrap table{border-collapse:separate;border-spacing:0;width:100%;}" +
+      ".pmd-grid-wrap th{background:#f1f5f9;border:1px solid #cbd5e1;padding:4px 3px;font-size:10px;white-space:normal;text-align:center;}" +
+      ".pmd-grid-wrap td{border:1px solid #e2e8f0;padding:4px;font-size:12px;text-align:center;background:#fff;}" +
+      ".pmd-grid-wrap tr.pmd-alt td{background:#f8fafc;}" +
+      ".pmd-grid-wrap td.pmd-size-cell{padding:6px 14px;font-weight:700;text-align:left;white-space:nowrap;}" +
+      ".pmd-rte-body{font-size:13px;line-height:1.5;}" +
+      ".pmd-rte-body:empty:before{content:'No remarks';color:#b0b7c3;font-style:italic;}" +
+      ".pmd-prod-tile{width:120px;}" +
+      ".pmd-prod-tile img,.pmd-prod-tile .pmd-prod-noimg{width:120px;height:120px;border-radius:10px;object-fit:cover;background:#f3f4f6;}"),
+
+    ce('div', null, fieldLabelEl('Products (' + products.length + ')'),
+      products.length
+        ? ce('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 14 } },
+            products.map(p => ce('div', { key: p.code, className: 'pmd-prod-tile' },
+              p.image
+                ? ce('img', { src: p.image })
+                : ce('div', { className: 'pmd-prod-noimg', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 30, color: '#cbd5e1' } }, '👕'),
+              ce('div', { style: { marginTop: 6, fontSize: 12, fontWeight: 700, color: '#111827' } }, p.code),
+              ce('div', { style: { fontSize: 11, color: '#6b7280' } }, p.name || '—'))))
+        : ce('div', { style: { fontSize: 12, color: '#9ca3af', fontStyle: 'italic' } }, 'No products linked.')),
+
+    ce('div', null, fieldLabelEl('Remarks'),
+      ce('div', { style: { border: '1px solid #e5e7eb', borderRadius: 8, padding: '10px 12px' } },
+        ce('div', { className: 'pmd-rte-body', dangerouslySetInnerHTML: { __html: row.remarks || '' } }))),
+
+    ce('div', null, fieldLabelEl('Measurements (' + variants.length + ' size' + (variants.length === 1 ? '' : 's') + ')'),
+      (variants.length && populatedFields.length)
+        ? ce('div', { className: 'pmd-grid-wrap' },
+            ce('table', null,
+              ce('thead', null, ce('tr', null,
+                ce('th', { style: { textAlign: 'left' } }, 'Size'),
+                populatedFields.map(f => ce('th', { key: f.key },
+                  ce('div', null, ce('div', { style: { fontWeight: 700 } }, f.primary), ce('div', { style: { color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')')))))),
+              ce('tbody', null, variants.map((v, i) => ce('tr', { key: v.sku_id, className: i % 2 === 1 ? 'pmd-alt' : '' },
+                ce('td', { className: 'pmd-size-cell' }, v.sku_display),
+                populatedFields.map(f => ce('td', { key: f.key }, fmtNum(v.values[f.key]))))))))
+        : ce('div', { style: { fontSize: 12, color: '#9ca3af', fontStyle: 'italic' } }, 'No measurements recorded.')),
+
+    ce('div', { style: { height: 20 } }));
+}
+
+// ── per-view CSS (layout only; engine owns the swipe-frame CSS) ──
+const VIEW_CSS =
+  ".pmm-cardbody{display:flex;flex-direction:column;gap:10px;padding:12px;}" +
+  ".pmm-col-summary{display:flex;gap:12px;align-items:flex-start;}" +
+  ".pmm-col-measure,.pmm-col-remarks{display:none;}" +
+  ".pmm-mini-grid{overflow-x:auto;border:1px solid #e2e8f0;border-radius:6px;}" +
+  ".pmm-mini-grid table{border-collapse:collapse;font-size:11px;}" +
+  ".pmm-mini-grid th,.pmm-mini-grid td{border:1px solid #f1f5f9;padding:3px 7px;text-align:center;white-space:nowrap;}" +
+  ".pmm-mini-grid th{background:#f8fafc;color:#64748b;font-weight:700;}" +
+  ".pmm-mini-grid td.pmm-mini-size{font-weight:700;color:#374151;text-align:left;padding-left:8px;}" +
+  "@media(min-width:900px){" +
+    ".pmm-cardbody{display:grid;grid-template-columns:280px minmax(0,1fr) 200px;gap:16px;align-items:start;}" +
+    ".pmm-col-measure{display:block;max-height:150px;overflow-y:auto;}" +
+    ".pmm-col-remarks{display:block;padding-top:4px;}" +
+  "}" +
+  ".kano-detail-drawer .ant-drawer-content-wrapper{width:min(900px,92vw) !important;}" +
+  "@media (max-width:700px){.kano-detail-drawer .ant-drawer-content-wrapper{width:100% !important;}}";
+
+// ── CONFIG ──
+const config = {
+  title: 'Product Measurements',
+  css: VIEW_CSS,
+  searchPlaceholder: 'Search product code, name…',
+  emptyText: 'No measurement sets match this search',
+  pageSize: 15,
+
+  fetchList: fetchList,
+  getImage: row => (row.products && row.products[0] && row.products[0].image) || '',
+
+  searchText: r => [].concat((r.products || []).map(p => p.code), (r.products || []).map(p => p.name)),
+
+  // no main tabs, no secondary filters, no sort options — plain newest-first list.
+
+  renderCard: renderCard,
+
+  detailTitle: r => r.name || ('#' + r.id),
+  statusAccent: function () { return '#6366f1'; },
+  detailRender: (row, refreshKey, helpers) => ce(DetailBody, { row: row, refreshKey: refreshKey, helpers: helpers }),
+
+  renderNewDrawer: function (api) {
+    return ce(NewDrawerLoader, {
+      open: api.open, onClose: api.onClose,
+      onCreated: function () { api.onClose(); api.helpers.reload(); },
+    });
+  },
+  renderEditDrawer: function (api) {
+    return ce(EditDrawerLoader, {
+      open: !!api.open, measurementId: api.row ? api.row.id : null, onClose: api.onClose,
+      onSaved: function () { api.onClose(); api.helpers.refresh(); api.helpers.reloadKeepOpen(); },
+    });
+  },
+
+  deleteRow: deleteMeasurement,
+  deleteTitle: 'Delete measurement set?',
+  deleteLabel: row => row.name || ('#' + row.id),
+  bulkActions: [
+    { label: '🗑 Delete', bg: '#ef4444', color: '#fff', run: function (ids, helpers) {
+        Modal.confirm({
+          title: 'Delete ' + ids.length + ' measurement set(s)?',
+          content: 'This also removes their size rows and unlinks any products pointing at them. This cannot be undone.',
+          okText: 'Delete', okButtonProps: { danger: true },
+          onOk: () => ids.reduce((p, id) => p.then(() => deleteMeasurement(id)), Promise.resolve())
+            .then(() => { message.success('Deleted ' + ids.length + '.'); helpers.exitSelect(); helpers.reload(); })
+            .catch(e => message.error('Bulk delete failed: ' + ((e && e.message) || e))),
+        });
+      } },
+  ],
+};
+
+// ── root ──
+const Root = function () {
+  const sLV = useState(null); const LV = sLV[0]; const setLV = sLV[1];
+  const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
+  useEffect(function () {
+    loadCode('ui_list_engine').then(function (M) { setLV(function () { return M.createListView(config); }); })
+      .catch(function (e) { setErr((e && e.message) || String(e)); });
+  }, []);
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load ui_list_engine: ' + err);
+  if (!LV) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…');
+  return ce('div', null, ce(LV));
+};
+
+ctx.render(ce(Root));
