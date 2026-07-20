@@ -1,0 +1,85 @@
+const recordId = ctx.record?.id ?? "";
+const productionRef = ctx.record?.production_ref ?? "";
+const productCode = ctx.record?.fk_product_code ?? "";
+const konveksiCode = ctx.record?.fk_konveksi_code ?? "";
+const productionStart = ctx.record?.est_production_start ?? "N/A";
+const productionFinish = ctx.record?.est_production_finish ?? "N/A";
+const status = (ctx.record?.status ?? "").toLowerCase();
+
+const isActiveStatus = status === 'cutting' || status === 'production';
+const today = new Date().toISOString().split('T')[0];
+const isLate = isActiveStatus && productionFinish !== "N/A" && productionFinish < today;
+
+ctx.sql.save({
+  uid: "product_name_" + recordId,
+  sql: `SELECT name FROM product WHERE code = '${productCode}'`,
+  dataSourceKey: "main"
+}).then(() => {
+  return ctx.sql.runById("product_name_" + recordId, {
+    type: "selectRows",
+    dataSourceKey: "main"
+  });
+}).then(function (productRows) {
+  const productName = productRows?.[0]?.name ?? "N/A";
+
+  return ctx.sql.save({
+    uid: "konveksi_name_" + recordId,
+    sql: `SELECT name FROM konveksi WHERE code = '${konveksiCode}'`,
+    dataSourceKey: "main"
+  }).then(() => {
+    return ctx.sql.runById("konveksi_name_" + recordId, {
+      type: "selectRows",
+      dataSourceKey: "main"
+    });
+  }).then(function (konveksiRows) {
+    const konveksiName = konveksiRows?.[0]?.name ?? "N/A";
+
+    const finishDisplay = isLate
+      ? `<span style="color: #ef4444; font-weight: 600;">⚠ ${productionFinish}</span>`
+      : `<span>${productionFinish}</span>`;
+
+    ctx.element.innerHTML = `
+      <div style="
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 12px;
+        line-height: 1.4;
+      ">
+        <div>
+          <span style="font-weight: 500; margin-left: 4px;">
+            ${productionRef}
+          </span>
+        </div>
+        <br/>
+        <div>
+          <span style="font-weight: 500; margin-left: 4px;">
+            ${productCode}
+          </span>
+        </div>
+        <div>
+          <span style="font-weight: 500; margin-left: 4px; color: #888">
+            ${productName}<br/><br/>
+          </span>
+        </div>
+        <div>
+          <span style="font-weight: 500; margin-left: 4px; color: #888">
+            on: ${konveksiName}
+          </span>
+        </div>
+        <div>
+          <span style="font-weight: 500; margin-left: 4px; color: #888">
+            at: ${productionStart}
+          </span>
+        </div>
+        <div>
+          <span style="font-weight: 500; margin-left: 4px; color: #888">
+            until: ${finishDisplay}
+          </span>
+        </div>
+      </div>
+    `;
+  });
+}).catch(err => {
+  ctx.element.innerHTML = 'SQL ERROR: ' + err.message;
+});
