@@ -1,0 +1,27 @@
+const images = ctx.record?.reference_images;
+
+if (!images || !images.length) {
+  ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No image</span>';
+  return;
+}
+
+const first = images[0];
+const url = first?.url || first?.thumbUrl || '';
+
+if (!url) {
+  ctx.element.innerHTML = '<span style="color:#d1d5db;font-size:11px;">No image</span>';
+  return;
+}
+
+ctx.element.innerHTML =
+  '<div style="padding:2px;">' +
+    '<img ' +
+      'src="' + url + '" ' +
+      'style="width:100%;max-width:160px;height:120px;object-fit:cover;border-radius:6px;cursor:pointer;display:block;" ' +
+      'onclick="window.open(\'' + url + '\',\'_blank\')" ' +
+      'onerror="this.parentElement.innerHTML=\'<span style=&quot;color:#d1d5db;font-size:11px;&quot;>Load error</span>\'" ' +
+    '/>' +
+    (images.length > 1
+      ? '<div style="font-size:10px;color:#9ca3af;margin-top:3px;">+' + (images.length - 1) + ' more</div>'
+      : '') +
+  '</div>';
