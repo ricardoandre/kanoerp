@@ -489,8 +489,28 @@ returned handle is confirmed **NOT** reliable), `Drawer`, `Dropdown`, `Select`,
 is needed that isn't on this list, it's not necessarily broken — just unverified;
 say so explicitly rather than presenting it with full confidence.
 
-- All components use `React.createElement` aliased as `ce` — **never JSX** (no
-  transpiler in the sandbox).
+- **JSX only works in a jblock's own top-level code — never in anything
+  loaded via `loadCode()`/`new Function(...)`.** *(Corrected 2026-07 — a
+  previous version of this README stated a blanket "never JSX" rule. That
+  was too broad. Confirmed by direct test: a throwaway `source_code` row
+  containing `return <div>hello</div>;`, loaded via the standard
+  `loadCode()` pattern (`new Function('React','antd','dayjs','ctx', src)`),
+  throws `SyntaxError: Unexpected token '<'` — `new Function(...)` only
+  parses real JavaScript, never JSX, since there's no transpilation step in
+  that path. Meanwhile `view_database_table_list` — a plain jblock using
+  raw JSX (`<Table dataSource={...} />` etc.) directly in its own top-level
+  code, not loaded via `loadCode()` — renders correctly live. NocoBase
+  evidently transpiles a jblock's own code before running it, but does NOT
+  transpile whatever `new Function(...)` compiles at runtime.)*
+  **Practical implication:** write plain jblocks (the outermost file
+  attached directly to a page/block, calling `ctx.render(...)` once at the
+  end) in JSX if you prefer — confirmed safe. But every `source_code` row
+  (loaded via `loadCode`) and every JSAction must stick to
+  `ce()`/`React.createElement(...)` calls, since those always go through
+  the untranspiled `new Function(...)` path, directly or (for a JSAction)
+  effectively the same way. Don't convert an existing `ce()`-based
+  `source_code` row to JSX for "readability" — it will silently fail to
+  compile the moment it's saved and loaded.
 - CSS via injected `<style>` tags with scoped class prefixes, to avoid leaking styles
   into the rest of the NocoBase page. **But see §6.1 — don't blanket-kill
   `transition`/`animation` on a Modal via this technique; it can break antd's own
