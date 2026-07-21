@@ -42,9 +42,20 @@ function buildImgUrl(filename, url) {
   return '';
 }
 
+// Both 'sample' and 'image' items are backed by real DB rows (sample table /
+// canvas.images attachments relation) and are re-fetched fresh on every load,
+// so layout only needs to remember their position. Only 'text' items have no
+// backing row — their full content lives in the layout JSON itself.
 function saveLayout(canvasId, items) {
   var val = JSON.stringify(items.map(function(it) {
-    return { id: it.id, x: it.x, y: it.y, w: it.w, h: it.h, z: it.z || 1 };
+    var base = { id: it.id, type: it.type || 'sample', x: it.x, y: it.y, w: it.w, h: it.h, z: it.z || 1 };
+    if (it.type === 'text') {
+      base.text = it.text || '';
+      base.color = it.color || '#1e293b';
+      base.fontSize = it.fontSize || 14;
+      base.bg = it.bg || '#fff9db';
+    }
+    return base;
   }));
   var escaped = val.replace(/'/g, "''");
   return execSql('canvas_save_' + canvasId,
@@ -61,6 +72,137 @@ function loadLayout(canvasId) {
   });
 }
 
+// ── canvas.images relation (attachment field) ──────────────────
+// Same introspection pattern already used elsewhere in this codebase for
+// product.image: attachment fields aren't real SQL columns, so we read the
+// field's through-table + keys from `fields` once, then join `attachments`.
+var _canvasImgMetaCache = null;
+function getCanvasImagesMeta() {
+  if (_canvasImgMetaCache) return Promise.resolve(_canvasImgMetaCache);
+  return runSql('canvas_imgmeta',
+    "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='canvas' AND name='images'"
+  ).then(function(rows) {
+    if (!rows.length) return null;
+    var opt = {};
+    try { opt = JSON.parse(rows[0].options || '{}'); } catch(e) { return null; }
+    var meta = { through: opt.through, fk: opt.foreignKey, ok: opt.otherKey, sk: opt.sourceKey || 'id' };
+    if (!meta.through || !meta.fk || !meta.ok) return null;
+    _canvasImgMetaCache = meta;
+    return meta;
+  }).catch(function() { return null; });
+}
+
+function fetchCanvasImages(canvasId) {
+  return getCanvasImagesMeta().then(function(meta) {
+    if (!meta) return [];
+    return runSql('canvas_imgs_' + canvasId,
+      "SELECT attachments.id AS id, attachments.title AS title, attachments.url AS url, attachments.filename AS filename " +
+      "FROM canvas " +
+      "JOIN " + meta.through + " ON " + meta.through + "." + meta.fk + " = canvas." + meta.sk + " " +
+      "JOIN attachments ON attachments.id = " + meta.through + "." + meta.ok + " " +
+      "WHERE canvas.id = " + canvasId + " " +
+      "ORDER BY attachments.id ASC"
+    );
+  }).catch(function() { return []; });
+}
+
+// ── Browse existing images (sample.reference_images + sample_variant.image) ──
+// for a given collection, so they can be linked into canvas.images without
+// re-uploading. Junction tables confirmed via schema dump.
+function fetchCollectionImages(collectionId) {
+  return Promise.all([
+    runSql('browse_sample_' + collectionId,
+      "SELECT sample.id AS sample_id, sample.name AS sample_name, " +
+      "attachments.id AS attachment_id, attachments.title AS title, attachments.url AS url, attachments.filename AS filename " +
+      "FROM sample " +
+      "JOIN t_wda3bnmr9c9 ON t_wda3bnmr9c9.f_57nmxuosclw = sample.id " +
+      "JOIN attachments ON attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+      "WHERE sample.fk_collection_id = " + collectionId + " AND sample.status <> 'cancel' " +
+      "ORDER BY sample.name ASC, attachments.id ASC"
+    ),
+    runSql('browse_variant_' + collectionId,
+      "SELECT sample.id AS sample_id, sample.name AS sample_name, " +
+      "attachments.id AS attachment_id, attachments.title AS title, attachments.url AS url, attachments.filename AS filename " +
+      "FROM sample_variant " +
+      "JOIN sample ON sample_variant.fk_sample_variant_id = sample.id " +
+      "JOIN t_hq2tyo4911x ON t_hq2tyo4911x.f_9uw8zn7ipd2 = sample_variant.id " +
+      "JOIN attachments ON attachments.id = t_hq2tyo4911x.f_bv8dcij84et " +
+      "WHERE sample.fk_collection_id = " + collectionId + " AND sample.status <> 'cancel' " +
+      "ORDER BY sample.name ASC, sample_variant.id ASC, attachments.id ASC"
+    ),
+  ]).then(function(results) {
+    var sampleRows  = results[0] || [];
+    var variantRows = results[1] || [];
+    var seen = {};
+    var out = [];
+    sampleRows.forEach(function(r) {
+      var aid = String(r.attachment_id);
+      if (seen[aid]) return;
+      seen[aid] = true;
+      out.push({ attachmentId: aid, label: r.sample_name, title: r.title, img_url: buildImgUrl(r.filename, r.url) });
+    });
+    variantRows.forEach(function(r) {
+      var aid = String(r.attachment_id);
+      if (seen[aid]) return;
+      seen[aid] = true;
+      out.push({ attachmentId: aid, label: r.sample_name + ' · variant', title: r.title, img_url: buildImgUrl(r.filename, r.url) });
+    });
+    return out;
+  }).catch(function() { return []; });
+}
+
+// Upload a new file: POST to attachments:create (multipart), which both
+// creates the attachment row and returns it. Mirrors the exact request the
+// normal NocoBase "images" upload field makes (confirmed via devtools).
+// Wrapped in Promise.resolve().then(...) so ANY synchronous throw (e.g. an
+// unexpected shape of ctx.api) becomes a rejected promise instead of an
+// uncaught exception — otherwise the caller's .catch never runs and the UI
+// gets stuck on "Uploading…" forever with no error shown.
+function uploadAttachment(file) {
+  return Promise.resolve().then(function() {
+    var FD = (typeof window !== 'undefined' && window.FormData) ? window.FormData
+            : (typeof FormData !== 'undefined' ? FormData : null);
+    var fd;
+    try {
+      fd = new FD(); // eslint-disable-line new-cap
+    } catch (e) {
+      throw new Error(
+        'FormData is unavailable or blocked in this context ' +
+        '(typeof FormData=' + typeof FormData + ', typeof window.FormData=' + (typeof window !== 'undefined' ? typeof window.FormData : 'no window') + '). ' +
+        'Original error: ' + (e && e.message)
+      );
+    }
+    fd.append('file', file);
+    var cfg = { url: 'attachments:create', method: 'POST', params: { attachmentField: 'canvas.images' }, data: fd };
+
+    if (ctx.api && typeof ctx.api.request === 'function') {
+      return ctx.api.request(cfg);
+    }
+    if (ctx.api && ctx.api.axios && typeof ctx.api.axios.post === 'function') {
+      return ctx.api.axios.post(cfg.url, fd, { params: cfg.params });
+    }
+    throw new Error('No usable upload method found on ctx.api (checked ctx.api.request and ctx.api.axios.post).');
+  }).then(function(res) {
+    var att = res && res.data && res.data.data;
+    if (!att || !att.id) throw new Error('Upload succeeded but no attachment id came back. Raw response: ' + JSON.stringify(res && res.data));
+    return att;
+  });
+}
+
+// Link an already-uploaded attachment into this canvas record's `images`
+// relation, using NocoBase's association-resource "add" action.
+function linkImageToCanvas(canvasId, attachmentId) {
+  return Promise.resolve().then(function() {
+    return ctx.api.resource('canvas.images', canvasId).add({ values: [attachmentId] });
+  });
+}
+
+function unlinkImageFromCanvas(canvasId, attachmentId) {
+  return Promise.resolve().then(function() {
+    return ctx.api.resource('canvas.images', canvasId).remove({ values: [attachmentId] });
+  });
+}
+
 // Canvas dimensions
 var CANVAS_W = 4000;
 var CANVAS_H = 2000;
@@ -72,18 +214,26 @@ var THUMB_H  = 250;
 var _zCounter = 10;
 function nextZ() { return ++_zCounter; }
 
+function newItemId(prefix) {
+  return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
 // ── IMAGE TILE (drag + resize on canvas) ──────────────────────
+// Used for both sample images (type: 'sample') and manually-added
+// images (type: 'image'). Only manual images get a delete control —
+// sample tiles are driven by the sample table, not deletable here.
 var ImageTile = function(props) {
   var item      = props.item;
   var onUpdate  = props.onUpdate;
   var onFocus   = props.onFocus;
+  var onDelete  = props.onDelete;
   var isFocused = props.isFocused;
   var dragging  = useRef(false);
   var resizing  = useRef(false);
   var start     = useRef({});
 
   var onDragDown = function(e) {
-    if (e.target.dataset.resize) return;
+    if (e.target.dataset.resize || e.target.dataset.delete) return;
     e.stopPropagation();
     e.preventDefault();
     dragging.current = true;
@@ -157,6 +307,18 @@ var ImageTile = function(props) {
         pointerEvents: 'none', lineHeight: 1.3,
       }
     }, item.name),
+    // Delete control — manual images only
+    item.type === 'image' ? createElement('div', {
+      'data-delete': '1',
+      onMouseDown: function(e) { e.stopPropagation(); onDelete(item.id); },
+      style: {
+        position: 'absolute', top: 4, right: 4,
+        width: 18, height: 18, borderRadius: 9,
+        background: 'rgba(0,0,0,0.55)', color: '#fff',
+        fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        cursor: 'pointer', lineHeight: 1,
+      }
+    }, '✕') : null,
     // Resize handle
     createElement('div', {
       'data-resize': '1',
@@ -172,6 +334,230 @@ var ImageTile = function(props) {
   );
 };
 
+// ── TEXT TILE (sticky-note style comment box) ──────────────────
+var TextTile = function(props) {
+  var item      = props.item;
+  var onUpdate  = props.onUpdate;
+  var onFocus   = props.onFocus;
+  var onDelete  = props.onDelete;
+  var isFocused = props.isFocused;
+  var dragging  = useRef(false);
+  var resizing  = useRef(false);
+  var start     = useRef({});
+
+  var onDragDown = function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    dragging.current = true;
+    var newZ = nextZ();
+    start.current = { mx: e.clientX, my: e.clientY, ox: item.x, oy: item.y };
+    onFocus(item.id);
+    onUpdate(item.id, { z: newZ });
+
+    function onMove(ev) {
+      if (!dragging.current) return;
+      onUpdate(item.id, {
+        x: Math.max(0, start.current.ox + (ev.clientX - start.current.mx)),
+        y: Math.max(0, start.current.oy + (ev.clientY - start.current.my)),
+      });
+    }
+    function onUp() {
+      dragging.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  var onResizeDown = function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    resizing.current = true;
+    start.current = { mx: e.clientX, my: e.clientY, ow: item.w, oh: item.h };
+
+    function onMove(ev) {
+      if (!resizing.current) return;
+      onUpdate(item.id, {
+        w: Math.max(100, start.current.ow + (ev.clientX - start.current.mx)),
+        h: Math.max(60, start.current.oh + (ev.clientY - start.current.my)),
+      });
+    }
+    function onUp() {
+      resizing.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  return createElement('div', {
+    onMouseDown: function() { onFocus(item.id); },
+    style: {
+      position: 'absolute', left: item.x, top: item.y, width: item.w, height: item.h,
+      background: item.bg || '#fff9db',
+      borderRadius: 4,
+      boxShadow: isFocused
+        ? '0 0 0 2px #6366f1, 0 8px 24px rgba(0,0,0,0.2)'
+        : '0 2px 8px rgba(0,0,0,0.15)',
+      zIndex: item.z || 1,
+      display: 'flex', flexDirection: 'column', overflow: 'hidden',
+    }
+  },
+    // Drag handle header, with delete control
+    createElement('div', {
+      onMouseDown: onDragDown,
+      style: {
+        height: 18, background: 'rgba(0,0,0,0.06)', cursor: 'grab', flexShrink: 0,
+        display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '0 2px',
+      }
+    },
+      createElement('div', {
+        onMouseDown: function(e) { e.stopPropagation(); onDelete(item.id); },
+        style: {
+          fontSize: 11, color: '#9ca3af', cursor: 'pointer',
+          width: 16, height: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }
+      }, '✕')
+    ),
+    // Editable comment body
+    createElement('textarea', {
+      value: item.text,
+      onChange: function(e) { onUpdate(item.id, { text: e.target.value }); },
+      onMouseDown: function(e) { e.stopPropagation(); onFocus(item.id); },
+      placeholder: 'Write a comment…',
+      style: {
+        flex: 1, border: 'none', outline: 'none', resize: 'none',
+        background: 'transparent', fontFamily: 'inherit', lineHeight: 1.4,
+        fontSize: item.fontSize || 14, color: item.color || '#1e293b',
+        padding: 8,
+      }
+    }),
+    // Resize handle
+    createElement('div', {
+      onMouseDown: onResizeDown,
+      style: {
+        position: 'absolute', bottom: 0, right: 0, width: 18, height: 18,
+        cursor: 'nwse-resize', display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end', padding: 4,
+      }
+    },
+      createElement('div', { style: { width: 7, height: 7, pointerEvents: 'none', borderRight: '2px solid rgba(0,0,0,0.25)', borderBottom: '2px solid rgba(0,0,0,0.25)' } })
+    )
+  );
+};
+
+// ── BROWSE EXISTING IMAGES MODAL ────────────────────────────────
+// Lets the user pick a collection, then multi-select from a combined grid of
+// that collection's sample.reference_images + sample_variant.image, to link
+// into canvas.images without re-uploading.
+var BrowseImagesModal = function(props) {
+  var open        = props.open;
+  var collections = props.collections || [];
+  var existingIds = props.existingIds || {};
+  var onClose     = props.onClose;
+  var onConfirm   = props.onConfirm; // (chosenItems[]) => void
+
+  var sCol  = useState(null);  var colId    = sCol[0];  var setColId    = sCol[1];
+  var sImgs = useState([]);    var images   = sImgs[0]; var setImages   = sImgs[1];
+  var sLoad = useState(false); var loading  = sLoad[0]; var setLoading  = sLoad[1];
+  var sSel  = useState({});    var selected = sSel[0];  var setSelected = sSel[1];
+
+  useEffect(function() {
+    if (!open) { setColId(null); setImages([]); setSelected({}); }
+  }, [open]);
+
+  useEffect(function() {
+    if (!colId) { setImages([]); return; }
+    setLoading(true);
+    setSelected({});
+    fetchCollectionImages(colId).then(function(list) {
+      setImages(list);
+      setLoading(false);
+    });
+  }, [colId]);
+
+  function toggle(id) {
+    setSelected(function(prev) {
+      var next = Object.assign({}, prev);
+      if (next[id]) delete next[id]; else next[id] = true;
+      return next;
+    });
+  }
+
+  var selectedCount = Object.keys(selected).length;
+
+  function handleConfirm() {
+    var chosen = images.filter(function(im) { return selected[im.attachmentId]; });
+    onConfirm(chosen);
+  }
+
+  return createElement(Modal, {
+    title: 'Add Images from Collection',
+    open: open,
+    onCancel: onClose,
+    width: 640,
+    footer: [
+      createElement('button', {
+        key: 'cancel', onClick: onClose,
+        style: { padding: '6px 14px', fontSize: 12, border: '1px solid #e2e8f0', borderRadius: 5, background: '#fff', color: '#64748b', cursor: 'pointer', marginRight: 8 }
+      }, 'Cancel'),
+      createElement('button', {
+        key: 'add', onClick: handleConfirm, disabled: selectedCount === 0,
+        style: {
+          padding: '6px 16px', fontSize: 12, border: 'none', borderRadius: 5, fontWeight: 700, color: '#fff',
+          cursor: selectedCount ? 'pointer' : 'default',
+          background: selectedCount ? '#6366f1' : '#c7c2ff',
+        }
+      }, selectedCount ? ('Add ' + selectedCount + ' Image' + (selectedCount > 1 ? 's' : '')) : 'Add Images'),
+    ],
+  },
+    createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+      createElement(Select, {
+        value: colId || undefined,
+        onChange: function(v) { setColId(v); },
+        placeholder: 'Select a collection…',
+        style: { width: '100%' },
+        options: collections.map(function(c) { return { value: String(c.id), label: c.name }; }),
+      }),
+      !colId
+        ? createElement('div', { style: { color: '#9ca3af', fontSize: 12, textAlign: 'center', padding: '30px 0' } }, 'Pick a collection to browse its images')
+        : loading
+          ? createElement('div', { style: { color: '#9ca3af', fontSize: 12, textAlign: 'center', padding: '30px 0' } }, 'Loading…')
+          : images.length === 0
+            ? createElement('div', { style: { color: '#9ca3af', fontSize: 12, textAlign: 'center', padding: '30px 0' } }, 'No images found for this collection')
+            : createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, maxHeight: 420, overflowY: 'auto', padding: 2 } },
+                images.map(function(im) {
+                  var isSel = !!selected[im.attachmentId];
+                  var already = !!existingIds[im.attachmentId];
+                  return createElement('div', {
+                    key: im.attachmentId,
+                    onClick: function() { if (!already) toggle(im.attachmentId); },
+                    style: { width: 110, cursor: already ? 'default' : 'pointer', opacity: already ? 0.4 : 1 }
+                  },
+                    createElement('div', {
+                      style: {
+                        width: 110, height: 110, borderRadius: 6, overflow: 'hidden', position: 'relative',
+                        background: '#f3f4f6',
+                        boxShadow: isSel ? '0 0 0 3px #6366f1' : '0 1px 3px rgba(0,0,0,0.15)',
+                      }
+                    },
+                      createElement('img', { src: im.img_url, style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' } }),
+                      isSel ? createElement('div', {
+                        style: { position: 'absolute', top: 4, right: 4, width: 18, height: 18, borderRadius: 9, background: '#6366f1', color: '#fff', fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }
+                      }, '✓') : null,
+                      already ? createElement('div', {
+                        style: { position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.6)', color: '#fff', fontSize: 9, textAlign: 'center', padding: '2px 0' }
+                      }, 'Already added') : null
+                    ),
+                    createElement('div', { style: { fontSize: 10, color: '#6b7280', marginTop: 4, textAlign: 'center', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, im.label)
+                  );
+                })
+              )
+    )
+  );
+};
+
 // ── MAIN COMPONENT ─────────────────────────────────────────────
 var Comp = function() {
   var sc = useState([]);    var canvasList     = sc[0];    var setCanvasList     = sc[1];
@@ -183,6 +569,10 @@ var Comp = function() {
   var sm = useState(false); var showModal      = sm[0];    var setShowModal      = sm[1];
   var sn = useState('');    var newName        = sn[0];    var setNewName        = sn[1];
   var sc2 = useState('');   var newColId       = sc2[0];   var setNewColId       = sc2[1];  var scl = useState([]);   var collections    = scl[0];   var setCollections    = scl[1];
+  var su = useState(false); var uploading      = su[0];    var setUploading      = su[1];
+  var sim = useState(false); var showImgMenu    = sim[0];   var setShowImgMenu    = sim[1];
+  var sbm = useState(false); var showBrowseModal = sbm[0]; var setShowBrowseModal = sbm[1];
+  var fileInputRef = useRef(null);
 
   useEffect(function() {
     runSql(CONFIG.uid_canvas,
@@ -201,49 +591,78 @@ var Comp = function() {
     var canvas = canvasList.find(function(c) { return String(c.id) === String(selectedCanvas); });
     if (!canvas) { setLoading(false); return; }
 
-    runSql(CONFIG.uid_samples + '_' + canvas.fk_collection_id,
-      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
-      "attachments.url AS img_url, attachments.filename AS img_filename " +
-      "FROM sample, t_wda3bnmr9c9, attachments " +
-      "WHERE sample.fk_collection_id = " + canvas.fk_collection_id + " " +
-      "AND t_wda3bnmr9c9.f_57nmxuosclw = sample.id " +
-      "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
-      "AND sample.status <> 'cancel' " +
-      "ORDER BY sample.name ASC, attachments.id ASC"
-    ).then(function(rows) {
+    Promise.all([
+      runSql(CONFIG.uid_samples + '_' + canvas.fk_collection_id,
+        "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
+        "attachments.url AS img_url, attachments.filename AS img_filename " +
+        "FROM sample, t_wda3bnmr9c9, attachments " +
+        "WHERE sample.fk_collection_id = " + canvas.fk_collection_id + " " +
+        "AND t_wda3bnmr9c9.f_57nmxuosclw = sample.id " +
+        "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+        "AND sample.status <> 'cancel' " +
+        "ORDER BY sample.name ASC, attachments.id ASC"
+      ),
+      fetchCanvasImages(selectedCanvas),
+      loadLayout(selectedCanvas),
+    ]).then(function(results) {
+      var sampleRows = results[0];
+      var imageRows  = results[1];
+      var saved_layout = results[2];
+
       var seen = {};
       var samples = [];
-      rows.forEach(function(r) {
+      sampleRows.forEach(function(r) {
         var sid = String(r.id);
         if (!seen[sid]) {
           seen[sid] = true;
-          samples.push({ id: sid, name: r.name, status: r.status, img_url: buildImgUrl(r.img_filename, r.img_url) });
+          samples.push({ id: sid, type: 'sample', name: r.name, status: r.status, img_url: buildImgUrl(r.img_filename, r.img_url) });
         }
       });
 
-      loadLayout(selectedCanvas).then(function(saved_layout) {
-        var layoutMap = {};
-        if (saved_layout) {
-          saved_layout.forEach(function(l) { layoutMap[String(l.id)] = l; });
-        }
+      var images = imageRows.map(function(r) {
+        return {
+          id: String(r.id), type: 'image',
+          name: r.title || r.filename || 'image',
+          img_url: buildImgUrl(r.filename, r.url),
+        };
+      });
 
-        // Position: use saved if exists, else stack on right tray column
-        var trayIndex = 0;
-        var positioned = samples.map(function(s) {
-          var pos = layoutMap[String(s.id)];
-          if (pos) {
-            return Object.assign({}, s, { x: pos.x, y: pos.y, w: pos.w, h: pos.h, z: pos.z || 1 });
-          } else {
-            var tx = TRAY_X;
-            var ty = 20 + trayIndex * (THUMB_H + 12);
-            trayIndex++;
-            return Object.assign({}, s, { x: tx, y: ty, w: THUMB_W, h: THUMB_H, z: trayIndex });
-          }
+      var layoutMap = {};
+      if (saved_layout) {
+        saved_layout.forEach(function(l) { layoutMap[String(l.id)] = l; });
+      }
+
+      // Position: use saved if exists, else stack in the left tray column.
+      // Samples and manual images share one tray stacking sequence.
+      var trayIndex = 0;
+      function withPosition(it, defaultW, defaultH) {
+        var pos = layoutMap[it.id];
+        if (pos) {
+          return Object.assign({}, it, { x: pos.x, y: pos.y, w: pos.w, h: pos.h, z: pos.z || 1 });
+        }
+        var tx = TRAY_X;
+        var ty = 20 + trayIndex * (THUMB_H + 12);
+        trayIndex++;
+        return Object.assign({}, it, { x: tx, y: ty, w: defaultW, h: defaultH, z: trayIndex });
+      }
+
+      var positionedSamples = samples.map(function(s) { return withPosition(s, THUMB_W, THUMB_H); });
+      var positionedImages  = images.map(function(im) { return withPosition(im, THUMB_W, THUMB_H); });
+
+      // Text comments have no backing table row — their full content lives
+      // only in the saved layout JSON, so pull them straight from there.
+      var texts = (saved_layout || [])
+        .filter(function(l) { return l.type === 'text'; })
+        .map(function(l) {
+          return {
+            id: l.id, type: 'text',
+            text: l.text, color: l.color, fontSize: l.fontSize, bg: l.bg,
+            x: l.x, y: l.y, w: l.w, h: l.h, z: l.z || 1,
+          };
         });
 
-        setItems(positioned);
-        setLoading(false);
-      });
+      setItems(positionedSamples.concat(positionedImages, texts));
+      setLoading(false);
     });
   }, [selectedCanvas]);
 
@@ -253,6 +672,20 @@ var Comp = function() {
     });
     setSaved(false);
   }, []);
+
+  var handleDelete = useCallback(function(id) {
+    setItems(function(prev) {
+      var it = prev.find(function(x) { return x.id === id; });
+      if (it && it.type === 'image' && selectedCanvas) {
+        unlinkImageFromCanvas(selectedCanvas, it.id).catch(function(e) {
+          console.error('Failed to unlink image from canvas:', e);
+        });
+      }
+      return prev.filter(function(x) { return x.id !== id; });
+    });
+    setSaved(false);
+    setFocused(function(f) { return f === id ? null : f; });
+  }, [selectedCanvas]);
 
   function handleSave() {
     if (!selectedCanvas) return;
@@ -268,7 +701,9 @@ var Comp = function() {
         return Object.assign({}, it, {
           x: TRAY_X,
           y: 20 + i * (THUMB_H + 12),
-          w: THUMB_W, h: THUMB_H, z: i + 1,
+          w: it.type === 'sample' ? THUMB_W : it.w,
+          h: it.type === 'sample' ? THUMB_H : it.h,
+          z: i + 1,
         });
       });
     });
@@ -309,9 +744,123 @@ var Comp = function() {
     }
   }
 
+  function handleAddImageMenuToggle() {
+    if (!selectedCanvas || uploading) return;
+    setShowImgMenu(function(v) { return !v; });
+  }
+
+  function handleChooseUpload() {
+    setShowImgMenu(false);
+    if (fileInputRef.current) fileInputRef.current.click();
+  }
+
+  function handleChooseBrowse() {
+    setShowImgMenu(false);
+    setShowBrowseModal(true);
+  }
+
+  function handleFileSelected(e) {
+    var file = e.target.files && e.target.files[0];
+    e.target.value = ''; // allow re-selecting the same file later
+    if (!file || !selectedCanvas) return;
+    var canvasId = selectedCanvas;
+
+    setUploading(true);
+    Promise.resolve()
+      .then(function() { return uploadAttachment(file); })
+      .then(function(att) {
+        return linkImageToCanvas(canvasId, att.id).then(function() { return att; });
+      })
+      .then(function(att) {
+        var newItem = {
+          id: String(att.id),
+          type: 'image',
+          name: att.title || att.filename || file.name,
+          img_url: buildImgUrl(att.filename, att.url),
+          x: TRAY_X, y: 20, w: THUMB_W, h: THUMB_H, z: nextZ(),
+        };
+        setItems(function(prev) { return prev.concat([newItem]); });
+        setFocused(newItem.id);
+        setSaved(false);
+      })
+      .catch(function(err) {
+        console.error('Image upload failed:', err);
+        Modal.error({
+          title: 'Upload failed',
+          content: (err && err.message) || 'Could not upload the image. Check the console for details.',
+        });
+      })
+      .then(function() { setUploading(false); });
+  }
+
+  // Links already-existing attachments (picked from the browse modal) into
+  // canvas.images, one at a time (sequential awaits, consistent with the
+  // rest of this codebase's write patterns).
+  async function linkChosenImages(canvasId, chosen) {
+    var linked = [];
+    for (var i = 0; i < chosen.length; i++) {
+      var im = chosen[i];
+      try {
+        await linkImageToCanvas(canvasId, im.attachmentId);
+        linked.push(im);
+      } catch (e) {
+        console.error('Failed to link image ' + im.attachmentId + ' to canvas:', e);
+      }
+    }
+    return linked;
+  }
+
+  function handleBrowseConfirm(chosen) {
+    setShowBrowseModal(false);
+    if (!chosen || !chosen.length || !selectedCanvas) return;
+    var canvasId = selectedCanvas;
+
+    setUploading(true);
+    linkChosenImages(canvasId, chosen)
+      .then(function(linked) {
+        if (!linked.length) {
+          Modal.error({ title: 'Add failed', content: 'Could not add the selected image(s). Check the console for details.' });
+          return;
+        }
+        var newItems = linked.map(function(im) {
+          return {
+            id: String(im.attachmentId), type: 'image',
+            name: im.title || im.label, img_url: im.img_url,
+            x: TRAY_X, y: 20, w: THUMB_W, h: THUMB_H, z: nextZ(),
+          };
+        });
+        setItems(function(prev) { return prev.concat(newItems); });
+        setSaved(false);
+      })
+      .then(function() { setUploading(false); });
+  }
+
+  function handleAddText() {
+    if (!selectedCanvas) return;
+    var newItem = {
+      id: newItemId('txt'),
+      type: 'text',
+      text: '',
+      color: '#1e293b',
+      fontSize: 14,
+      bg: '#fff9db',
+      x: TRAY_X, y: 20, w: 180, h: 100, z: nextZ(),
+    };
+    setItems(function(prev) { return prev.concat([newItem]); });
+    setFocused(newItem.id);
+    setSaved(false);
+  }
+
   return createElement('div', {
     style: { display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui,sans-serif' }
   },
+
+    // Hidden file input for manual image uploads
+    createElement('input', {
+      ref: fileInputRef, type: 'file', accept: 'image/*',
+      style: { display: 'none' },
+      onChange: handleFileSelected,
+    }),
 
     // New canvas modal
     createElement(Modal, {
@@ -343,6 +892,19 @@ var Comp = function() {
       )
     ),
 
+    // Browse-existing-images modal
+    createElement(BrowseImagesModal, {
+      open: showBrowseModal,
+      collections: collections,
+      existingIds: (function() {
+        var map = {};
+        items.forEach(function(it) { if (it.type === 'image') map[it.id] = true; });
+        return map;
+      })(),
+      onClose: function() { setShowBrowseModal(false); },
+      onConfirm: handleBrowseConfirm,
+    }),
+
     // Toolbar
     createElement('div', {
       style: {
@@ -361,9 +923,44 @@ var Comp = function() {
         options: canvasList.map(function(c) { return { value: String(c.id), label: c.name }; }),
       }),
       createElement('span', { style: { fontSize: 11, color: '#9ca3af' } },
-        selectedCanvas ? items.length + ' samples · drag to arrange · tray on right' : ''
+        selectedCanvas ? items.length + ' items · drag to arrange · tray on left' : ''
       ),
       createElement('div', { style: { flex: 1 } }),
+      selectedCanvas ? createElement('div', { style: { position: 'relative' } },
+        createElement('button', {
+          onClick: handleAddImageMenuToggle,
+          disabled: uploading,
+          style: {
+            padding: '5px 12px', fontSize: 11, cursor: uploading ? 'default' : 'pointer',
+            border: '1px solid #e2e8f0', borderRadius: 5, background: '#fff',
+            color: uploading ? '#c8c3bc' : '#64748b',
+          }
+        }, uploading ? 'Uploading…' : '+ Image ▾'),
+        showImgMenu ? createElement('div', {
+          onClick: function() { setShowImgMenu(false); },
+          style: { position: 'fixed', inset: 0, zIndex: 998 }
+        }) : null,
+        showImgMenu ? createElement('div', {
+          style: {
+            position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 999,
+            background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.12)', minWidth: 190, overflow: 'hidden',
+          }
+        },
+          createElement('div', {
+            onClick: handleChooseUpload,
+            style: { padding: '9px 12px', fontSize: 12, cursor: 'pointer', color: '#374151', borderBottom: '1px solid #f1f5f9' }
+          }, '⬆ Upload New Image'),
+          createElement('div', {
+            onClick: handleChooseBrowse,
+            style: { padding: '9px 12px', fontSize: 12, cursor: 'pointer', color: '#374151' }
+          }, '🗂 Choose from Collection')
+        ) : null
+      ) : null,
+      selectedCanvas ? createElement('button', {
+        onClick: handleAddText,
+        style: { padding: '5px 12px', fontSize: 11, cursor: 'pointer', border: '1px solid #e2e8f0', borderRadius: 5, background: '#fff', color: '#64748b' }
+      }, '+ Text') : null,
       selectedCanvas ? createElement('button', {
         onClick: handleResetTray,
         style: { padding: '5px 12px', fontSize: 11, cursor: 'pointer', border: '1px solid #e2e8f0', borderRadius: 5, background: '#fff', color: '#64748b' }
@@ -452,11 +1049,21 @@ var Comp = function() {
                 'Select a canvas to begin'
               )
             : items.map(function(item) {
+                if (item.type === 'text') {
+                  return createElement(TextTile, {
+                    key: item.id, item: item,
+                    isFocused: focused === item.id,
+                    onUpdate: handleUpdate,
+                    onFocus: setFocused,
+                    onDelete: handleDelete,
+                  });
+                }
                 return createElement(ImageTile, {
                   key: item.id, item: item,
                   isFocused: focused === item.id,
                   onUpdate: handleUpdate,
                   onFocus: setFocused,
+                  onDelete: handleDelete,
                 });
               })
       )
