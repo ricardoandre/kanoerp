@@ -1,336 +1,55 @@
-const React = ctx.libs.React;
-const { useState } = React;
-const { Modal } = ctx.libs.antd;
+// =====================================================
+// act_match_production — thin JSAction shell → ui_match_production.
+//
+// Table-level bulk action on production_result. Attach to that list
+// block's toolbar (multi-select rows first).
+//
+// CONVERTED (2026-07): this JSAction used to contain a full, standalone
+// copy of the matching logic (raw ctx.sql, per-product-code query loop).
+// A separate, newer, resource-based, reusable version of the exact same
+// feature already existed as ui_match_production.js — documented there as
+// meant to be shared with ui_result_import/ui_result_bulk_add — but this
+// JSAction wasn't actually calling it, so the two had drifted (this one
+// on the slower N+1 query pattern the shared version already fixed).
+// Converted to the standard thin-shell pattern used by every other
+// act_production_* JSAction, so there's exactly one implementation to
+// maintain going forward.
+// =====================================================
 
-// =====================
-// GET SELECTED ROWS
-// =====================
+const _codeCache = {};
+async function loadCode(name) {
+  if (_codeCache[name]) return _codeCache[name];
+  const res = await ctx.api.resource('source_code').list({
+    filter: { name: name },
+    fields: ['code'],
+    pageSize: 1,
+  });
+  const rows = (res && res.data && res.data.data) || [];
+  const src = (rows[0] && rows[0].code) || '';
+  if (!src) throw new Error("source_code row '" + name + "' was not found or is empty.");
+  const { React, antd, dayjs } = ctx.libs;
+  _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+  return _codeCache[name];
+}
+
 const selectedRows = ctx.resource?.getSelectedRows?.() || [];
-
 if (!selectedRows.length) {
   ctx.message.warning('Please select at least one production result record.');
-  return;
-}
-
-const ids = selectedRows.map(r => r.id).filter(Boolean);
-if (!ids.length) {
-  ctx.message.warning('Selected rows have no valid ID.');
-  return;
-}
-
-// =====================
-// SQL HELPERS
-// =====================
-async function runSql(uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }).then(r => r || []).catch(() => []);
-}
-
-async function execSql(uid, sql) {
-  if (ctx.flowSettingsEnabled) {
-    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
-  }
-  return ctx.sql.runById(uid, { type: 'exec', dataSourceKey: 'main' }).catch(() => null);
-}
-
-// =====================
-// FETCH DATA
-// =====================
-const idList = ids.map(id => `'${id}'`).join(',');
-
-const resultRows = await runSql('pr_match_results',
-  `SELECT production_result.id, production_result.import_product_code, ` +
-  `production_result.quantity, production_result.remarks, ` +
-  `production_result.shipment_date, production_result.checking_pic, ` +
-  `production_result.is_permakan, production_result.fk_production_id, ` +
-  `production_result.fk_sku_option_id, ` +
-  `sku_option.display AS sku_display, sku_option.sort AS sku_sort, ` +
-  `product.name AS product_name ` +
-  `FROM production_result ` +
-  `LEFT JOIN sku_option ON production_result.fk_sku_option_id = sku_option.id ` +
-  `LEFT JOIN product ON production_result.import_product_code = product.code ` +
-  `WHERE production_result.id IN (${idList}) ` +
-  `ORDER BY production_result.shipment_date, production_result.import_product_code, sku_option.sort`
-);
-
-// NOTE: we continue even if resultRows is empty — modal will show a warning inside
-
-const productCodes = [...new Set(resultRows.map(r => r.import_product_code).filter(Boolean))];
-const productionMap = {};
-for (const code of productCodes) {
-  productionMap[code] = await runSql('pr_match_prod_' + code,
-    `SELECT production.id, production.production_ref, production.status, ` +
-    `production.est_production_start, production.est_production_finish, ` +
-    `konveksi.name AS konveksi_name, product.name AS product_name ` +
-    `FROM production, konveksi, product ` +
-    `WHERE production.fk_product_code = '${code}' ` +
-    `AND production.status <> 'planning' AND production.status <> 'done' ` +
-    `AND production.fk_konveksi_code = konveksi.code ` +
-    `AND production.fk_product_code = product.code ` +
-    `ORDER BY production.est_production_finish`
-  );
-}
-
-const allProductionIds = Object.values(productionMap).flat().map(p => p.id);
-const variantMap = {};
-for (const prodId of allProductionIds) {
-  const rows = await runSql('pr_match_var_' + prodId,
-    `SELECT fk_sku_option_id FROM production_quantity_details ` +
-    `WHERE fk_production_id = '${prodId}'`
-  );
-  variantMap[prodId] = new Set(rows.map(r => String(r.fk_sku_option_id)));
-}
-
-// =====================
-// COMPONENT
-// =====================
-function MatcherContent() {
-  const initSelections = {};
-  resultRows.forEach(r => {
-    const options = productionMap[r.import_product_code] || [];
-    initSelections[r.id] = options.length === 1 ? options[0].id : (r.fk_production_id || null);
-  });
-
-  const [selections, setSelections] = useState(initSelections);
-  const [applying, setApplying] = useState(false);
-  const [done, setDone] = useState(false);
-
-  function handleClose() {
-    Modal.destroyAll();
-  }
-
-  function toggleSelection(resultId, productionId) {
-    setSelections(prev => ({
-      ...prev,
-      [resultId]: prev[resultId] === productionId ? null : productionId
-    }));
-  }
-
-  async function applyAll() {
-    const toUpdate = Object.entries(selections).filter(([, prodId]) => prodId !== null);
-    if (!toUpdate.length) { ctx.message.warning('No matches selected.'); return; }
-    setApplying(true);
-    let ok = 0;
-    for (const [resultId, prodId] of toUpdate) {
-      const res = await execSql('pr_upd_' + resultId,
-        `UPDATE production_result SET fk_production_id = '${prodId}' WHERE id = '${resultId}'`
-      );
-      if (res !== null) ok++;
-    }
-
-    // Update matched productions: if status = cutting or production → set to qc
-    const uniqueProdIds = [...new Set(Object.values(selections).filter(Boolean))];
-    for (const prodId of uniqueProdIds) {
-      await execSql('pr_status_' + prodId,
-        `UPDATE production SET status = 'qc' WHERE id = '${prodId}' AND status IN ('cutting', 'production')`
-      );
-    }
-
-    const failed = toUpdate.length - ok;
-    Modal.destroyAll();
-    if (failed === 0) {
-      ctx.notification.success({
-        message: 'Matching Complete',
-        description: `${ok} production result(s) linked. Eligible productions moved to QC.`,
-        duration: 6,
+} else {
+  const ids = selectedRows.map(r => r.id).filter(Boolean);
+  if (!ids.length) {
+    ctx.message.warning('Selected rows have no valid ID.');
+  } else {
+    try {
+      const MP = await loadCode('ui_match_production');
+      await MP.openMatchModal({
+        ctx: ctx,
+        ids: ids,
+        onDone: () => { if (ctx.resource?.refresh) ctx.resource.refresh(); },
       });
-    } else {
-      ctx.notification.warning({
-        message: 'Matching Partial',
-        description: `${ok} record(s) updated, ${failed} failed. Please check and retry the failed rows.`,
-        duration: 8,
-      });
+    } catch (e) {
+      console.error('act_match_production error:', e);
+      ctx.message.error('Failed to open Match Production: ' + ((e && e.message) || 'unknown error'));
     }
   }
-
-  const matchedCount = Object.values(selections).filter(v => v !== null).length;
-  const unmatched = resultRows.length - matchedCount;
-
-  // Check if any currently selected match has an invalid variant
-  const hasInvalidSelections = resultRows.some(row => {
-    const selectedProdId = selections[row.id];
-    if (!selectedProdId) return false;
-    const validVariants = variantMap[selectedProdId] || new Set();
-    return validVariants.size > 0 && !validVariants.has(String(row.fk_sku_option_id));
-  });
-
-  function fmt(d) { return d ? String(d).substring(0, 10) : '-'; }
-
-  const th = {
-    background: '#fafafa', borderBottom: '2px solid #e8e8e8',
-    padding: '7px 8px', fontWeight: 600, textAlign: 'left', fontSize: 11, color: '#555'
-  };
-  const td = (alt) => ({
-    borderBottom: '1px solid #f0f0f0', padding: '8px',
-    verticalAlign: 'top', fontSize: 12, background: alt ? '#fafafa' : '#fff'
-  });
-  const optBox = (sel) => ({
-    display: 'flex', alignItems: 'flex-start', gap: 6,
-    padding: '5px 6px', borderRadius: 4, marginBottom: 4,
-    border: sel ? '1px solid #86efac' : '1px solid #e8e8e8',
-    cursor: 'pointer', background: sel ? '#f0fdf4' : '#fff'
-  });
-
-  // Empty state
-  if (!resultRows.length) {
-    return React.createElement('div', { style: { fontFamily: 'system-ui,sans-serif', padding: '12px 0' } },
-      React.createElement('div', { style: { color: '#f59e0b', marginBottom: 16, fontSize: 13 } },
-        '⚠ No production result records could be loaded for the selected rows.'
-      ),
-      React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end' } },
-        React.createElement('button', {
-          onClick: handleClose,
-          style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }
-        }, 'Close')
-      )
-    );
-  }
-
-  return React.createElement('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 12 } },
-
-    // summary
-    React.createElement('div', { style: { color: '#888', fontSize: 11, marginBottom: 12 } },
-      `${resultRows.length} result(s) · ${matchedCount} matched · ${unmatched} unmatched`
-    ),
-
-    // table
-    React.createElement('div', { style: { overflowX: 'auto' } },
-      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' } },
-        React.createElement('colgroup', null,
-          React.createElement('col', { style: { width: '90px' } }),
-          React.createElement('col', { style: { width: '150px' } }),
-          React.createElement('col', { style: { width: '55px' } }),
-          React.createElement('col', { style: { width: '120px' } }),
-          React.createElement('col', { style: { width: 'auto' } })
-        ),
-        React.createElement('thead', null,
-          React.createElement('tr', null,
-            ['Shipment Date','Product','Qty','Remarks','Production Match'].map(l =>
-              React.createElement('th', { key: l, style: th }, l)
-            )
-          )
-        ),
-        React.createElement('tbody', null,
-          resultRows.map((row, i) => {
-            const options = productionMap[row.import_product_code] || [];
-            const selected = selections[row.id];
-            const c = td(i % 2 === 1);
-
-            return React.createElement('tr', { key: row.id },
-
-              React.createElement('td', { style: c }, fmt(row.shipment_date)),
-
-              React.createElement('td', { style: c },
-                React.createElement('div', { style: { fontWeight: 600, fontSize: 12 } }, row.import_product_code || '-'),
-                React.createElement('div', { style: { fontSize: 11, color: '#888', marginTop: 2 } },
-                  [row.product_name, row.sku_display].filter(Boolean).join(' — ')
-                )
-              ),
-
-              React.createElement('td', { style: { ...c, textAlign: 'right' } }, row.quantity ?? '-'),
-
-              React.createElement('td', { style: c },
-                row.checking_pic
-                  ? React.createElement('div', { style: { fontSize: 11, color: '#555' } }, '👤 ' + row.checking_pic)
-                  : null,
-                row.is_permakan
-                  ? React.createElement('span', { style: { display: 'inline-block', background: '#fef2f2', color: '#ef4444', border: '1px solid #fca5a5', borderRadius: 3, padding: '0 5px', fontSize: 10, fontWeight: 600, marginTop: 3 } }, 'PERMAK')
-                  : null,
-                row.remarks
-                  ? React.createElement('div', { style: { fontSize: 10, color: '#aaa', marginTop: 3 } }, row.remarks)
-                  : null
-              ),
-
-              React.createElement('td', { style: c },
-                options.length === 0
-                  ? React.createElement('span', { style: { color: '#bbb', fontSize: 11, fontStyle: 'italic' } }, '— no active production found')
-                  : options.map(opt => {
-                      const isSel = selected === opt.id;
-                      const wasLinked = row.fk_production_id === opt.id;
-                      const validVariants = variantMap[opt.id] || new Set();
-                      const invalidVariant = validVariants.size > 0 && !validVariants.has(String(row.fk_sku_option_id));
-
-                      return React.createElement('div', {
-                        key: opt.id,
-                        style: optBox(isSel),
-                        onClick: () => toggleSelection(row.id, opt.id)
-                      },
-                        React.createElement('input', {
-                          type: 'checkbox', checked: isSel, readOnly: true,
-                          style: { marginTop: 2, cursor: 'pointer', flexShrink: 0 }
-                        }),
-                        React.createElement('div', { style: { flex: 1 } },
-                          React.createElement('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4 } },
-                            React.createElement('span', { style: { fontWeight: 600, fontSize: 12, color: '#166534' } },
-                              opt.production_ref || ('ID: ' + opt.id)
-                            ),
-                            wasLinked
-                              ? React.createElement('span', { style: { color: '#3b82f6', fontSize: 10 } }, '(linked)')
-                              : null,
-                            invalidVariant
-                              ? React.createElement('span', { style: { background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 6px', fontSize: 10, fontWeight: 600 } }, '⚠ invalid variant')
-                              : null
-                          ),
-                          React.createElement('div', { style: { fontSize: 10, color: '#888', marginTop: 1 } },
-                            [opt.konveksi_name, opt.product_name, opt.status].filter(Boolean).join(' · ')
-                          ),
-                          (opt.est_production_start || opt.est_production_finish)
-                            ? React.createElement('div', { style: { fontSize: 10, color: '#aaa', marginTop: 1 } },
-                                [
-                                  opt.est_production_start ? 'start ' + fmt(opt.est_production_start) : null,
-                                  opt.est_production_finish ? 'finish ' + fmt(opt.est_production_finish) : null
-                                ].filter(Boolean).join(' → ')
-                              )
-                            : null
-                        )
-                      );
-                    })
-              )
-            );
-          })
-        )
-      )
-    ),
-
-    // footer
-    React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14, paddingTop: 10, borderTop: '1px solid #eee' } },
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-        React.createElement('span', { style: { fontSize: 11, color: unmatched > 0 ? '#f59e0b' : '#22c55e' } },
-          unmatched > 0 ? `⚠ ${unmatched} not yet matched` : `✓ All matched`
-        ),
-        hasInvalidSelections
-          ? React.createElement('span', { style: { fontSize: 11, color: '#dc2626' } },
-              '✕ Fix invalid variant warnings before applying'
-            )
-          : null
-      ),
-      React.createElement('div', { style: { display: 'flex', gap: 8 } },
-        React.createElement('button', {
-          onClick: handleClose,
-          style: { padding: '5px 14px', fontSize: 12, cursor: 'pointer', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }
-        }, 'Cancel'),
-        React.createElement('button', {
-          onClick: applyAll,
-          disabled: applying || done || hasInvalidSelections,
-          style: { padding: '5px 16px', fontSize: 12, cursor: applying || done || hasInvalidSelections ? 'not-allowed' : 'pointer', border: 'none', borderRadius: 4, fontWeight: 600, color: '#fff', background: done ? '#86efac' : (applying || hasInvalidSelections) ? '#d9d9d9' : '#22c55e' }
-        }, applying ? 'Applying…' : done ? 'Done ✓' : 'Apply All Matching')
-      )
-    )
-  );
 }
-
-// =====================
-// OPEN MODAL — using Modal.success with hidden ok button so antd doesn't intercept clicks
-// =====================
-Modal.confirm({
-  title: 'Match Production Results → Production',
-  width: 900,
-  icon: null,
-  content: React.createElement(MatcherContent),
-  okButtonProps: { style: { display: 'none' } },
-  cancelButtonProps: { style: { display: 'none' } },
-  maskClosable: true,
-  onCancel() {},
-});
