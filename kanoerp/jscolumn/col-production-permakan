@@ -1,6 +1,8 @@
 const prod_id = ctx.record?.id ?? "";
 
-
+if (!prod_id) {
+  ctx.element.innerHTML = '';
+} else {
 
 // query 1: total permakan
 ctx.sql.save({
@@ -80,3 +82,5 @@ ctx.sql.save({
 }).catch(err => {
   ctx.element.innerHTML = 'SQL ERROR: ' + err.message;
 });
+
+}
