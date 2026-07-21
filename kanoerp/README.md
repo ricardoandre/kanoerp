@@ -182,20 +182,40 @@ If a solution requires one of the "blocked" items below, it is wrong — find an
   much bigger problem — see the permissions bullet immediately below, which was
   the actual root cause of an intermittent load failure originally (wrongly)
   attributed to this one.**
-- **`ctx.sql.save()`/`ctx.sql.runById()` are admin/root-gated and silently fail for
-  non-admin roles.** *(Learned 2026-07, the hard way — first suspected as a
-  concurrency race per the bullet above, actually a permissions gap.)* No thrown
-  error, just empty results (or, if wrapped in the §4.2 `runSql` template, a
-  swallowed rejection that looks like "no data found"). Confirmed independently in
-  three separate files (`product_measurement.js`, `ui_product_measurement_add.js`,
-  `ui_product_measurement_edit.js`) before this was promoted here — **use
-  `ctx.api.resource()` (`.list()` / `.get()` / `.create()` / `.update()` /
-  `.destroy()`, with the `fetchAllPages`/`fetchByIn` batching helpers in §4) for ALL
-  reads and writes in any component non-admin users will touch. Never raw `ctx.sql`
-  for anything user-facing.** The §4.2 `runSql`/`execSql` template isn't deprecated
-  outright — it may still suit genuine admin-only/dev-tool contexts (e.g.
-  `view_database_schema_dump`) — but stop treating it as a general-purpose data-access
-  pattern for regular features.
+- **Only `ctx.api.resource('fields')` (the REST endpoint for that one
+  meta-collection) is confirmed admin-gated — raw `ctx.sql` is NOT gated at
+  all, not even against `fields` directly.** *(Corrected 2026-07 — a
+  previous version of this README claimed raw `ctx.sql.save()`/`runById()`
+  were broadly admin/root-gated for non-admin roles. That was wrong, the
+  same shape of mistake as the earlier `window.*` correction: a narrow, real
+  bug — `ctx.api.resource('fields')` throwing "No permissions" for a
+  non-admin user while building `ui_production_addmarker.js` — got
+  generalized into a much broader claim that was never actually tested.
+  Confirmed with a throwaway diagnostic jblock (`probe_sql_gating.js` in
+  session history) run under BOTH an admin and a non-admin account:
+  identical results either way — plain `ctx.sql` against an ordinary table
+  works, `ctx.sql` directly against the `fields` table works, only
+  `ctx.api.resource('fields')` specifically returns 403.)*
+  **Practical implication:** the large `ctx.sql` → `ctx.api.resource()`
+  migrations done across `ui_production_addmarker.js`, `ui_production_edit.js`,
+  `ui_production_detail.js`, `ui_production_material_detail.js`, and
+  `view_sample_details.js` this session were not wrong to do (`ctx.api.resource()`
+  is still a perfectly good pattern, and none of it broke anything) — but
+  they were not *necessary* for the reason originally given. **Don't cite
+  "ctx.sql is admin-gated" as a reason to migrate any further file.** The
+  one thing that IS still real and worth avoiding: calling
+  `ctx.api.resource('fields')` (or presumably `collections`/`roles`,
+  untested) to resolve a `belongsTo` relation's field name at runtime
+  (the `getRels()` pattern) — this still throws for non-admin users. Fix
+  that specific pattern by hardcoding the relation name once confirmed from
+  the schema dump (§4.1), same as `MARKER_RELS` in
+  `ui_production_addmarker.js` — or, per this correction, an equally valid
+  alternative is querying `fields` via raw `ctx.sql` instead of
+  `ctx.api.resource`, since that path is confirmed to work for every role.
+  **Not yet tested**: whether `ctx.api.resource('collections')`/`('roles')`
+  are gated the same way as `('fields')`, or whether `ctx.dataSourceManager`
+  (§4's introspection API) has any role-based restriction. Don't assume
+  either way — test with the same throwaway-jblock technique first.
 - **NocoBase's `fields` meta-collection (and likely other system collections like
   `collections`/`roles`) is ALSO admin-gated — even via `ctx.api.resource()`, not
   just raw SQL.** *(Learned 2026-07, building `ui_production_addmarker.js`.)* The
