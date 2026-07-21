@@ -1,9 +1,13 @@
 const prod_id = ctx.record?.id ?? "";
 
+if (!prod_id) {
+  ctx.element.innerHTML = '';
+} else {
+
 // 1st query: sku_option labels
 ctx.sql.save({
   uid: "opt_query",
-  sql: "SELECT id, display FROM sku_option",
+  sql: "SELECT id, display, sort FROM sku_option",
   dataSourceKey: "main"
 }).then(() => {
   return ctx.sql.runById("opt_query", {
@@ -57,15 +61,23 @@ ctx.sql.save({
         });
       }).then(function (qcResults) {
 
-        const sorted = [...(details || [])].sort((a, b) => {
-          const sortA = a.option?.sort ?? 0;
-          const sortB = b.option?.sort ?? 0;
-          return sortA - sortB;
-        });
-
         const optionMap = {};
+        const sortMap = {};
         (options || []).forEach(opt => {
           optionMap[String(opt.id)] = opt.display;
+          sortMap[String(opt.id)] = opt.sort ?? 0;
+        });
+
+        // FIX: details rows come from a flat `SELECT *` (no join), so they
+        // never had an `.option` relation to read `.sort` off of —
+        // a.option?.sort was always undefined, making this sort a
+        // silent no-op (every row compared as 0). Look the sort value up
+        // from the already-fetched sku_option list instead, keyed by
+        // fk_sku_option_id, same as optionMap/resultMap/qcMap below.
+        const sorted = [...(details || [])].sort((a, b) => {
+          const sortA = sortMap[String(a.fk_sku_option_id)] ?? 0;
+          const sortB = sortMap[String(b.fk_sku_option_id)] ?? 0;
+          return sortA - sortB;
         });
 
         const resultMap = {};
@@ -125,3 +137,5 @@ ctx.sql.save({
 }).catch(err => {
   ctx.element.innerHTML = 'SQL ERROR: ' + err.message;
 });
+
+}
