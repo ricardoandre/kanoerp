@@ -15,6 +15,18 @@
 //   MaterialEditDrawer({ open, pmId, onClose, onSaved })
 //       — self-contained material edit drawer (self-fetches record + options).
 //
+// 2026-07 MIGRATION: every data-layer function moved off raw ctx.sql onto
+// ctx.api.resource() (fetchAllPages/fetchByIn) — same fix already applied to
+// ui_production_detail.js / ui_production_edit.js / ui_production_addmarker.js
+// (README §3 — ctx.sql is admin/root-gated, silently fails for non-admin
+// roles). `updateMaterial` was already on ctx.api.resource() and is
+// unchanged. `fetchProductImage` no longer introspects the `fields`
+// meta-collection — uses `appends: ['image']` instead, same fix as
+// ui_production_detail.js. All rendering components (MaterialSummary,
+// MaterialNeed, MaterialOutSummaryBox, MaterialOutDetailsSection,
+// MaterialDetailBody, ProductionMaterialDetailDrawer, MaterialEditDrawer)
+// are UNCHANGED — only the data-fetching functions above them were rewritten.
+//
 // Button vs. tag convention (kept consistent with ui_material_out):
 //   clickable actions  → solid fill, white text, no border, subtle shadow (BTN_* below)
 //   status/type tags   → soft tinted background, no border, no shadow, cursor default
@@ -25,15 +37,45 @@ const { Drawer, Dropdown, Select, DatePicker, InputNumber, Spin } = antd;
 const ce = React.createElement;
 const { useState, useEffect } = React;
 
-// this row composes another shared row → its own loader (ctx is injected)
+// ── resource-based read helpers (non-admin-safe), same pattern used
+// throughout the rest of this codebase ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function chunk(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, 150);
+  return batches.reduce(function (p, batch) {
+    return p.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter })).then(rows => acc.concat(rows));
+    });
+  }, Promise.resolve([]));
+}
+
+// this row composes another shared row → its own loader (resource-based, non-admin-safe)
 const _codeCache = {};
 function loadCode(name) {
   if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
-  const uid = 'code_' + name;
-  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(rows => {
-      const src = (rows && rows[0] && rows[0].code) || '';
+  return ctx.api.resource('source_code').list({ filter: { name: name }, fields: ['code'], pageSize: 1 })
+    .then(function (res) {
+      const rows = (res && res.data && res.data.data) || [];
+      const src = (rows[0] && rows[0].code) || '';
       _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
       return _codeCache[name];
     });
@@ -62,12 +104,6 @@ const statusBg = s => statusColor(s) + '1a';
 const statusLabel = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : '—';
 function isFabric(t) { return String(t || '').toLowerCase() === 'fabric'; }
 
-// ── helpers ──
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
-}
 const num = v => Number(v == null ? 0 : v);
 function fmtDateNumeric(d) { if (!d) return ''; const p = dayjs(d); return p.isValid() ? p.format('DD/MM/YYYY') : ''; }
 const M_TO_YARD = 1.0936;
@@ -120,53 +156,78 @@ const MaterialDetailStyles = () => ce('style', null, PMD_CSS);
 
 // ── data ──
 function fetchPmHeader(pmId) {
-  return runSql('pmd_hdr_' + pmId,
-    "SELECT pm.id AS id, pm.status AS status, pm.shipment_date AS shipment_date, pm.quantity_need AS quantity_need, " +
-    "  pm.fk_material_details_code AS material_code, pm.fk_production_id AS production_id, " +
-    "  raw_material.type AS material_type, raw_material.default_content AS default_content, " +
-    "  production.production_ref AS production_ref, production.planning_rol AS planning_rol, " +
-    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
-    "FROM production_material pm " +
-    "JOIN production ON pm.fk_production_id = production.id " +
-    "JOIN product  ON production.fk_product_code  = product.code " +
-    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
-    "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
-    "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
-    "WHERE pm.id = '" + pmId + "'"
-  ).then(r => r[0] || null);
+  return fetchAllPages('production_material', {
+    filter: { id: pmId },
+    fields: ['id', 'status', 'shipment_date', 'quantity_need', 'fk_material_details_code', 'fk_production_id'],
+    appends: ['material_details', 'production'],
+    pageSize: 1,
+  }).then(function (rows) {
+    const pm = rows[0];
+    if (!pm) return null;
+    const md = pm.material_details || {};
+    const prod = pm.production || {};
+    return Promise.all([
+      md.fk_material_code ? fetchAllPages('raw_material', { filter: { code: md.fk_material_code }, fields: ['type', 'default_content'], pageSize: 1 }) : Promise.resolve([]),
+      prod.fk_product_code ? fetchAllPages('product', { filter: { code: prod.fk_product_code }, fields: ['code', 'name'], pageSize: 1 }) : Promise.resolve([]),
+      prod.fk_konveksi_code ? fetchAllPages('konveksi', { filter: { code: prod.fk_konveksi_code }, fields: ['name'], pageSize: 1 }) : Promise.resolve([]),
+    ]).then(function (r) {
+      const rm = r[0][0] || {};
+      const product = r[1][0] || {};
+      const konv = r[2][0] || {};
+      return {
+        id: pm.id, status: pm.status, shipment_date: pm.shipment_date, quantity_need: pm.quantity_need,
+        material_code: pm.fk_material_details_code, production_id: pm.fk_production_id,
+        material_type: rm.type, default_content: rm.default_content,
+        production_ref: prod.production_ref, planning_rol: prod.planning_rol,
+        product_code: product.code, product_name: product.name, konveksi_name: konv.name,
+      };
+    });
+  });
 }
 function fetchLightHeader(pmId) {
-  return runSql('pmd_lhdr_' + pmId, "SELECT id, status, fk_material_details_code AS material_code FROM production_material WHERE id = '" + pmId + "'").then(r => r[0] || null);
+  return fetchAllPages('production_material', { filter: { id: pmId }, fields: ['id', 'status', 'fk_material_details_code'], pageSize: 1 })
+    .then(function (rows) {
+      const pm = rows[0];
+      return pm ? { id: pm.id, status: pm.status, material_code: pm.fk_material_details_code } : null;
+    });
 }
 function fetchProductionDo(productionId) {
-  return runSql('pmd_ddo_' + productionId, "SELECT COALESCE(SUM(quantity),0) AS total_do FROM production_quantity_details WHERE fk_production_id = '" + productionId + "'").then(r => num(r[0] && r[0].total_do));
+  return fetchAllPages('production_quantity_details', { filter: { fk_production_id: productionId }, fields: ['quantity'] })
+    .then(function (rows) { return rows.reduce(function (s, x) { return s + num(x.quantity); }, 0); });
 }
+// image via appends:['image'] — same fix as ui_production_detail.js, instead
+// of introspecting the `fields` meta-collection (admin-gated).
 function fetchProductImage(productCode) {
   if (!productCode) return Promise.resolve('');
-  return runSql('pmd_imgmeta', "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'")
-    .then(function(rows) {
-      if (!rows.length) return '';
-      let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return ''; }
-      const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
-      if (!through || !fk || !ok) return '';
-      return runSql('pmd_imgjoin_' + productCode,
-        "SELECT attachments.url AS url, attachments.filename AS filename FROM product " +
-        "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
-        "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
-        "WHERE product.code = '" + productCode + "' ORDER BY attachments.id ASC LIMIT 1")
-        .then(function(irows) { const r = irows[0]; return r ? (r.url || (r.filename ? '/storage/uploads/' + r.filename : '')) : ''; });
+  return fetchAllPages('product', { filter: { code: productCode }, fields: ['code'], appends: ['image'], pageSize: 1 })
+    .then(function (rows) {
+      const p = rows[0];
+      if (!p) return '';
+      const img = p.image;
+      const imgRow = Array.isArray(img) ? img[0] : img;
+      if (!imgRow) return '';
+      return imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
     }).catch(() => '');
 }
 function fetchEditRecord(pmId) {
-  return runSql('pmd_erec_' + pmId, "SELECT fk_production_id, fk_material_details_code, quantity_need, status, shipment_date FROM production_material WHERE id = '" + pmId + "'").then(r => r[0] || {});
+  return fetchAllPages('production_material', { filter: { id: pmId }, fields: ['fk_production_id', 'fk_material_details_code', 'quantity_need', 'status', 'shipment_date'], pageSize: 1 })
+    .then(function (rows) { return rows[0] || {}; });
 }
 let _editOpts = null;
 function fetchEditOptions() {
   if (_editOpts) return Promise.resolve(_editOpts);
   return Promise.all([
-    runSql('pmd_opt_prod', "SELECT production.id AS id, production.production_ref AS ref, product.code AS pcode, product.name AS pname, konveksi.name AS kname FROM production JOIN product ON production.fk_product_code = product.code JOIN konveksi ON production.fk_konveksi_code = konveksi.code ORDER BY production.created_at DESC"),
-    runSql('pmd_opt_mat', "SELECT code FROM material_details ORDER BY code ASC"),
-  ]).then(r => { _editOpts = { productions: r[0], materials: r[1] }; return _editOpts; });
+    fetchAllPages('production', { fields: ['id', 'production_ref'], appends: ['product_code', 'konveksi'], sort: ['-created_at'] }),
+    fetchAllPages('material_details', { fields: ['code'], sort: ['code'] }),
+  ]).then(function (r) {
+    const productions = (r[0] || []).map(function (p) {
+      const product = p.product_code || {};
+      const konv = p.konveksi || {};
+      return { id: p.id, ref: p.production_ref, pcode: product.code, pname: product.name, kname: konv.name };
+    });
+    _editOpts = { productions: productions, materials: r[1] };
+    return _editOpts;
+  });
 }
 function updateMaterial(pmId, form) {
   return ctx.api.resource('production_material').update({ filterByTk: pmId, values: {
