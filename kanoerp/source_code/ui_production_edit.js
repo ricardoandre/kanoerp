@@ -16,33 +16,38 @@
 //         record for productionId (details, variants, materials). onSaved() fires
 //         after a successful update. zIndex 1100 so it sits above a detail drawer.
 //
-// Both resolve required belongsTo relations (product, konveksi, sku, production)
-// at runtime from the `fields` config and send nested associations, with raw-FK
-// fallback — fixes "X is required" 400s.
+// 2026-07 MIGRATION: all reads/writes moved off raw ctx.sql onto
+// ctx.api.resource() (fetchAllPages), same fix already applied to
+// ui_production_addmarker.js — raw ctx.sql and any getRels()-style runtime
+// query against the `fields` meta-collection are admin/root-gated and
+// silently fail (or throw a "No permissions" toast even when the write
+// itself falls back and succeeds) for non-admin roles. belongsTo relation
+// field names below are hardcoded from the schema dump, not resolved at
+// runtime, per the same reasoning as MARKER_RELS in
+// ui_production_addmarker.js.
 //
 // FIX (marker_remarks): the old "Marker" card read/wrote a `marker` column
 // on production that does not exist — the real column is `marker_remarks`.
 //
-// MARKER INTEGRATION (this pass): the Edit Production drawer's "Markers"
-// card now embeds ui_production_addmarker.js's MarkerContent component
-// directly (loaded lazily, same source_code as the standalone "Add Marker"
-// modal) — existing markers, reuse suggestions (same product / same model),
-// manual product-code lookup, add-new-marker form, and marker_remarks notes
-// are all handled there, exactly as in that modal. It's rendered with
+// MARKER INTEGRATION: the Edit Production drawer's "Markers" card embeds
+// ui_production_addmarker.js's MarkerContent component directly (loaded
+// lazily, same source_code as the standalone "Add Marker" modal) —
+// existing markers, reuse suggestions (same product / same model), manual
+// product-code lookup, add-new-marker form, and marker_remarks notes are
+// all handled there, exactly as in that modal. Rendered with
 // `embedded: true`, which hides the modal-only chrome (title bar, close
 // button, product-info box — redundant next to this drawer's own Details
-// card). Marker actions (create/link/unlink marker, save marker notes) are
-// immediate writes, independent of this drawer's own "Save changes" button
-// — same as standalone usage. This drawer no longer owns marker_remarks
-// itself: MarkerContent is the single source of truth for that field, so
-// fetchEditRecord/updateProduction/form state no longer touch it.
+// card). Marker actions are immediate writes, independent of this drawer's
+// own "Save changes" button — same as standalone usage. This drawer no
+// longer owns marker_remarks itself: MarkerContent is the single source of
+// truth for that field.
 //
 // Card order: Details → Materials → Quantity → Markers → Remarks.
 //
 // Depends on: none (but the Edit drawer lazily loads the 'ui_production_addmarker'
 // source_code row at runtime for the Markers card).
 // =====================================================
-const { Drawer, Select, DatePicker, InputNumber, Switch, Spin, message } = antd;
+const { Drawer, Select, DatePicker, InputNumber, Switch, Spin, Modal, message } = antd;
 const ce = React.createElement;
 const { useState, useEffect, useRef } = React;
 
@@ -53,17 +58,25 @@ const sLabel = v => STATUS_LABEL[String(v || '').toLowerCase()] || (v || '-');
 
 const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' } }, t);
 
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
+// ── resource-based read helpers (non-admin-safe), same pattern as
+// ui_production_addmarker.js / product_measurement.js ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
 }
 
-// resource-based source_code loader (non-admin-safe — NOT the ctx.sql-based
-// loadCode pattern used elsewhere in this file for its own SQL reads; that
-// pattern is admin/root-gated per project notes. This loader specifically
-// avoids that, matching the pattern already proven in the act_ shell that
-// opens ui_production_addmarker.js standalone.)
+// resource-based source_code loader (non-admin-safe) — used to lazily load
+// ui_production_addmarker.js for the embedded Markers card.
 const _moduleCache = {};
 function loadModule(name) {
   if (_moduleCache[name]) return Promise.resolve(_moduleCache[name]);
@@ -93,43 +106,48 @@ let _optsCache = null;
 function fetchOptions() {
   if (_optsCache) return Promise.resolve(_optsCache);
   return Promise.all([
-    runSql('pe_opt_prod', "SELECT code, name FROM product ORDER BY name ASC"),
-    runSql('pe_opt_konv', "SELECT code, name FROM konveksi ORDER BY name ASC"),
-    runSql('pe_opt_sku',  "SELECT id, display FROM sku_option ORDER BY sort ASC"),
-    runSql('pe_opt_mat',  "SELECT code FROM material_details ORDER BY code ASC"),
+    fetchAllPages('product', { fields: ['code', 'name'], sort: ['name'] }),
+    fetchAllPages('konveksi', { fields: ['code', 'name'], sort: ['name'] }),
+    fetchAllPages('sku_option', { fields: ['id', 'display'], sort: ['sort'] }),
+    fetchAllPages('material_details', { fields: ['code'], sort: ['code'] }),
   ]).then(function(r) { _optsCache = { prods: r[0], konvs: r[1], skus: r[2], mats: r[3] }; return _optsCache; });
 }
 
 function fetchEditRecord(id) {
   return Promise.all([
-    runSql('pe_erec_' + id, "SELECT fk_product_code, fk_konveksi_code, is_new, planning_rol, status, est_production_start, est_production_finish, remarks FROM production WHERE id = '" + id + "'"),
-    runSql('pe_eqd_' + id,
-      "SELECT pqd.id AS id, pqd.fk_sku_option_id AS sku_id, sku_option.display AS variant, pqd.ratio AS ratio, pqd.quantity AS quantity, pqd.cut_quantity AS cut_quantity " +
-      "FROM production_quantity_details pqd JOIN sku_option ON pqd.fk_sku_option_id = sku_option.id WHERE pqd.fk_production_id = '" + id + "' ORDER BY sku_option.sort ASC"),
-    runSql('pe_emat_' + id, "SELECT id, fk_material_details_code AS material_code, quantity_need FROM production_material WHERE fk_production_id = '" + id + "' ORDER BY id ASC"),
-  ]).then(function(r) { return { record: r[0][0] || {}, quantityDetails: r[1], materials: r[2] }; });
+    fetchAllPages('production', { filter: { id: id }, fields: ['fk_product_code', 'fk_konveksi_code', 'is_new', 'planning_rol', 'status', 'est_production_start', 'est_production_finish', 'remarks'], pageSize: 1 }),
+    fetchAllPages('production_quantity_details', { filter: { fk_production_id: id }, fields: ['id', 'fk_sku_option_id', 'ratio', 'quantity', 'cut_quantity'], appends: ['sku_option'] }),
+    fetchAllPages('production_material', { filter: { fk_production_id: id }, fields: ['id', 'fk_material_details_code', 'quantity_need'], sort: ['id'] }),
+  ]).then(function(r) {
+    const qds = (r[1] || []).map(function (q) {
+      const sk = q.sku_option || {};
+      return { id: q.id, sku_id: q.fk_sku_option_id, variant: sk.display || '', sku_sort: sk.sort || 0, ratio: q.ratio, quantity: q.quantity, cut_quantity: q.cut_quantity };
+    }).sort(function (a, b) { return a.sku_sort - b.sku_sort; });
+    const materials = (r[2] || []).map(function (m) {
+      return { id: m.id, material_code: m.fk_material_details_code, quantity_need: m.quantity_need };
+    });
+    return { record: r[0][0] || {}, quantityDetails: qds, materials: materials };
+  });
 }
 
 // =====================================================
-// belongsTo resolution: { [foreignKey]: { field, targetKey } } per collection.
-// Lets us send required associations as { <field>: { <targetKey>: value } } for
-// BOTH product and konveksi, instead of raw FKs (which fail required-validation).
+// belongsTo relation field names — HARDCODED, confirmed from the schema
+// dump, rather than resolved at runtime via ctx.api.resource('fields'),
+// which non-admin roles can't read. Same reasoning as MARKER_RELS in
+// ui_production_addmarker.js.
 // =====================================================
-const _relsCache = {};
-function getRels(collection) {
-  if (_relsCache[collection]) return Promise.resolve(_relsCache[collection]);
-  return runSql('pe_rels_' + collection,
-    "SELECT name, CAST(options AS CHAR) AS options FROM fields WHERE collection_name='" + collection + "' AND type='belongsTo'"
-  ).then(function(rows) {
-    const byFk = {};
-    (rows || []).forEach(function(r) {
-      let opt = {}; try { opt = JSON.parse(r.options || '{}'); } catch (e) {}
-      if (opt.foreignKey) byFk[opt.foreignKey] = { field: r.name, targetKey: opt.targetKey || 'id' };
-    });
-    _relsCache[collection] = byFk;
-    return byFk;
-  }).catch(function() { _relsCache[collection] = {}; return {}; });
-}
+const PRODUCTION_RELS = {
+  fk_product_code:  { field: 'product_code', targetKey: 'code' }, // product's primary key is `code`
+  fk_konveksi_code: { field: 'konveksi',     targetKey: 'code' }, // konveksi's primary key is `code`
+};
+const QD_RELS = {
+  fk_production_id: { field: 'production',  targetKey: 'id' },
+  fk_sku_option_id: { field: 'sku_option',  targetKey: 'id' },
+};
+// production_material has no belongsTo relations configured on its FK
+// columns — writes below already use raw fk_production_id /
+// fk_material_details_code values directly, no map needed.
+
 function assocFragment(rels, fkColumn, value) {
   const rel = rels[fkColumn];
   const out = {};
@@ -141,27 +159,24 @@ function assocFragment(rels, fkColumn, value) {
 async function createProduction(form) {
   // brand, production_ref, uniqueness, production_material (BOM) and
   // production_sample are handled by the NocoBase workflow on insert.
-  const rels = await getRels('production');
   const values = { is_new: !!form.is_new, planning_rol: form.planning_rol, status: 'planning' };
-  Object.assign(values, assocFragment(rels, 'fk_product_code',  form.product));
-  Object.assign(values, assocFragment(rels, 'fk_konveksi_code', form.konveksi));
+  Object.assign(values, assocFragment(PRODUCTION_RELS, 'fk_product_code',  form.product));
+  Object.assign(values, assocFragment(PRODUCTION_RELS, 'fk_konveksi_code', form.konveksi));
   const res = await ctx.api.resource('production').create({ values });
   const newId = (res && res.data && res.data.data && res.data.data.id) || (res && res.data && res.data.id);
   if (!newId) throw new Error('Production created but no id returned.');
 
-  const qdRels = await getRels('production_quantity_details');
   for (const row of (form.variants || [])) {
     if (!row.sku) continue;
     const v = { ratio: row.ratio };
-    Object.assign(v, assocFragment(qdRels, 'fk_production_id', newId));
-    Object.assign(v, assocFragment(qdRels, 'fk_sku_option_id', row.sku));
+    Object.assign(v, assocFragment(QD_RELS, 'fk_production_id', newId));
+    Object.assign(v, assocFragment(QD_RELS, 'fk_sku_option_id', row.sku));
     await ctx.api.resource('production_quantity_details').create({ values: v });
   }
   return newId;
 }
 
 async function updateProduction(id, form) {
-  const rels = await getRels('production');
   const values = {
     is_new: !!form.is_new,
     planning_rol: form.planning_rol,
@@ -170,18 +185,17 @@ async function updateProduction(id, form) {
     est_production_finish: form.est_finish ? form.est_finish.format('YYYY-MM-DD') : null,
     remarks: form.remarks,
   };
-  Object.assign(values, assocFragment(rels, 'fk_product_code',  form.product));
-  Object.assign(values, assocFragment(rels, 'fk_konveksi_code', form.konveksi));
+  Object.assign(values, assocFragment(PRODUCTION_RELS, 'fk_product_code',  form.product));
+  Object.assign(values, assocFragment(PRODUCTION_RELS, 'fk_konveksi_code', form.konveksi));
   await ctx.api.resource('production').update({ filterByTk: id, values });
 
-  const qdRels = await getRels('production_quantity_details');
   for (const qd of (form.quantityDetails || [])) {
     if (qd.id) {
       await ctx.api.resource('production_quantity_details').update({ filterByTk: qd.id, values: { ratio: qd.ratio, quantity: qd.quantity, cut_quantity: qd.cut_quantity } });
     } else if (qd.sku_id) {
       const v = { ratio: qd.ratio, quantity: qd.quantity, cut_quantity: qd.cut_quantity };
-      Object.assign(v, assocFragment(qdRels, 'fk_production_id', id));
-      Object.assign(v, assocFragment(qdRels, 'fk_sku_option_id', qd.sku_id));
+      Object.assign(v, assocFragment(QD_RELS, 'fk_production_id', id));
+      Object.assign(v, assocFragment(QD_RELS, 'fk_sku_option_id', qd.sku_id));
       await ctx.api.resource('production_quantity_details').create({ values: v });
     }
   }
@@ -241,7 +255,23 @@ const ProductionNewDrawer = function(props) {
   const fb = useState(false); const busy = fb[0];      const setBusy = fb[1];
   const fe = useState({});    const errs = fe[0];      const setErrs = fe[1];
 
-  useEffect(function() { if (props.open) fetchOptions().then(setOpts).catch(() => {}); }, [props.open]);
+  // On open: fetch dropdown options, then apply initialValues (duplicate flow)
+  // if given, else leave whatever is currently in state (reset() handles the
+  // normal Add-button blank-slate case on close/submit).
+  useEffect(function() {
+    if (!props.open) return;
+    fetchOptions().then(function(o) {
+      setOpts(o);
+      const iv = props.initialValues;
+      if (iv) {
+        setProduct(iv.product || null);
+        setIsNew(!!iv.is_new);
+        setKonveksi(iv.konveksi || null);
+        setRol(iv.rol != null ? iv.rol : null);
+        setVariants((iv.variants && iv.variants.length) ? iv.variants.map(function(v) { return { sku: v.sku, ratio: v.ratio }; }) : [{ sku: null, ratio: null }]);
+      }
+    }).catch(() => {});
+  }, [props.open]);
 
   function reset() { setProduct(null); setIsNew(false); setKonveksi(null); setRol(null); setVariants([{ sku: null, ratio: null }]); setErrs({}); }
   function setVar(i, key, val) { setVariants(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { [key]: val }) : r)); }
@@ -267,14 +297,7 @@ const ProductionNewDrawer = function(props) {
     }
   }
 
-  return ce(Drawer, {
-    open: props.open, title: 'New Production', width: 480, placement: 'right', rootClassName: 'pe-new-drawer',
-    onClose: () => { reset(); props.onClose(); },
-    footer: ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-      ce('button', { onClick: () => { reset(); props.onClose(); }, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
-      ce('button', { onClick: submit, disabled: busy, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 18px', fontSize: 13, fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 } }, busy ? 'Creating…' : 'Create')),
-  },
-    ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+  const formFields = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
       ce(EditStyles, null),
       ce('div', null, fieldLabel('Product'),
         ce(Select, { showSearch: true, status: errs.product ? 'error' : '', value: product, onChange: v => { setProduct(v); setErrs(p => Object.assign({}, p, { product: false })); }, style: { width: '100%' }, placeholder: 'Search code or name…', filterOption: (i, o) => String(o.label).toLowerCase().includes(i.toLowerCase()), options: (opts.prods || []).map(p => ({ value: p.code, label: (p.code || '') + ' — ' + (p.name || '') })) })),
@@ -289,9 +312,34 @@ const ProductionNewDrawer = function(props) {
               ce(Select, { showSearch: true, value: v.sku, onChange: val => setVar(i, 'sku', val), style: { flex: 1 }, placeholder: 'SKU', filterOption: (inp, o) => String(o.label).toLowerCase().includes(inp.toLowerCase()), options: (opts.skus || []).map(s => ({ value: s.id, label: s.display })) }),
               ce(InputNumber, { value: v.ratio, onChange: val => setVar(i, 'ratio', val), placeholder: 'ratio', min: 0, style: { width: 90 } }),
               ce('button', { onClick: () => setVariants(prev => prev.filter((_, j) => j !== i)), style: { border: 'none', background: '#fef2f2', color: '#ef4444', borderRadius: 8, width: 30, height: 30, cursor: 'pointer', fontSize: 14 } }, '×'))),
-          ce('button', { onClick: () => setVariants(prev => prev.concat([{ sku: null, ratio: null }])), style: { border: '1px dashed #cbd5e1', background: '#f8fafc', color: '#475569', borderRadius: 8, padding: '6px 0', cursor: 'pointer', fontSize: 12, fontWeight: 600 } }, '+ Add variant')))
-    )
-  );
+          ce('button', { onClick: () => setVariants(prev => prev.concat([{ sku: null, ratio: null }])), style: { border: '1px dashed #cbd5e1', background: '#f8fafc', color: '#475569', borderRadius: 8, padding: '6px 0', cursor: 'pointer', fontSize: 12, fontWeight: 600 } }, '+ Add variant'))));
+
+  const footerButtons = ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+    ce('button', { onClick: () => { reset(); props.onClose(); }, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
+    ce('button', { onClick: submit, disabled: busy, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 18px', fontSize: 13, fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 } }, busy ? 'Creating…' : 'Create'));
+
+  // inline=true → bare content for hosting inside Modal.confirm (duplicate flow,
+  // openDuplicateDrawer below). Same fields, same submit() — just no antd
+  // Drawer wrapper.
+  if (props.inline) {
+    return ce('div', { style: { padding: 4 } }, formFields, ce('div', { style: { marginTop: 16 } }, footerButtons));
+  }
+
+  // optional DrawerShell (from lib_drawer_shell) for callers that preload
+  // it — falls back to the plain antd Drawer if not passed, so any existing
+  // caller not passing DrawerShell is unaffected.
+  if (props.DrawerShell) {
+    return ce(props.DrawerShell, {
+      open: props.open, onClose: () => { reset(); props.onClose(); }, title: 'New Production',
+      width: 480, placement: 'right', rootClassName: 'pe-new-drawer', footer: footerButtons,
+    }, formFields);
+  }
+
+  return ce(Drawer, {
+    open: props.open, title: 'New Production', width: 480, placement: 'right', rootClassName: 'pe-new-drawer',
+    onClose: () => { reset(); props.onClose(); },
+    footer: footerButtons,
+  }, formFields);
 };
 
 // =====================================================
@@ -400,25 +448,103 @@ const ProductionEditDrawer = function(props) {
       ce('button', { onClick: () => setMats(prev => prev.filter((_, j) => j !== i)), style: { border: 'none', background: '#fef2f2', color: '#ef4444', borderRadius: 8, width: 30, height: 30, cursor: 'pointer', fontSize: 14 } }, '×'))),
     ce('button', { onClick: () => setMats(prev => prev.concat([{ id: null, material_code: null, quantity_need: null }])), style: { border: '1px dashed #cbd5e1', background: '#f8fafc', color: '#475569', borderRadius: 8, padding: '6px 0', cursor: 'pointer', fontSize: 12, fontWeight: 600 } }, '+ Add material'));
 
+  const footerNode = ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+    ce('button', { onClick: props.onClose, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
+    ce('button', { onClick: submit, disabled: busy || loading, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 20px', fontSize: 13, fontWeight: 700, cursor: (busy || loading) ? 'not-allowed' : 'pointer', opacity: (busy || loading) ? 0.6 : 1, boxShadow: '0 1px 3px rgba(79,70,229,0.4)' } }, busy ? 'Saving…' : 'Save changes'));
+
+  const contentNode = ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+    ce(EditStyles, null),
+    card('Details',   '#6366f1', detailsBody),
+    card('Materials', '#f97316', matBody),
+    card('Quantity',  '#84cc16', qtyBody),
+    card('Markers',   '#a855f7', markersBody),
+    card('Remarks',   '#0ea5e9', remarksBody),
+    ce('div', { style: { height: 24 } }));
+
+  // optional DrawerShell (from lib_drawer_shell) — its own `loading` prop
+  // shows a centered Spin and hides the footer while loading is true, same
+  // as this drawer's fallback path below, so contentNode can be passed
+  // unconditionally here.
+  if (props.DrawerShell) {
+    return ce(props.DrawerShell, {
+      open: props.open, onClose: props.onClose, title: 'Edit Production',
+      width: 580, placement: 'right', rootClassName: 'pe-edit-drawer', zIndex: 1100,
+      loading: loading, footer: footerNode,
+    }, contentNode);
+  }
+
   return ce(Drawer, {
     open: props.open, title: 'Edit Production', width: 580, placement: 'right', onClose: props.onClose,
     rootClassName: 'pe-edit-drawer', zIndex: 1100,
-    footer: ce('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-      ce('button', { onClick: props.onClose, style: { border: '1px solid #e5e7eb', background: '#fff', borderRadius: 8, padding: '7px 16px', cursor: 'pointer', fontSize: 13 } }, 'Cancel'),
-      ce('button', { onClick: submit, disabled: busy || loading, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 20px', fontSize: 13, fontWeight: 700, cursor: (busy || loading) ? 'not-allowed' : 'pointer', opacity: (busy || loading) ? 0.6 : 1, boxShadow: '0 1px 3px rgba(79,70,229,0.4)' } }, busy ? 'Saving…' : 'Save changes')),
+    footer: footerNode,
   },
     loading
       ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null))
-      : ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
-          ce(EditStyles, null),
-          card('Details',   '#6366f1', detailsBody),
-          card('Materials', '#f97316', matBody),
-          card('Quantity',  '#84cc16', qtyBody),
-          card('Markers',   '#a855f7', markersBody),
-          card('Remarks',   '#0ea5e9', remarksBody),
-          ce('div', { style: { height: 24 } })
-        )
+      : contentNode
   );
 };
 
-return { ProductionNewDrawer, ProductionEditDrawer };
+// =====================================================
+// DUPLICATE — fetch a source production's template fields (product,
+// konveksi, is_new, planning ROL, variant ratios) and open the New
+// Production form pre-filled, so the user edits before saving. Nothing is
+// written until Create is clicked — reuses createProduction, same as a
+// normal Add. NOT copied: remarks, marker_remarks, quantity/cut_quantity
+// (actual run figures), production_material (BOM), production_sample —
+// BOM/sample are regenerated fresh by the on-insert workflow, same as any
+// new production.
+//
+// Hosted via Modal.confirm content — the same proven pattern already used
+// for the Material Out entry form (MaterialOutContent): a stateful React
+// element passed as `content`, own Cancel/Create buttons, closed with
+// Modal.destroyAll(). No portal/CSS tricks needed.
+//
+// RESTORED 2026-07: this function (and fetchDuplicateSource, and
+// ProductionNewDrawer's initialValues/inline support) had been dropped from
+// an earlier pass of this file, silently breaking the "Duplicate" bulk
+// action in view_production.js (PE.openDuplicateDrawer was undefined). Not
+// caught earlier since view_production.js wasn't live yet. Converted to
+// ctx.api.resource() here rather than restoring the old raw-SQL version.
+// =====================================================
+function fetchDuplicateSource(sourceId) {
+  return Promise.all([
+    fetchAllPages('production', { filter: { id: sourceId }, fields: ['fk_product_code', 'fk_konveksi_code', 'is_new', 'planning_rol'], pageSize: 1 }),
+    fetchAllPages('production_quantity_details', { filter: { fk_production_id: sourceId }, fields: ['fk_sku_option_id', 'ratio'], sort: ['id'] }),
+  ]).then(function(r) {
+    const rec = r[0][0];
+    if (!rec) throw new Error('Source production not found.');
+    return {
+      product: rec.fk_product_code,
+      konveksi: rec.fk_konveksi_code,
+      is_new: rec.is_new === true || String(rec.is_new) === 'true' || rec.is_new === 1,
+      rol: rec.planning_rol != null ? Number(rec.planning_rol) : null,
+      variants: (r[1] || []).map(function(q) { return { sku: q.fk_sku_option_id, ratio: q.ratio }; }),
+    };
+  });
+}
+
+async function openDuplicateDrawer(sourceId, opts) {
+  opts = opts || {};
+  const initialValues = await fetchDuplicateSource(sourceId);
+  Modal.confirm({
+    title: 'Duplicate Production',
+    width: 480,
+    icon: null,
+    content: ce(ProductionNewDrawer, {
+      inline: true,
+      open: true,
+      initialValues: initialValues,
+      onClose: function() { Modal.destroyAll(); if (opts.onClose) opts.onClose(); },
+      onCreated: function(newId) {
+        Modal.destroyAll();
+        if (opts.onCreated) opts.onCreated(newId);
+      },
+    }),
+    okButtonProps: { style: { display: 'none' } },
+    cancelButtonProps: { style: { display: 'none' } },
+    maskClosable: false,
+    onCancel() {},
+  });
+}
+
+return { ProductionNewDrawer, ProductionEditDrawer, openDuplicateDrawer };
