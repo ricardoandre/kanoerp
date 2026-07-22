@@ -15,7 +15,8 @@
 //   product_measurement            — id, name, remarks (richText/HTML).
 //   product_measurement_variant    — one row per size: id,
 //     fk_product_measurement_variant_id (→ product_measurement.id),
-//     belongsTo sku_option, + 16 numeric measurement columns.
+//     belongsTo sku_option, + measurement columns (count/order defined by
+//     lib_measurement_fields — see below).
 //   product                        — fk_product_measurement_id (→ set).
 // A measurement set's linked products and its size rows are both fetched in
 // ONE fetchList() pass (batched via fetchByIn), so the card + detail views
@@ -25,7 +26,34 @@
 //
 // Card/detail measurement tables only show columns that actually have a
 // value somewhere in that set (getPopulatedFields below) — Edit is the one
-// place that always shows all 16, since that's where you'd fill blanks in.
+// place that always shows all fields, since that's where you'd fill blanks in.
+//
+// CHANGED (2026-07): the measurement field list (order + bilingual labels)
+// used to be hand-maintained separately in THIS file, ui_product_measurement_add,
+// ui_product_measurement_edit, AND ui_product_details — four copies of the
+// same list, and one of them (ui_product_details) had silently drifted out
+// of sync (missing 3 fields, only caught by manually checking against the
+// schema). Now sourced from ONE shared module, lib_measurement_fields,
+// loaded once here alongside ui_list_engine in Root's startup effect,
+// before the list view ever mounts. See that module's own header for why
+// its order is append-only and never reordered (legacy XLS copy-paste
+// column alignment) — a brand-new measurement column discovered later
+// always appears at the END of the populated-fields list here too, never
+// inserted near a "related" field.
+//
+// 2026-07: Edit drawer now sets zIndex:1100 (matches production's pattern) —
+// Edit is opened from inside the still-open Detail drawer via the header
+// "✏️ Edit" button, so without an explicit z-index bump the Edit drawer was
+// stacking BEHIND Detail at the same default level and appeared to do
+// nothing when clicked.
+//
+// 2026-07, cont'd: added a "📋 Duplicate" bulk action. It does NOT write
+// anything directly — it fetches the source set's data (name, remarks, all
+// variant rows) and opens the New drawer pre-filled via
+// helpers.openNewWithPrefill (see ui_list_engine), so the user can review/
+// edit before Save actually creates anything. Product links are
+// intentionally NOT copied — fk_product_measurement_id is one-per-product,
+// so a duplicate starts unlinked and the user reassigns via Edit.
 // =====================================================
 const { React, antd, dayjs } = ctx.libs;
 const { useState, useEffect } = React;
@@ -79,41 +107,34 @@ function fetchByIn(resourceName, field, values, params) {
   }, Promise.resolve([]));
 }
 
-// ── measurement fields (product_measurement_variant SQL columns, fixed order) —
-// duplicated in ui_product_measurement_add/_edit and here (3 places now) —
-// a real candidate for a shared lib_measurement_fields row; left inline to
-// keep this change scoped to what was asked. ──
-const MEASURE_FIELDS = [
-  { key: 'bust',              primary: 'Bust',          secondary: 'Lingkar Dada' },
-  { key: 'shoulder',          primary: 'Shoulder',      secondary: 'Bahu' },
-  { key: 'waist',             primary: 'Waist',         secondary: 'Lingkar Pinggang' },
-  { key: 'hips',              primary: 'Hips',          secondary: 'Lingkar Pinggul' },
-  { key: 'length',            primary: 'Length',        secondary: 'Panjang' },
-  { key: 'length2',           primary: 'Length 2',      secondary: 'Panjang 2' },
-  { key: 'bottom_hole',       primary: 'Bottom Hole',   secondary: 'Lingkar Bawah' },
-  { key: 'neck',              primary: 'Neck',          secondary: 'Lingkar Leher' },
-  { key: 'arm_hole',          primary: 'Arm Hole',      secondary: 'Lingkar Ketiak' },
-  { key: 'bottom_sleeve',     primary: 'Bottom Sleeve', secondary: 'Lebar Lengan' },
-  { key: 'mid_sleeve',        primary: 'Mid Sleeve',    secondary: 'Pangkal Lengan' },
-  { key: 'sleeve_length',     primary: 'Sleeve Length', secondary: 'Panjang Lengan' },
-  { key: 'thigh',             primary: 'Thigh',         secondary: 'Lebar Paha' },
-  { key: 'est_main_fabric',   primary: 'Est Fabric',    secondary: 'Est Bahan' },
-  { key: 'est_main_fabric_2', primary: 'Est Fabric 2',  secondary: 'Est Bahan 2' },
-  { key: 'est_furing',        primary: 'Est Furing',    secondary: 'Est Furing' },
-  { key: 'bust2',              primary: 'Bust 2',        secondary: 'Lingkar Dada 2' },
-  { key: 'waist2',             primary: 'Waist 2',       secondary: 'Lingkar Pinggang 2' },
-  { key: 'elastic',            primary: 'Elastic',       secondary: 'Karet' },
-];
-const MEASURE_KEYS = MEASURE_FIELDS.map(f => f.key);
+// ── measurement fields — now sourced from the shared lib_measurement_fields
+// module (loaded once in Root's startup effect, below, before the list view
+// ever mounts). These start empty and get populated before any of the
+// functions below actually execute — see Root. ──
+let MEASURE_FIELDS = [];
+let MEASURE_KEYS = [];
 
 function isPopulated(v) { return v !== null && v !== undefined && v !== ''; }
 // only the columns that have a value somewhere across this set's sizes —
-// used by the (read-only) card + detail views. Edit always shows all 16.
+// used by the (read-only) card + detail views. Edit always shows all fields.
 function getPopulatedFields(variants) {
   return MEASURE_FIELDS.filter(f => variants.some(v => isPopulated(v.values[f.key])));
 }
-function stripHtml(html) { return String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(); }
-function fmtNum(v) { return isPopulated(v) ? v : '—'; }
+// CHANGED (2026-07): card remarks now render the actual rich HTML (bold,
+// lists, etc.), truncated visually via CSS line-clamp — instead of
+// flattening to plain text via stripHtml. htmlIsEmpty just checks whether
+// there's any real content once tags/&nbsp; are discounted (same pattern
+// used elsewhere in this codebase, e.g. ui_production_detail.js).
+function htmlIsEmpty(html) { return !html || !String(html).replace(/<[^>]*>/g, '').replace(/&nbsp;/gi, ' ').trim(); }
+// defensive: if a non-primitive somehow ends up here (e.g. a relation
+// object slipping through), never pass it straight into JSX — that's
+// exactly what caused "React error #31: object with keys {...}" once
+// already (see lib_measurement_fields.js's fetchAllSchemaFields fix).
+function fmtNum(v) {
+  if (!isPopulated(v)) return '—';
+  if (typeof v === 'object') return '—';
+  return v;
+}
 
 // ── data layer — everything the card + detail views need comes from ONE
 // fetchList() pass: product_measurement rows, plus their linked products
@@ -172,6 +193,32 @@ async function deleteMeasurement(id) {
   return ctx.api.resource('product_measurement').destroy({ filterByTk: id });
 }
 
+// ── duplicate: fetches the source set's data (name, remarks, all variant
+// rows) so it can be handed to the New drawer as prefill — nothing is
+// created here. The user reviews/edits in the drawer and Save does the
+// actual write, same flow as filling out New Measurement normally. ──
+async function fetchDuplicateSource(id) {
+  const srcRes = await ctx.api.resource('product_measurement').get({ filterByTk: id, fields: ['id', 'name', 'remarks'] });
+  const src = srcRes.data.data;
+
+  const variants = await fetchAllPages('product_measurement_variant', {
+    filter: { fk_product_measurement_variant_id: id },
+    fields: ['fk_product_measurement_variant_id'].concat(MEASURE_KEYS),
+    appends: ['sku_option'],
+  });
+
+  return {
+    name: (src.name || 'Untitled') + ' (Copy)',
+    remarks: src.remarks || '',
+    variants: variants.map(function (v) {
+      const sk = v.sku_option || {};
+      const values = {};
+      MEASURE_FIELDS.forEach(function (f) { values[f.key] = v[f.key]; });
+      return { sku_id: sk.id, sku_display: sk.display || '—', sku_sort: sk.sort || 0, values: values };
+    }).filter(function (v) { return v.sku_id; }),
+  };
+}
+
 // ── New / Edit drawer loaders (dedicated source_code rows, Drawer-based) ──
 function NewDrawerLoader(props) {
   const sC = useState(null); const Mod = sC[0]; const setMod = sC[1];
@@ -184,9 +231,13 @@ function NewDrawerLoader(props) {
   const DrawerShell = Shell.DrawerShell;
   const ready = Mod && Mod.NewMeasurementFormBody;
   return ce(DrawerShell, {
-    open: props.open, onClose: props.onClose, title: 'New Product Measurement',
+    open: props.open, onClose: props.onClose,
+    title: props.prefill ? 'Duplicate Product Measurement' : 'New Product Measurement',
     width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', loading: !ready,
-  }, ready ? ce(Mod.NewMeasurementFormBody, { onClose: props.onClose, onCreated: props.onCreated, resetSignal: props.open }) : null);
+  }, ready ? ce(Mod.NewMeasurementFormBody, {
+    onClose: props.onClose, onCreated: props.onCreated,
+    resetSignal: props.open, initialData: props.prefill || null,
+  }) : null);
 }
 
 function EditDrawerLoader(props) {
@@ -202,7 +253,7 @@ function EditDrawerLoader(props) {
   const ready = Mod && Mod.EditMeasurementFormBody;
   return ce(DrawerShell, {
     open: props.open, onClose: props.onClose, title: 'Edit Product Measurement',
-    width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', loading: !ready, footer: footer,
+    width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', zIndex: 1100, loading: !ready, footer: footer,
   }, ready ? ce(Mod.EditMeasurementFormBody, { open: props.open, measurementId: props.measurementId, onClose: props.onClose, onSaved: props.onSaved, onFooterChange: setFooter }) : null);
 }
 
@@ -214,7 +265,7 @@ function renderCard(o) {
   const variants = row.variants || [];
   const img = products[0] && products[0].image;
   const codesText = products.length ? products.map(p => p.code).join(', ') : '—';
-  const remarksText = stripHtml(row.remarks);
+  const hasRemarks = !htmlIsEmpty(row.remarks);
   const populatedFields = getPopulatedFields(variants);
 
   return ce('div', { className: 'pmm-cardbody' },
@@ -244,7 +295,9 @@ function renderCard(o) {
                 populatedFields.map(f => ce('td', { key: f.key }, fmtNum(v.values[f.key]))))))))
         : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, '—')),
     ce('div', { className: 'pmm-col-remarks' },
-      remarksText ? ce('div', { style: { fontSize: 12, color: '#6b7280' } }, remarksText) : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, 'No remarks')));
+      hasRemarks
+        ? ce('div', { className: 'pmm-remarks-preview', dangerouslySetInnerHTML: { __html: row.remarks } })
+        : ce('span', { style: { fontSize: 11, color: '#cbd5e1' } }, 'No remarks')));
 }
 
 // ── detail: everything — products (bigger photo-on-top tiles), remarks
@@ -293,7 +346,7 @@ function DetailBody(props) {
               ce('thead', null, ce('tr', null,
                 ce('th', { style: { textAlign: 'left' } }, 'Size'),
                 populatedFields.map(f => ce('th', { key: f.key },
-                  ce('div', null, ce('div', { style: { fontWeight: 700 } }, f.primary), ce('div', { style: { color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')')))))),
+                  ce('div', null, ce('div', { style: { fontWeight: 700 } }, f.primary), f.secondary ? ce('div', { style: { color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')') : null))))),
               ce('tbody', null, variants.map((v, i) => ce('tr', { key: v.sku_id, className: i % 2 === 1 ? 'pmd-alt' : '' },
                 ce('td', { className: 'pmd-size-cell' }, v.sku_display),
                 populatedFields.map(f => ce('td', { key: f.key }, fmtNum(v.values[f.key]))))))))
@@ -307,6 +360,10 @@ const VIEW_CSS =
   ".pmm-cardbody{display:flex;flex-direction:column;gap:10px;padding:12px;}" +
   ".pmm-col-summary{display:flex;gap:12px;align-items:flex-start;}" +
   ".pmm-col-measure,.pmm-col-remarks{display:none;}" +
+  ".pmm-remarks-preview{font-size:12px;color:#4b5563;line-height:1.45;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;}" +
+  ".pmm-remarks-preview p{margin:0 0 4px;}" +
+  ".pmm-remarks-preview ul,.pmm-remarks-preview ol{margin:0 0 4px;padding-left:16px;}" +
+  ".pmm-remarks-preview b,.pmm-remarks-preview strong{color:#374151;}" +
   ".pmm-mini-grid{overflow-x:auto;border:1px solid #e2e8f0;border-radius:6px;}" +
   ".pmm-mini-grid table{border-collapse:collapse;font-size:11px;}" +
   ".pmm-mini-grid th,.pmm-mini-grid td{border:1px solid #f1f5f9;padding:3px 7px;text-align:center;white-space:nowrap;}" +
@@ -343,7 +400,7 @@ const config = {
 
   renderNewDrawer: function (api) {
     return ce(NewDrawerLoader, {
-      open: api.open, onClose: api.onClose,
+      open: api.open, onClose: api.onClose, prefill: api.prefillData,
       onCreated: function () { api.onClose(); api.helpers.reload(); },
     });
   },
@@ -357,7 +414,32 @@ const config = {
   deleteRow: deleteMeasurement,
   deleteTitle: 'Delete measurement set?',
   deleteLabel: row => row.name || ('#' + row.id),
+
+  // 2026-07: per-card quick actions — Edit shows as a direct icon (desktop
+  // hover cluster + mobile swipe, both driven by this same list), Duplicate
+  // and Delete sit behind the "⋯" overflow on desktop (still show directly
+  // on the mobile swipe panel, which comfortably fits 3 buttons). Separate
+  // from bulkActions below, which is the existing multi-select toolbar —
+  // this is single-row, no selection needed.
+  quickActions: [
+    { key: 'edit', icon: '✏️', label: 'Edit', color: '#3b82f6', run: (row, helpers) => helpers.openEdit(row) },
+    { key: 'duplicate', icon: '📋', label: 'Duplicate', color: '#6366f1', primary: false, run: function (row, helpers) {
+        fetchDuplicateSource(row.id).then(function (prefill) { helpers.openNewWithPrefill(prefill); })
+          .catch(function (e) { message.error('Could not load source data: ' + ((e && e.message) || e)); });
+      } },
+    { key: 'delete', icon: '🗑', label: 'Delete', color: '#ef4444', danger: true, primary: false, run: (row, helpers) => helpers.confirmDelete(row) },
+  ],
+
   bulkActions: [
+    { label: '📋 Duplicate', bg: '#6366f1', color: '#fff', run: function (ids, helpers) {
+        if (ids.length !== 1) { message.warning('Select exactly one measurement set to duplicate.'); return; }
+        fetchDuplicateSource(ids[0])
+          .then(function (prefill) {
+            helpers.exitSelect();
+            helpers.openNewWithPrefill(prefill);
+          })
+          .catch(function (e) { message.error('Could not load source data: ' + ((e && e.message) || e)); });
+      } },
     { label: '🗑 Delete', bg: '#ef4444', color: '#fff', run: function (ids, helpers) {
         Modal.confirm({
           title: 'Delete ' + ids.length + ' measurement set(s)?',
@@ -371,15 +453,33 @@ const config = {
   ],
 };
 
-// ── root ──
+// ── root — now also loads lib_measurement_fields alongside ui_list_engine,
+// populating the module-level MEASURE_FIELDS/MEASURE_KEYS before the list
+// view is ever constructed. If the lib fails to load for any reason, this
+// surfaces as a load error the same way a missing ui_list_engine would —
+// there's no sane partial-fallback for "no measurement columns at all". ──
 const Root = function () {
   const sLV = useState(null); const LV = sLV[0]; const setLV = sLV[1];
   const sErr = useState(null); const err = sErr[0]; const setErr = sErr[1];
   useEffect(function () {
-    loadCode('ui_list_engine').then(function (M) { setLV(function () { return M.createListView(config); }); })
-      .catch(function (e) { setErr((e && e.message) || String(e)); });
+    Promise.all([
+      loadCode('ui_list_engine'),
+      loadCode('lib_measurement_fields'),
+    ]).then(function (r) {
+      const M = r[0]; const Lib = r[1];
+      // fetchAllSchemaFields (not a fixed list) — this file's resource()
+      // calls need an explicit field list (no SELECT * for the resource
+      // API), so a schema check is how a brand-new column gets picked up
+      // automatically here, same intent as the SELECT * discovery used by
+      // the raw-SQL read-only views.
+      return Lib.fetchAllSchemaFields(ctx).then(function (schemaKeys) {
+        MEASURE_FIELDS = Lib.getDisplayFields(schemaKeys);
+        MEASURE_KEYS = MEASURE_FIELDS.map(function (f) { return f.key; });
+        setLV(function () { return M.createListView(config); });
+      });
+    }).catch(function (e) { setErr((e && e.message) || String(e)); });
   }, []);
-  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load ui_list_engine: ' + err);
+  if (err) return ce('div', { style: { color: '#ef4444', padding: 16 } }, 'Failed to load: ' + err);
   if (!LV) return ce('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…');
   return ce('div', null, ce(LV));
 };
