@@ -9,12 +9,13 @@
 // matching — these were previously two near-identical, fully duplicated
 // JSActions (act_match_production, act_match_qc_result), differing only in:
 // table name, date field, person field, defect/permak flag + badge style,
-// whether a successful match also bumps the production's status to 'qc',
-// and one small UI-state difference kept deliberately (see KIND_CONFIG
-// below): production's matcher disables its Apply button permanently after
-// one successful apply (a "done" state); QC's original never had that —
-// it can be re-run. That difference is preserved exactly, not "fixed" into
-// consistency, since it's how each one already behaved.
+// and whether a successful match also bumps the production's status to
+// 'qc'. One difference (production's matcher disabling Apply permanently
+// after a successful run, "done" state; QC's original never had this) was
+// initially preserved as-is on the assumption it was intentional — later
+// confirmed to have actually been an oversight, not a deliberate design
+// choice. Both kinds now set hasDoneState: true — matching is one-time-only
+// for QC as well.
 //
 // This is otherwise an EXACT port of each original's raw ctx.sql queries
 // (same INNER JOIN behavior on the production-candidate lookup — a
@@ -73,7 +74,11 @@ const KIND_CONFIG = {
         : ce('span', { style: { display: 'inline-block', background: '#f0fdf4', color: '#16a34a', border: '1px solid #86efac', borderRadius: 3, padding: '0 5px', fontSize: 10, fontWeight: 600, marginTop: 3 } }, 'OK');
     },
     bumpProductionStatus: false,
-    hasDoneState: false,
+    // CHANGED 2026-07: was false — production_result's matcher already
+    // disabled Apply permanently after one successful run and QC's didn't;
+    // confirmed this was an oversight, not an intentional difference.
+    // Matching is one-time-only for both kinds now.
+    hasDoneState: true,
     modalTitle: 'Match QC Results → Production',
     selectWarnLabel: 'QC result',
     emptyStateLabel: 'QC result',
