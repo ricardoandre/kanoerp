@@ -1,0 +1,39 @@
+// lib_enum_labels — shared enum-label resolver.
+//
+// Stored as a `source_code` row named 'lib_enum_labels'.
+// Loaded via loadCode(ctx, 'lib_enum_labels'); compiled with
+//   new Function('React','antd','dayjs','ctx', src)(React, antd, dayjs, ctx).
+//
+// EXPORTS (contract):
+//   enumLabelMap(collectionName, fieldName)
+//     — returns { [value]: label } for a single-select field's enum
+//       options, via ctx.dataSourceManager (the documented-safe schema
+//       introspection API — NOT the `fields` meta-collection REST endpoint,
+//       which is confirmed admin-gated for non-admin roles). Synchronous —
+//       dataSourceManager is already available client-side, no await
+//       needed, safe to call directly during render or in an effect.
+//
+// Extracted 2026-07 from three independent, near-identical
+// implementations: ui_production_detail.js's pdEnumLabelMap,
+// view_sample_details.js's enumLabelMap, and view_sample_dashboard_summary's
+// three separate `fields`-table SQL lookups for the same
+// sample.designer/sample_variant.sewing_pic enums. Extract-on-second-use —
+// this is now the third+ use, past the threshold for promoting to shared.
+//
+// Depends on: none.
+
+function enumLabelMap(collectionName, fieldName) {
+  try {
+    const ds = ctx.dataSourceManager.getDataSource('main');
+    const col = ds && ds.getCollection(collectionName);
+    const field = col && col.getField(fieldName);
+    const opts = (field && field.enum) || [];
+    const map = {};
+    opts.forEach(function (o) {
+      if (o && typeof o === 'object' && o.value != null) map[String(o.value)] = (o.label != null ? o.label : o.value);
+    });
+    return map;
+  } catch (e) { return {}; }
+}
+
+return { enumLabelMap };
