@@ -4,8 +4,26 @@
 // Sibling of ui_product_measurement_add — same grid/paste/rich-text UI, but
 // loads an existing set on open and updates it instead of creating one.
 // Unlike the list card + detail view (which only show measurement columns
-// that actually have a value), Edit always shows ALL 16 columns, since the
+// that actually have a value), Edit always shows ALL columns, since the
 // whole point is being able to fill in ones that were left blank.
+//
+// CHANGED (2026-07): the measurement field list used to be a hand-
+// maintained, file-local MEASURE_FIELDS constant — same one duplicated in
+// ui_product_measurement_add.js, view_product_measurement.js, and
+// ui_product_details.js, and it had drifted out of sync at least once. Now
+// sourced from lib_measurement_fields, using getEntryFields() (the FLAT,
+// legacy-XLS-column order — new fields always appended at the very end,
+// e.g. `crotch`) for the same paste-from-Excel reason ui_product_
+// measurement_add.js does. fetchAllSchemaFields() means a brand-new
+// column shows up here automatically too. See that module's own header
+// for the full reasoning, and ui_product_measurement_add.js's header for
+// why order must stay flat/append-only here specifically (not the grouped
+// order the read-only views use).
+//
+// Because the field list is now fetched asynchronously, this file's
+// existing `loading` state (previously just "is the record loaded yet")
+// now also covers "is the field list loaded yet" — see the combined guard
+// in EditMeasurementFormBody's data-loading effect.
 //
 // Reads via ctx.api.resource() (not raw ctx.sql), same non-admin-safe
 // pattern as ui_product_measurement_add / view_product_measurement.
@@ -26,10 +44,24 @@
 //     buttons, reflecting current busy/loading state) should update.
 //     Optional — omit if you don't need the sticky-footer slot.
 //
-// Depends on: none.
+// Depends on: lib_measurement_fields.
 const { useState, useEffect, useMemo, useRef } = React;
 const { Drawer, Select, Input, InputNumber, Spin, Alert, Table, Checkbox } = antd;
 const ce = React.createElement;
+
+// ── shared code loader (resource-based, non-admin-safe) — needed to load
+// lib_measurement_fields, which this file didn't do before. ──
+const _codeCache = {};
+function loadCode(name) {
+  if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
+  return ctx.api.resource('source_code').list({ filter: { name: name }, fields: ['code'], pageSize: 1 })
+    .then(function (res) {
+      const rows = (res && res.data && res.data.data) || [];
+      const src = (rows[0] && rows[0].code) || '';
+      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+      return _codeCache[name];
+    });
+}
 
 // ── resource-based read helpers ──
 const DEFAULT_PAGE_SIZE = 1000;
@@ -65,30 +97,9 @@ const fieldLabel = t => ce('div', { style: { fontSize: 11, fontWeight: 600, colo
 function fetchProductOptions() { return fetchAllPages('product', { fields: ['code', 'name'], sort: ['name'] }); }
 function fetchSkuOptions() { return fetchAllPages('sku_option', { fields: ['id', 'display', 'sort'], sort: ['sort'] }); }
 
-// ── measurement fields (product_measurement_variant SQL columns, fixed order) ──
-const MEASURE_FIELDS = [
-  { key: 'bust',              primary: 'Bust',          secondary: 'Lingkar Dada' },
-  { key: 'shoulder',          primary: 'Shoulder',      secondary: 'Bahu' },
-  { key: 'waist',             primary: 'Waist',         secondary: 'Lingkar Pinggang' },
-  { key: 'hips',              primary: 'Hips',          secondary: 'Lingkar Pinggul' },
-  { key: 'length',            primary: 'Length',        secondary: 'Panjang' },
-  { key: 'length2',           primary: 'Length 2',      secondary: 'Panjang 2' },
-  { key: 'bottom_hole',       primary: 'Bottom Hole',   secondary: 'Lingkar Bawah' },
-  { key: 'neck',              primary: 'Neck',          secondary: 'Lingkar Leher' },
-  { key: 'arm_hole',          primary: 'Arm Hole',      secondary: 'Lingkar Ketiak' },
-  { key: 'bottom_sleeve',     primary: 'Bottom Sleeve', secondary: 'Lebar Lengan' },
-  { key: 'mid_sleeve',        primary: 'Mid Sleeve',    secondary: 'Pangkal Lengan' },
-  { key: 'sleeve_length',     primary: 'Sleeve Length', secondary: 'Panjang Lengan' },
-  { key: 'thigh',             primary: 'Thigh',         secondary: 'Lebar Paha' },
-  { key: 'est_main_fabric',   primary: 'Est Fabric',    secondary: 'Est Bahan' },
-  { key: 'est_main_fabric_2', primary: 'Est Fabric 2',  secondary: 'Est Bahan 2' },
-  { key: 'est_furing',        primary: 'Est Furing',    secondary: 'Est Furing' },
-  { key: 'bust2',              primary: 'Bust 2',        secondary: 'Lingkar Dada 2' },
-  { key: 'waist2',             primary: 'Waist 2',       secondary: 'Lingkar Pinggang 2' },
-  { key: 'elastic',            primary: 'Elastic',       secondary: 'Karet' },
-];
-const PASTE_COLUMNS = MEASURE_FIELDS;
-function emptyValues() { return MEASURE_FIELDS.reduce((acc, f) => { acc[f.key] = null; return acc; }, {}); }
+// measurement field list now comes from lib_measurement_fields (fetched on
+// mount, see EditMeasurementFormBody) — no local hardcoded list.
+function emptyValues(fields) { return (fields || []).reduce((acc, f) => { acc[f.key] = null; return acc; }, {}); }
 
 const PMS_CSS =
   ".pmm-form-drawer .ant-drawer-content-wrapper{width:min(1080px,96vw)!important;}" +
@@ -125,17 +136,19 @@ function RichTextEditor(props) {
     ce('div', { ref: ref, className: 'pms-rte-body', contentEditable: true, suppressContentEditableWarning: true, onInput: handleInput, 'data-placeholder': props.placeholder || 'Notes…' }));
 }
 
-// ── load an existing set: header, linked products, size rows (ALL columns) ──
-function fetchMeasurementForEdit(id) {
+// ── load an existing set: header, linked products, size rows (ALL columns
+// per the given field list) ──
+function fetchMeasurementForEdit(id, measureFields) {
+  const fieldKeys = measureFields.map(f => f.key);
   return Promise.all([
     ctx.api.resource('product_measurement').get({ filterByTk: id, fields: ['id', 'name', 'remarks'] }).then(r => r.data.data),
     fetchAllPages('product', { filter: { fk_product_measurement_id: id }, fields: ['code', 'name'] }),
-    fetchAllPages('product_measurement_variant', { filter: { fk_product_measurement_variant_id: id }, fields: ['id'].concat(MEASURE_FIELDS.map(f => f.key)), appends: ['sku_option'] }),
+    fetchAllPages('product_measurement_variant', { filter: { fk_product_measurement_variant_id: id }, fields: ['id'].concat(fieldKeys), appends: ['sku_option'] }),
   ]).then(function (r) {
     const pm = r[0]; const products = r[1]; const varRows = r[2];
     const gridRows = varRows.map(v => {
       const sk = v.sku_option || {};
-      const values = {}; MEASURE_FIELDS.forEach(f => { values[f.key] = v[f.key]; });
+      const values = {}; measureFields.forEach(f => { values[f.key] = v[f.key]; });
       return { variant_id: v.id, sku_id: sk.id, sku_display: sk.display || '—', sku_sort: sk.sort || 0, values: values };
     }).sort((a, b) => a.sku_sort - b.sku_sort);
     return { name: pm.name || '', remarks: pm.remarks || '', productCodes: products.map(p => p.code), gridRows: gridRows };
@@ -192,19 +205,29 @@ function EditMeasurementFormBody(props) {
   const sAddSkus = useState([]);    const addSkuIds = sAddSkus[0];    const setAddSkuIds = sAddSkus[1];
   const sBusy = useState(false);    const busy = sBusy[0];            const setBusy = sBusy[1];
   const sActive = useState(null);   const activeCell = sActive[0];    const setActiveCell = sActive[1];
+  // measurement field list — fetched once from lib_measurement_fields
+  // (flat, append-only ENTRY_ORDER — same reasoning as
+  // ui_product_measurement_add.js). Loaded independently of the record
+  // itself; the record-loading effect below waits for both.
+  const sMeasureFields = useState([]); const measureFields = sMeasureFields[0]; const setMeasureFields = sMeasureFields[1];
 
   useEffect(function () { fetchProductOptions().then(setProdOpts).catch(() => {}); fetchSkuOptions().then(setSkuOptions).catch(() => {}); }, []);
+  useEffect(function () {
+    loadCode('lib_measurement_fields').then(function (Lib) {
+      return Lib.fetchAllSchemaFields(ctx).then(function (schemaKeys) { setMeasureFields(Lib.getEntryFields(schemaKeys)); });
+    }).catch(function () { ctx.message.error('Failed to load measurement field list.'); });
+  }, []);
 
   useEffect(function () {
-    if (!open || !measurementId) return;
+    if (!open || !measurementId || !measureFields.length) return;
     setLoading(true); setAddSkuIds([]); setActiveCell(null);
-    fetchMeasurementForEdit(measurementId).then(function (data) {
+    fetchMeasurementForEdit(measurementId, measureFields).then(function (data) {
       setName(data.name); setRemarks(data.remarks);
       setSelected(data.productCodes); setOrigCodes(data.productCodes);
       setGridRows(data.gridRows); setOrigVids(data.gridRows.map(r => r.variant_id));
       setResetKey(k => k + 1); setLoading(false);
     }).catch(function (e) { ctx.message.error('Failed to load: ' + ((e && e.message) || e)); setLoading(false); });
-  }, [open, measurementId]);
+  }, [open, measurementId, measureFields]);
 
   const availableSkuOptions = useMemo(() => skuOptions.filter(s => !gridRows.some(r => r.sku_id === s.id)), [skuOptions, gridRows]);
 
@@ -215,7 +238,7 @@ function EditMeasurementFormBody(props) {
     setGridRows(prev => {
       const existingIds = new Set(prev.map(r => r.sku_id));
       const toAdd = addSkuIds.filter(id => !existingIds.has(id)).map(id => skuOptions.find(s => s.id === id)).filter(Boolean)
-        .map(opt => ({ variant_id: null, sku_id: opt.id, sku_display: opt.display, sku_sort: opt.sort, values: emptyValues() }));
+        .map(opt => ({ variant_id: null, sku_id: opt.id, sku_display: opt.display, sku_sort: opt.sort, values: emptyValues(measureFields) }));
       if (!toAdd.length) return prev;
       const merged = prev.concat(toAdd); merged.sort((a, b) => a.sku_sort - b.sku_sort); return merged;
     });
@@ -231,9 +254,9 @@ function EditMeasurementFormBody(props) {
       lines.forEach(function (line, r) {
         const rowIdx = anchorRowIdx + r; if (rowIdx < 0 || rowIdx >= next.length) return;
         line.split('\t').forEach(function (cell, c) {
-          const colIdx = anchorColIdx + c; if (colIdx < 0 || colIdx >= PASTE_COLUMNS.length) return;
+          const colIdx = anchorColIdx + c; if (colIdx < 0 || colIdx >= measureFields.length) return;
           const trimmed = cell.trim(); if (trimmed === '') return;
-          const num = parseFloat(trimmed.replace(',', '.')); if (!isNaN(num)) next[rowIdx].values[PASTE_COLUMNS[colIdx].key] = num;
+          const num = parseFloat(trimmed.replace(',', '.')); if (!isNaN(num)) next[rowIdx].values[measureFields[colIdx].key] = num;
         });
       });
       return next;
@@ -244,7 +267,7 @@ function EditMeasurementFormBody(props) {
     const text = e.clipboardData && e.clipboardData.getData ? e.clipboardData.getData('text/plain') : ''; if (!text) return;
     e.preventDefault();
     const rowIdx = gridRows.findIndex(r => r.sku_id === activeCell.skuId);
-    const colIdx = PASTE_COLUMNS.findIndex(f => f.key === activeCell.colKey);
+    const colIdx = measureFields.findIndex(f => f.key === activeCell.colKey);
     if (rowIdx === -1 || colIdx === -1) return;
     applyPastedGrid(text, rowIdx, colIdx);
     ctx.message.success('Pasted.');
@@ -278,16 +301,19 @@ function EditMeasurementFormBody(props) {
 
   const sizeColumn = { title: 'Size', dataIndex: 'sku_display', key: 'sku_display', fixed: 'left', width: 88, onCell: () => ({ className: 'pms-size-cell' }), render: v => ce('span', { style: { fontWeight: 700 } }, v) };
   const removeColumn = { title: '', key: '_remove', width: 28, fixed: 'right', render: (_, record) => ce('button', { onClick: () => removeRow(record.sku_id), title: 'Remove size', style: { border: 'none', background: 'transparent', color: '#cbd5e1', cursor: 'pointer', fontSize: 12 } }, '✕') };
-  const fieldColumns = MEASURE_FIELDS.map(f => ({
-    title: ce('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1.25 } }, ce('div', { style: { fontWeight: 700, fontSize: 10, color: '#334155' } }, f.primary), ce('div', { style: { fontSize: 9, color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')')),
+  const fieldColumns = measureFields.map(f => ({
+    title: ce('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1.25 } }, ce('div', { style: { fontWeight: 700, fontSize: 10, color: '#334155' } }, f.primary), f.secondary ? ce('div', { style: { fontSize: 9, color: '#94a3b8', fontWeight: 500 } }, '(' + f.secondary + ')') : null),
     dataIndex: ['values', f.key], key: f.key, width: 90,
     render: (v, record) => ce(InputNumber, { size: 'small', controls: false, value: record.values[f.key], onChange: val => setCell(record.sku_id, f.key, val), style: { width: '100%' }, min: 0, onFocus: () => setActiveCell({ skuId: record.sku_id, colKey: f.key }) }),
   }));
   const gridColumns = [sizeColumn].concat(fieldColumns).concat([removeColumn]);
 
+  // still resolving the field list and/or the record itself.
+  const stillLoading = loading || !measureFields.length;
+
   return ce(React.Fragment, null,
     ce(PmsStyles, null),
-    loading ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null)) :
+    stillLoading ? ce('div', { style: { padding: 60, textAlign: 'center' } }, ce(Spin, null)) :
     ce('div', { style: { fontFamily: 'system-ui,sans-serif', fontSize: 13, display: 'flex', flexDirection: 'column', gap: 14 } },
       ce('div', { style: { display: 'flex', gap: 12 } },
         ce('div', { style: { flex: 1 } }, fieldLabel('Name'), ce(Input, { value: name, onChange: e => setName(e.target.value), placeholder: 'e.g. O420005/06' })),
@@ -321,11 +347,11 @@ function ProductMeasurementEditDrawer(props) {
   if (props.DrawerShell) {
     return ce(props.DrawerShell, {
       open: props.open, onClose: props.onClose, title: 'Edit Product Measurement',
-      width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', footer: footer,
+      width: 1080, placement: 'right', rootClassName: 'pmm-form-drawer', zIndex: 1100, footer: footer,
     }, bodyNode);
   }
   return ce(Drawer, {
-    open: props.open, title: 'Edit Product Measurement', placement: 'right', onClose: props.onClose, rootClassName: 'pmm-form-drawer',
+    open: props.open, title: 'Edit Product Measurement', placement: 'right', onClose: props.onClose, rootClassName: 'pmm-form-drawer', zIndex: 1100,
     footer: footer,
   }, bodyNode);
 }
