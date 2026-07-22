@@ -17,6 +17,33 @@
 // the view supplies meaning.
 //
 // loadCode injects (React, antd, dayjs, ctx). Ends with `return {...}`.
+//
+// 2026-07: added optional New-drawer prefill support (helpers.openNewWithPrefill,
+// config.renderNewDrawer receives api.prefillData) — used by views that offer a
+// "Duplicate" bulk action that opens New pre-filled instead of writing directly.
+// Purely additive: any config.renderNewDrawer that ignores prefillData behaves
+// exactly as before.
+//
+// 2026-07, cont'd: added optional config.quickActions — a configurable list
+// of per-card actions ({ key, icon, label, color?, primary?, danger?,
+// run(row, helpers) }), rendered in TWO places:
+//   - the existing mobile swipe-reveal panel (was hardcoded to Edit/Delete,
+//     now driven by this list — same visual mechanism, just generalized)
+//   - a NEW desktop hover-reveal button cluster (top-right of the card,
+//     fades in on :hover), gated on `(hover:hover) and (pointer:fine)` so it
+//     never appears/sticks on touch devices — those keep using swipe
+//     instead. Desktop had NO quick-action affordance at all before this;
+//     only the swipe gesture existed, which doesn't work with a mouse.
+// Any view that does NOT set config.quickActions gets the exact same
+// Edit + Delete pair as before (same icons/colors/handlers) — this is
+// purely additive, no existing view's behavior changes except that
+// Edit/Delete are now ALSO reachable via desktop hover, not just mobile
+// swipe. To customize per view, set config.quickActions to your own array;
+// `primary: true` (or omitted) actions appear as direct icon buttons in the
+// desktop hover cluster (first 2 only — more go behind a "⋯" overflow,
+// same Dropdown pattern already used in DetailDrawer); ALL actions appear
+// as swipe-reveal buttons on mobile regardless of `primary`, since swipe
+// already comfortably fits a few buttons at once.
 // =====================================================
 const ce = React.createElement;
 const { useState, useEffect, useMemo, useRef } = React;
@@ -40,6 +67,15 @@ const BASE_CSS =
   ".kano-root .kano-card{position:relative;z-index:2;background:#fff;border:1px solid #e5e7eb;border-radius:14px;transition:transform .18s ease;touch-action:pan-y;}" +
   ".kano-root .kano-actions{position:absolute;top:0;right:0;height:100%;display:flex;z-index:1;}" +
   ".kano-root .kano-actbtn{width:70px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:#fff;font-size:11px;font-weight:700;cursor:pointer;border:none;}" +
+  // 2026-07: desktop hover-reveal quick actions — additive, separate from
+  // the swipe-reveal panel above (mobile keeps swipe; desktop had no
+  // affordance at all before this). Gated on (hover:hover) and
+  // (pointer:fine) so it never shows/sticks on touch devices, which rely
+  // on the swipe gesture instead — no overlap between the two mechanisms.
+  ".kano-root .kano-hover-actions{position:absolute;top:8px;right:8px;display:flex;gap:6px;opacity:0;transition:opacity .15s;z-index:3;}" +
+  "@media (hover:hover) and (pointer:fine){.kano-root .kano-card:hover .kano-hover-actions{opacity:1;}}" +
+  ".kano-root .kano-hover-btn{width:30px;height:30px;padding:0;border-radius:8px;border:1px solid #e5e7eb;background:#fff;display:flex;align-items:center;justify-content:center;font-size:14px;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,0.08);}" +
+  ".kano-root .kano-hover-btn:hover{background:#f8fafc;}" +
   ".kano-root .kano-searchrow{display:flex;gap:8px;align-items:center;margin-bottom:12px;}" +
   ".kano-root .kano-tabs{display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;margin-bottom:14px;padding-bottom:2px;-webkit-overflow-scrolling:touch;scrollbar-width:none;}" +
   ".kano-root .kano-tabs::-webkit-scrollbar{display:none;}" +
@@ -164,21 +200,53 @@ function createListView(config) {
     const row = p.row;
     const selectMode = p.selectMode, selected = p.selected;
     const sx = useState(0); const dx = sx[0]; const setDx = sx[1];
-    const startRef = useRef(0); const REVEAL = 140;
+    const startRef = useRef(0);
+
+    // quick actions: config.quickActions (custom, run(row, helpers)) or the
+    // original Edit/Delete pair (same handlers, icons, colors as before) if
+    // a view hasn't opted into anything custom — see header note. This
+    // drives BOTH the mobile swipe-reveal panel and the new desktop
+    // hover-reveal cluster below, so they never drift out of sync with
+    // each other.
+    const quickActions = config.quickActions || [
+      { key: 'edit', icon: '✏️', label: 'Edit', color: '#3b82f6', run: r => p.onEdit(r) },
+      { key: 'delete', icon: '🗑', label: 'Delete', color: '#ef4444', danger: true, run: r => p.onDelete(r) },
+    ];
+    const REVEAL = quickActions.length * 70;
+
     useEffect(function() { if (selectMode) setDx(0); }, [selectMode]);
     function onStart(e) { if (selectMode) return; startRef.current = e.touches[0].clientX - dx; }
     function onMove(e) { if (selectMode) return; let nx = e.touches[0].clientX - startRef.current; if (nx > 0) nx = 0; if (nx < -REVEAL) nx = -REVEAL; setDx(nx); }
     function onEnd() { if (selectMode) return; setDx(dx < -REVEAL / 2 ? -REVEAL : 0); }
+    function runAction(a) { setDx(0); a.run(row, p.helpers); }
+
+    // desktop hover cluster: up to 2 "primary" actions as direct icon
+    // buttons, the rest (if any) behind a "⋯" overflow — same Dropdown
+    // pattern already used in DetailDrawer's overflow menu. All actions
+    // (not just primary ones) still show on the mobile swipe panel below,
+    // since swipe already comfortably fits a few buttons at once.
+    const primaryActions = quickActions.filter(a => a.primary !== false).slice(0, 2);
+    const overflowActions = quickActions.filter(a => primaryActions.indexOf(a) === -1);
+    const hoverCluster = !selectMode ? ce('div', { className: 'kano-hover-actions' },
+      primaryActions.map(a => ce('button', { key: a.key, className: 'kano-hover-btn', title: a.label, onClick: e => { e.stopPropagation(); runAction(a); } }, a.icon)),
+      overflowActions.length ? ce(Dropdown, {
+        menu: { items: overflowActions.map(a => ({ key: a.key, label: a.label, danger: a.danger })), onClick: e => { const a = overflowActions.find(x => x.key === e.key); if (a) runAction(a); } },
+        trigger: ['click'],
+      }, ce('button', { className: 'kano-hover-btn', title: 'More', onClick: e => e.stopPropagation() }, '⋯')) : null
+    ) : null;
+
     return ce('div', { className: 'kano-cardwrap' },
       !selectMode ? ce('div', { className: 'kano-actions' },
-        ce('button', { className: 'kano-actbtn', style: { background: '#3b82f6' }, onClick: e => { e.stopPropagation(); setDx(0); p.onEdit(row); } }, ce('span', { style: { fontSize: 16 } }, '✏️'), 'Edit'),
-        ce('button', { className: 'kano-actbtn', style: { background: '#ef4444' }, onClick: e => { e.stopPropagation(); setDx(0); p.onDelete(row); } }, ce('span', { style: { fontSize: 16 } }, '🗑'), 'Delete')) : null,
+        quickActions.map(a => ce('button', { key: a.key, className: 'kano-actbtn', style: { background: a.color || '#64748b' }, onClick: e => { e.stopPropagation(); runAction(a); } }, ce('span', { style: { fontSize: 16 } }, a.icon), a.label))) : null,
       ce('div', {
         className: 'kano-card',
         style: { transform: selectMode ? 'none' : 'translateX(' + dx + 'px)', transition: selectMode ? 'none' : 'transform .18s ease', borderColor: (selectMode && selected) ? '#6366f1' : '#e5e7eb', boxShadow: (selectMode && selected) ? '0 0 0 2px #6366f155' : 'none' },
         onTouchStart: onStart, onTouchMove: onMove, onTouchEnd: onEnd,
         onClick: () => { if (selectMode) { p.onToggleSelect(getId(row)); return; } if (dx === 0) p.onOpen(row); else setDx(0); },
-      }, config.renderCard({ row: row, summary: p.summary, imgMap: p.imgMap, getImage: p.getImage, selectMode: selectMode, selected: selected })));
+      },
+        config.renderCard({ row: row, summary: p.summary, imgMap: p.imgMap, getImage: p.getImage, selectMode: selectMode, selected: selected }),
+        hoverCluster
+      ));
   }
 
   // ── new / edit drawer shells ──
@@ -297,6 +365,7 @@ function DetailDrawer(p) {
     const sff = useState(initFilters); const filters = sff[0]; const setFilters = sff[1];
     const sfo = useState(false);const filterOpen = sfo[0]; const setFilterOpen = sfo[1];
     const sn = useState(false); const newOpen = sn[0];   const setNewOpen = sn[1];
+    const snp = useState(null); const newPrefill = snp[0]; const setNewPrefill = snp[1];
     const so = useState(null);  const openRow = so[0];   const setOpenRow = so[1];
     const se = useState(null);  const editRow = se[0];   const setEditRow = se[1];
     const srk = useState(0);    const refreshKey = srk[0]; const setRefreshKey = srk[1];
@@ -329,7 +398,13 @@ function DetailDrawer(p) {
         });
       }).catch(() => {});
     }
-    const helpers = { reload, reloadUntil, closeDetail: () => setOpenRow(null), refresh: () => setRefreshKey(k => k + 1), reloadKeepOpen: () => reload(openRow ? getId(openRow) : null), getImage: row => (config.getImage ? config.getImage(row, imgMap) : ''), exitSelect: () => { setSelectMode(false); setSelected({}); } };
+    const helpers = { reload, reloadUntil, closeDetail: () => setOpenRow(null), refresh: () => setRefreshKey(k => k + 1), reloadKeepOpen: () => reload(openRow ? getId(openRow) : null), getImage: row => (config.getImage ? config.getImage(row, imgMap) : ''), exitSelect: () => { setSelectMode(false); setSelected({}); }, openNewWithPrefill: function(data) { setNewPrefill(data || null); setNewOpen(true); },
+      // 2026-07: exposed so a custom config.quickActions entry can trigger
+      // the standard edit-drawer/delete-confirm flows too, not just brand
+      // new custom actions — otherwise a view defining quickActions would
+      // have no way to reach the same Edit/Delete behavior every other
+      // view gets for free via the default pair.
+      openEdit: r => setEditRow(r), confirmDelete: r => onDelete(r) };
 
     useEffect(function() {
       reload();
@@ -421,7 +496,7 @@ function DetailDrawer(p) {
         : ce('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
             ce('div', { style: { fontSize: 18, fontWeight: 800, color: '#0f172a' } }, config.title || 'List'),
             ce('div', { style: { display: 'flex', gap: 8 } },
-              (config.newForm || config.renderNewDrawer) ? ce('button', { onClick: () => setNewOpen(true), style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 10, width: 40, height: 40, fontSize: 22, fontWeight: 700, cursor: 'pointer', lineHeight: 1 } }, '+') : null,
+              (config.newForm || config.renderNewDrawer) ? ce('button', { onClick: () => { setNewPrefill(null); setNewOpen(true); }, style: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 10, width: 40, height: 40, fontSize: 22, fontWeight: 700, cursor: 'pointer', lineHeight: 1 } }, '+') : null,
               (config.bulkActions && config.bulkActions.length) ? ce('button', { onClick: () => setSelectMode(true), title: 'Select', style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e5e7eb', background: '#fff', borderRadius: 10, width: 40, height: 40, color: '#475569', cursor: 'pointer' } },
                 ce('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none' }, ce('path', { d: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01', stroke: '#475569', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }))) : null)),
 
@@ -438,7 +513,7 @@ function DetailDrawer(p) {
         : filtered.length === 0 ? ce('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, config.emptyText || 'Nothing matches this filter')
           : paged.map(row => ce(Card, {
               key: getId(row), row: row, summary: summaries, imgMap: imgMap, getImage: getImage,
-              selectMode: selectMode, selected: !!selected[getId(row)],
+              selectMode: selectMode, selected: !!selected[getId(row)], helpers: helpers,
               onOpen: setOpenRow, onDelete: onDelete, onEdit: setEditRow, onToggleSelect: toggleSelect,
             })),
 
@@ -452,7 +527,7 @@ function DetailDrawer(p) {
       }) : null,
 
       config.renderNewDrawer
-        ? config.renderNewDrawer({ open: newOpen, onClose: () => setNewOpen(false), helpers: helpers })
+        ? config.renderNewDrawer({ open: newOpen, onClose: () => { setNewOpen(false); setNewPrefill(null); }, helpers: helpers, prefillData: newPrefill })
         : (config.newForm ? ce(FormDrawer, { mode: 'new', open: newOpen, extra: extra, onClose: () => setNewOpen(false), onDone: () => { setNewOpen(false); reload(); } }) : null),
 
       config.renderEditDrawer
