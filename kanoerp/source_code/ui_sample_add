@@ -1,0 +1,223 @@
+// ui_sample_add — shared "Add Sample" drawer.
+//
+// Exports: { SampleCreateDrawer }
+//
+// Section-1 fields (name/description/collection/type/designer/isNew/status)
+// and the reference-images picker are shared with ui_sample_edit via
+// lib_sample_details_fields, so the two forms can't drift apart.
+//
+// Depends on (loaded lazily via this module's own loadCode, since a
+// new Function-loaded module doesn't inherit its host's loader closure):
+//   lib_attachment_upload      — uploadAttachment(), buildImgUrl()
+//   lib_current_user           — getCurrentUserEmail(), emailLocalPart()
+//   lib_sample_details_fields  — SampleDetailsFields, ReferenceImagesPicker
+//   lib_rich_text_editor       — RichTextEditor (used for the description field)
+//
+// Props:
+//   open, onClose, onCreated(newSampleId)
+//   collections            [{id, name}]
+//   defaultCollectionId    string|number|null
+//   designerMap            { enumValue: label }
+//   typeOptions            [{value, label}]
+//   statusOptions          [{value, label}]
+//   defaultStatus          string (e.g. 'ideas')
+//   DrawerShell            component from lib_drawer_shell, or null to fall
+//                          back to a plain antd Drawer
+
+var useState = React.useState;
+var useEffect = React.useEffect;
+var createElement = React.createElement;
+var Drawer = antd.Drawer;
+
+// ── self-contained module loader (mirrors the host app's loadCode) ──
+var _codeCache = {};
+function loadCode(name) {
+  if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
+  return ctx.api.resource('source_code').list({ filter: { name: name }, fields: ['code'], pageSize: 1 })
+    .then(function (res) {
+      var rows = (res && res.data && res.data.data) || [];
+      var src = (rows[0] && rows[0].code) || '';
+      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
+      return _codeCache[name];
+    });
+}
+
+var _depsPromise = Promise.all([
+  loadCode('lib_attachment_upload'),
+  loadCode('lib_current_user'),
+  loadCode('lib_sample_details_fields'),
+  loadCode('lib_rich_text_editor'),
+]).then(function (mods) {
+  return { upload: mods[0], user: mods[1], fields: mods[2], rte: mods[3] };
+});
+
+
+
+var SampleCreateDrawer = function(props) {
+  var open                = props.open;
+  var onClose             = props.onClose;
+  var onCreated           = props.onCreated;
+  var collections         = props.collections || [];
+  var defaultCollectionId = props.defaultCollectionId;
+  var designerMap         = props.designerMap || {};
+  var typeOptions         = props.typeOptions || [];
+  var statusOptions       = props.statusOptions || [];
+  var defaultStatus       = props.defaultStatus || (statusOptions[0] && statusOptions[0].value) || null;
+  var DrawerShellComp     = props.DrawerShell;
+
+  var sDeps  = useState(null);    var deps        = sDeps[0];  var setDeps        = sDeps[1];
+  var sForm  = useState({});      var form        = sForm[0];  var setForm        = sForm[1];
+  var sImgs  = useState([]);      var images      = sImgs[0];  var setImages      = sImgs[1];
+  var sImgUp = useState(false);   var imgUploading = sImgUp[0]; var setImgUploading = sImgUp[1];
+  var sSub   = useState(false);   var submitting  = sSub[0];   var setSubmitting  = sSub[1];
+  var sErr   = useState(null);    var error       = sErr[0];   var setError       = sErr[1];
+  var sRK    = useState(0);       var resetKey    = sRK[0];    var setResetKey    = sRK[1];
+
+  useEffect(function() {
+    _depsPromise.then(setDeps).catch(function(e) {
+      console.error('Failed to load ui_sample_add dependencies:', e);
+      setError('Failed to load form dependencies: ' + ((e && e.message) || e));
+    });
+  }, []);
+
+  // Reset the form each time the drawer opens, and default collection/designer.
+  // resetKey bumps so the RichTextEditor (uncontrolled after mount) actually
+  // clears its content for the new blank form instead of keeping stale text.
+  useEffect(function() {
+    if (!open) return;
+    setForm({
+      name: '', description: '', type: null, isNew: true, status: defaultStatus,
+      collectionId: defaultCollectionId ? String(defaultCollectionId) : null,
+      designer: null,
+    });
+    setImages([]); setError(null); setSubmitting(false);
+    setResetKey(function(k) { return k + 1; });
+
+    if (!deps) return;
+    deps.user.getCurrentUserEmail().then(function(email) {
+      var local = deps.user.emailLocalPart(email).toLowerCase();
+      if (!local) return;
+      var matchKey = Object.keys(designerMap).find(function(k) { return String(k).toLowerCase() === local; });
+      setForm(function(prev) { return Object.assign({}, prev, { designer: matchKey || local || null }); });
+    }).catch(function() {});
+  }, [open, deps]);
+
+
+  function setField(key, val) {
+    setForm(function(prev) { return Object.assign({}, prev, { [key]: val }); });
+  }
+
+  function handleAddFiles(files) {
+    if (!deps) return;
+    setImgUploading(true);
+    (async function() {
+      for (var i = 0; i < files.length; i++) {
+        try {
+          var att = await deps.upload.uploadAttachment(files[i], 'sample.reference_images');
+          setImages(function(prev) {
+            return prev.concat([{ id: att.id, url: deps.upload.buildImgUrl(att.filename, att.url), name: att.title || att.filename }]);
+          });
+        } catch (e2) {
+          console.error('Reference image upload failed:', e2);
+          setError('One or more images failed to upload: ' + ((e2 && e2.message) || e2));
+        }
+      }
+      setImgUploading(false);
+    })();
+  }
+
+  function removeImage(id) {
+    setImages(function(prev) { return prev.filter(function(im) { return im.id !== id; }); });
+  }
+
+  function handleSubmit() {
+    if (!form.name || !form.name.trim()) { setError('Name is required.'); return; }
+    if (!form.collectionId) { setError('Please pick a collection.'); return; }
+    setError(null);
+    setSubmitting(true);
+
+    var values = {
+      name: form.name.trim(),
+      description: form.description || '',
+      fk_collection_id: form.collectionId,
+      type: form.type || null,
+      designer: form.designer || null,
+      is_new: !!form.isNew,
+      status: form.status || defaultStatus,
+    };
+
+    Promise.resolve()
+      .then(function() { return ctx.api.resource('sample').create({ values: values }); })
+      .then(function(res) {
+        var newId = (res && res.data && res.data.data && res.data.data.id) || (res && res.data && res.data.id);
+        if (!newId) throw new Error('Sample created but no id was returned.');
+        if (!images.length) return newId;
+        var ids = images.map(function(im) { return im.id; });
+        return ctx.api.resource('sample.reference_images', newId).add({ values: ids }).then(function() { return newId; });
+      })
+      .then(function(newId) {
+        setSubmitting(false);
+        if (onCreated) onCreated(newId);
+      })
+      .catch(function(err) {
+        console.error('Create sample failed:', err);
+        setError((err && err.message) || 'Failed to create sample.');
+        setSubmitting(false);
+      });
+  }
+
+  if (!open) return null;
+
+  var bodyContent = !deps
+    ? createElement('div', { style: { padding: 40, textAlign: 'center', color: '#94a3b8' } }, 'Loading…')
+    : createElement('div', { style: { padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 18, overflowY: 'auto', flex: 1 } },
+        error ? createElement('div', { style: { background: '#fef2f2', border: '1px solid #fca5a5', color: '#dc2626', borderRadius: 6, padding: '8px 12px', fontSize: 12 } }, error) : null,
+
+        createElement(deps.fields.ReferenceImagesPicker, {
+          images: images, onAddFiles: handleAddFiles, onRemove: removeImage, uploading: imgUploading,
+        }),
+
+        createElement(deps.fields.SampleDetailsFields, {
+          values: form, onChange: setField,
+          collections: collections, designerMap: designerMap,
+          typeOptions: typeOptions, statusOptions: statusOptions,
+          RichTextEditor: deps.rte.RichTextEditor,
+          richTextKey: 'rte_add_' + resetKey,
+          onUploadImage: function(file) {
+            return deps.upload.uploadAttachment(file, 'sample.reference_images')
+              .then(function(att) { return deps.upload.buildImgUrl(att.filename, att.url); });
+          },
+        }),
+
+        createElement('div', { style: { display: 'flex', gap: 8, marginTop: 4 } },
+          createElement('button', {
+            onClick: handleSubmit,
+            disabled: submitting,
+            style: {
+              flex: 1, padding: '9px 0', fontSize: 13, fontWeight: 700, cursor: submitting ? 'default' : 'pointer',
+              border: 'none', borderRadius: 6, background: submitting ? '#c7c2ff' : '#6366f1', color: '#fff',
+            }
+          }, submitting ? 'Creating…' : 'Create Sample'),
+          createElement('button', {
+            onClick: onClose,
+            style: { padding: '9px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', color: '#64748b' }
+          }, 'Cancel')
+        ),
+        createElement('div', { style: { width: '100%', height: 40 } })
+      );
+
+  if (DrawerShellComp) {
+    return createElement(DrawerShellComp, {
+      open: true, onClose: onClose, title: 'Add Sample',
+      accentColor: '#6366f1', width: 440, placement: 'right', rootClassName: 'sample-create-drawer',
+    }, bodyContent);
+  }
+
+  return createElement(Drawer, {
+    open: true, onClose: onClose, placement: 'right', width: 440,
+    title: 'Add Sample',
+    bodyStyle: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' },
+  }, bodyContent);
+};
+
+return { SampleCreateDrawer: SampleCreateDrawer };
