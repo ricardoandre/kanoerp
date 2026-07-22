@@ -585,9 +585,6 @@ for its exact path/name).
 - **6 legacy `product_marker` rows** from when that collection's second FK column
   meant `product_variant.code` instead of its current meaning, `product.code` —
   values no longer match anything. Delete or manually correct.
-- **`ui_result_import`/`ui_result_bulk_add`** — planned modules for importing/
-  bulk-adding production results, referenced by `view_production_result.js`'s own
-  code with a graceful "not installed yet" fallback, but not yet built.
 - Optional cleanup: normalize inconsistent `.js` extensions across files.
 
 ---
