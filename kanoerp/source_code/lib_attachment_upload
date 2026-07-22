@@ -1,0 +1,50 @@
+// lib_attachment_upload — shared attachment upload helper.
+//
+// Exports: { uploadAttachment(file, attachmentField), buildImgUrl(filename, url) }
+//
+// ctx.api.request(...) is the confirmed-working upload method for this app
+// (proven against attachments:create in both the canvas view and the
+// sample-create drawer). Falls back to ctx.api.axios.post if present.
+// Wrapped in Promise.resolve().then(...) so ANY synchronous throw (e.g. an
+// unexpected ctx.api shape, or FormData being unavailable/blocked in this
+// sandbox) becomes a rejected promise instead of an uncaught exception —
+// otherwise a caller's .catch never runs and an "uploading" UI state can get
+// stuck forever with no error shown.
+
+function uploadAttachment(file, attachmentField) {
+  return Promise.resolve().then(function() {
+    var FD = (typeof window !== 'undefined' && window.FormData) ? window.FormData
+            : (typeof FormData !== 'undefined' ? FormData : null);
+    var fd;
+    try {
+      fd = new FD();
+    } catch (e) {
+      throw new Error(
+        'FormData is unavailable in this context (typeof FormData=' + typeof FormData + '). ' +
+        'Original error: ' + (e && e.message)
+      );
+    }
+    fd.append('file', file);
+    var cfg = { url: 'attachments:create', method: 'POST', params: { attachmentField: attachmentField }, data: fd };
+
+    if (ctx.api && typeof ctx.api.request === 'function') {
+      return ctx.api.request(cfg);
+    }
+    if (ctx.api && ctx.api.axios && typeof ctx.api.axios.post === 'function') {
+      return ctx.api.axios.post(cfg.url, fd, { params: cfg.params });
+    }
+    throw new Error('No usable upload method found on ctx.api (checked ctx.api.request and ctx.api.axios.post).');
+  }).then(function(res) {
+    var att = res && res.data && res.data.data;
+    if (!att || !att.id) throw new Error('Upload succeeded but no attachment id came back. Raw response: ' + JSON.stringify(res && res.data));
+    return att;
+  });
+}
+
+function buildImgUrl(filename, url) {
+  if (url) return url;
+  if (filename) return window.location.origin + '/storage/uploads/' + filename;
+  return '';
+}
+
+return { uploadAttachment: uploadAttachment, buildImgUrl: buildImgUrl };
