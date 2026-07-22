@@ -1,0 +1,33 @@
+// lib_current_user — best-effort lookup of the logged-in user's email.
+//
+// Exports: { getCurrentUserEmail(), emailLocalPart(email) }
+//
+// No confirmed single source for "who's logged in" exists elsewhere in this
+// codebase yet, so this tries a few plausible ctx shapes first (cheap,
+// synchronous), then falls back to NocoBase's standard auth:check action
+// (the framework's built-in "who am I" endpoint). If everything fails,
+// callers should treat this as a convenience default only — not a hard
+// requirement — and leave the dependent field blank/manually selectable.
+
+function getCurrentUserEmail() {
+  return Promise.resolve().then(function() {
+    if (ctx.currentUser && ctx.currentUser.email) return ctx.currentUser.email;
+    if (ctx.user && ctx.user.email) return ctx.user.email;
+    if (ctx.api && ctx.api.auth && ctx.api.auth.user && ctx.api.auth.user.email) return ctx.api.auth.user.email;
+    if (ctx.api && typeof ctx.api.request === 'function') {
+      return ctx.api.request({ url: 'auth:check', method: 'get' }).then(function(res) {
+        var u = res && res.data && res.data.data;
+        return (u && u.email) || null;
+      });
+    }
+    return null;
+  }).catch(function() { return null; });
+}
+
+function emailLocalPart(email) {
+  if (!email) return '';
+  var idx = String(email).indexOf('@');
+  return idx > -1 ? String(email).slice(0, idx) : String(email);
+}
+
+return { getCurrentUserEmail: getCurrentUserEmail, emailLocalPart: emailLocalPart };
