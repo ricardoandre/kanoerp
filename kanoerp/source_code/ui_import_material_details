@@ -13,6 +13,16 @@
 // skipped and reported — no update/overwrite path (matches
 // ui_import_product_material's behavior).
 //
+// FIX (2026-07): runCreates()'s create payload sent the value under the key
+// `material` instead of `fk_material_code` — the field name this header
+// comment (and the rest of this codebase, e.g. col-production-material,
+// ui_production_detail.js) documents and confirms. `material` isn't a real
+// field on this collection, so every import row was either silently
+// dropping the material link or failing outright, since fk_material_code
+// is required. Every other part of the classification/preview logic
+// (existing-code check, raw_material lookup) was already correctly using
+// fk_material_code — only the final create call had the wrong key.
+//
 // SANDBOX NOTE (same environment as the other importers): SES lockdown
 // blocks document.* property access, fetch(), writing to any global, and
 // `new FileReader()`. So:
@@ -54,11 +64,6 @@ function runSql(ctx, uid, sql) {
     .then(r => r || []).catch(() => []);
 }
 
-// Reads the File object antd's Upload already handed us. Deliberately NOT
-// `new FileReader()` — that constructor is blocked in this sandbox, same as
-// document.* and fetch(). Blob.prototype.text() is an instance method on an
-// object the platform already gave us, not a global we're instantiating, so
-// it isn't subject to the same restriction.
 function readFileAsText(file) {
   if (file && typeof file.text === 'function') return file.text();
   return Promise.reject(new Error('Cannot read this file in this sandbox.'));
@@ -89,9 +94,6 @@ function detectDelimiter(firstLine) {
   return best;
 }
 
-// Shared normalizer: raw = array of row-arrays (cells: code,
-// fk_material_code, variant, supplier_variant_code). Skips a header row
-// heuristically. Rows where ALL FOUR cells are blank are dropped silently.
 function rowsFromCells(raw) {
   if (!raw || !raw.length) return [];
   let start = 0;
@@ -108,7 +110,7 @@ function rowsFromCells(raw) {
     const fk_material_code = String(r[1] == null ? '' : r[1]).trim();
     const variant = String(r[2] == null ? '' : r[2]).trim();
     const supplier_variant_code = String(r[3] == null ? '' : r[3]).trim();
-    if (!code && !fk_material_code && !variant && !supplier_variant_code) continue; // fully blank row — ignore
+    if (!code && !fk_material_code && !variant && !supplier_variant_code) continue;
     out.push({ code: code, fk_material_code: fk_material_code, variant: variant, supplier_variant_code: supplier_variant_code, row: i + 1 });
   }
   return out;
@@ -126,13 +128,13 @@ function parseCsvRows(text) { return rowsFromCells(csvToCells(text)); }
 function ImportContent(props) {
   const ctx = props.ctx;
   const onSaved = props.onSaved;
-  const sP = useState('pick'); const phase = sP[0]; const setPhase = sP[1]; // pick | parsing | preview | running | done
+  const sP = useState('pick'); const phase = sP[0]; const setPhase = sP[1];
   const sErr = useState(''); const err = sErr[0]; const setErr = sErr[1];
   const sRows = useState([]); const rows = sRows[0]; const setRows = sRows[1];
   const sToCreate = useState([]); const toCreate = sToCreate[0]; const setToCreate = sToCreate[1];
-  const sDup = useState([]); const dup = sDup[0]; const setDup = sDup[1]; // code already exists
-  const sNoMaterial = useState([]); const noMaterial = sNoMaterial[0]; const setNoMaterial = sNoMaterial[1]; // fk_material_code not found
-  const sInvalid = useState([]); const invalid = sInvalid[0]; const setInvalid = sInvalid[1]; // missing code / fk_material_code
+  const sDup = useState([]); const dup = sDup[0]; const setDup = sDup[1];
+  const sNoMaterial = useState([]); const noMaterial = sNoMaterial[0]; const setNoMaterial = sNoMaterial[1];
+  const sInvalid = useState([]); const invalid = sInvalid[0]; const setInvalid = sInvalid[1];
   const sBlankSkipped = useState(0); const blankSkipped = sBlankSkipped[0]; const setBlankSkipped = sBlankSkipped[1];
   const sProg = useState({ done: 0, total: 0 }); const prog = sProg[0]; const setProg = sProg[1];
   const sRes = useState({ created: 0, errors: [] }); const results = sRes[0]; const setResults = sRes[1];
@@ -194,7 +196,9 @@ function ImportContent(props) {
     for (let i = 0; i < toCreate.length; i++) {
       const row = toCreate[i];
       try {
-        const values = { code: row.code, material: row.fk_material_code };
+        // FIX: was `material: row.fk_material_code` — the confirmed field
+        // name is `fk_material_code` (see header note at top of file).
+        const values = { code: row.code, fk_material_code: row.fk_material_code };
         if (row.variant) values.variant = row.variant;
         if (row.supplier_variant_code) values.supplier_variant_code = row.supplier_variant_code;
         await ctx.api.resource('material_details').create({ values: values });
@@ -286,7 +290,6 @@ function ImportContent(props) {
       ce('div', { style: { marginTop: 8, color: '#6b7280', fontSize: 13 } }, 'Creating ' + prog.done + ' / ' + prog.total + '…'));
   }
 
-  // done
   function statRow(label, value, color) {
     return ce('div', { style: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #f1f5f9' } },
       ce('span', { style: { color: '#475569' } }, label),
@@ -325,7 +328,6 @@ function ImportContent(props) {
       ce(Button, { type: 'primary', onClick: close }, 'Close')));
 }
 
-// ===== entry point: mirrors ui_material_out's openModal shell exactly =====
 function openModal(args) {
   const ctx = args.ctx;
   const onSaved = args.onSaved;
