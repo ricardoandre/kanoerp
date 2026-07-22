@@ -19,21 +19,31 @@
 //         detail can be opened from anywhere (e.g. production_material).
 //         onEdit(productionId) / onDelete(productionId) are caller-supplied.
 //
+// 2026-07 MIGRATION: every data-layer function moved off raw ctx.sql onto
+// ctx.api.resource() (fetchAllPages/fetchByIn) — ctx.sql is admin/root-gated
+// and silently fails for non-admin roles (README §3). This was the shared
+// detail view for BOTH the list-engine popup (view_production.js) and the
+// native record popup (act_production_view) — non-admin users opening
+// EITHER entry point would have seen a mostly-empty detail. All rendering
+// logic (the Section* components, DetailBody, ProductionDetailDrawer) is
+// UNCHANGED — only the data-fetching functions above them were rewritten.
+//
+// FIX (marker_remarks): fetchDetailMeta selected a `marker` column that does
+// not exist — the real column is `marker_remarks` (same bug already fixed in
+// ui_production_edit.js and ui_production_addmarker.js).
+//
+// FIX (product image): fetchProductImage used to manually introspect the
+// `fields` meta-collection to find product.image's junction table — same
+// admin-gating problem as a getRels()-style lookup, just for an attachment
+// relation instead of a belongsTo. Replaced with `appends: ['image']`, the
+// same proven pattern already used in view_production.js's
+// fetchProductImages.
+//
 // Depends on: none.
 //
 // NOTE: status colors live HERE (the detail is now self-contained); each list
 // view still keeps its own card status colors. Slight duplication is intended
 // per the "status stays in the view" philosophy — the detail simply owns its.
-//
-// MARKER SECTION (updated): now reads the relational marker system —
-// production_marker (link) → marker (length) → marker_details (per-size
-// quantity, via sku_option) — instead of the old free-text `marker` HTML
-// field on production. Fetched via ctx.api.resource (non-admin-safe), not
-// ctx.sql, per the current standard (ctx.sql is admin/root-gated and fails
-// silently for non-admin roles — see recent project notes). Includes an
-// "Add marker" button that lazy-loads ui_production_addmarker and opens its
-// modal, mirroring the pattern already used elsewhere (act_ shells that
-// loadCode() a source_code row and call its openModal()).
 // =====================================================
 const { Drawer, Dropdown, Spin } = antd;
 const ce = React.createElement;
@@ -52,26 +62,50 @@ const sColor = v => (STATUS[String(v || '').toLowerCase()] || {}).color || '#9ca
 const sBg    = v => (STATUS[String(v || '').toLowerCase()] || {}).bg    || '#f3f4f6';
 const sLabel = v => (STATUS[String(v || '').toLowerCase()] || {}).label || (v || '-');
 
-// ── helpers ──
-// this row composes another shared row → its own loader (ctx is injected)
+// ── resource-based read helpers (non-admin-safe), same pattern used
+// throughout the rest of this codebase ──
+const DEFAULT_PAGE_SIZE = 1000;
+function fetchAllPages(resourceName, params) {
+  const pageSize = (params && params.pageSize) || DEFAULT_PAGE_SIZE;
+  function loadPage(page, acc) {
+    return ctx.api.resource(resourceName).list(Object.assign({}, params, { pageSize: pageSize, page: page }))
+      .then(function (res) {
+        const rows = (res && res.data && res.data.data) || [];
+        const merged = acc.concat(rows);
+        if (rows.length < pageSize) return merged;
+        return loadPage(page + 1, merged);
+      });
+  }
+  return loadPage(1, []);
+}
+function chunk(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
+function uniqVals(a) { const out = [], seen = {}; a.forEach(x => { if (x == null) return; const k = String(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+function fetchByIn(resourceName, field, values, params) {
+  const values2 = uniqVals(values);
+  if (!values2.length) return Promise.resolve([]);
+  const batches = chunk(values2, 150);
+  return batches.reduce(function (p, batch) {
+    return p.then(function (acc) {
+      const filter = Object.assign({}, (params && params.filter) || {});
+      filter[field] = { $in: batch };
+      return fetchAllPages(resourceName, Object.assign({}, params, { filter: filter })).then(rows => acc.concat(rows));
+    });
+  }, Promise.resolve([]));
+}
+
+// this row composes another shared row → its own loader (resource-based, non-admin-safe)
 const _codeCache = {};
 function loadCode(name) {
   if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
-  const uid = 'code_' + name;
-  return ctx.sql.save({ uid, dataSourceKey: 'main', sql: "SELECT code FROM source_code WHERE name='" + name + "'" })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(rows => {
-      const src = (rows && rows[0] && rows[0].code) || '';
+  return ctx.api.resource('source_code').list({ filter: { name: name }, fields: ['code'], pageSize: 1 })
+    .then(function (res) {
+      const rows = (res && res.data && res.data.data) || [];
+      const src = (rows[0] && rows[0].code) || '';
       _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(React, antd, dayjs, ctx);
       return _codeCache[name];
     });
 }
 
-function runSql(uid, sql) {
-  return ctx.sql.save({ uid, sql, dataSourceKey: 'main' })
-    .then(() => ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }))
-    .then(r => r || []);
-}
 const num = v => Number(v == null ? 0 : v);
 const diffColor = v => v < 0 ? '#ef4444' : v > 0 ? '#22c55e' : '#9ca3af';
 const diffLabel = v => v > 0 ? '+' + v : String(v);
@@ -156,178 +190,202 @@ const DetailStyles = () => ce('style', null, DETAIL_CSS);
 // DATA LAYER (all keyed by productionId)
 // =====================================================
 function fetchHeader(id) {
-  return runSql('pd_hdr_' + id,
-    "SELECT production.id AS id, production.production_ref, production.status, production.is_new, " +
-    "  production.est_production_start, production.est_production_finish, " +
-    "  product.code AS product_code, product.name AS product_name, konveksi.name AS konveksi_name " +
-    "FROM production " +
-    "JOIN product  ON production.fk_product_code  = product.code " +
-    "JOIN konveksi ON production.fk_konveksi_code = konveksi.code " +
-    "WHERE production.id = '" + id + "'"
-  ).then(r => r[0] || {});
+  return fetchAllPages('production', {
+    filter: { id: id },
+    appends: ['product_code', 'konveksi'],
+    pageSize: 1,
+  }).then(function (rows) {
+    const p = rows[0];
+    if (!p) return {};
+    const product = p.product_code || {};
+    const konveksi = p.konveksi || {};
+    return {
+      id: p.id, production_ref: p.production_ref, status: p.status, is_new: p.is_new,
+      est_production_start: p.est_production_start, est_production_finish: p.est_production_finish,
+      product_code: product.code, product_name: product.name, konveksi_name: konveksi.name,
+    };
+  });
 }
 
-// image: attachment fields aren't SQL columns. Introspect product.image's
-// through-table + keys from `fields`, then join `attachments` for one product.
+// image via appends:['image'] — same proven pattern as view_production.js's
+// fetchProductImages, instead of introspecting the `fields` meta-collection
+// (admin-gated, same problem class as a getRels()-style lookup).
 function fetchProductImage(productCode) {
   if (!productCode) return Promise.resolve('');
-  return runSql('pd_imgmeta',
-    "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name='product' AND name='image'"
-  ).then(function(rows) {
-    if (!rows.length) return '';
-    let opt = {}; try { opt = JSON.parse(rows[0].options || '{}'); } catch (e) { return ''; }
-    const through = opt.through, fk = opt.foreignKey, ok = opt.otherKey, sk = opt.sourceKey || 'id';
-    if (!through || !fk || !ok) return '';
-    return runSql('pd_imgjoin_' + productCode,
-      "SELECT attachments.url AS url, attachments.filename AS filename FROM product " +
-      "JOIN " + through + " ON " + through + "." + fk + " = product." + sk + " " +
-      "JOIN attachments ON attachments.id = " + through + "." + ok + " " +
-      "WHERE product.code = '" + productCode + "' ORDER BY attachments.id ASC LIMIT 1"
-    ).then(function(irows) { const r = irows[0]; return r ? (r.url || (r.filename ? '/storage/uploads/' + r.filename : '')) : ''; });
-  }).catch(() => '');
+  return fetchAllPages('product', { filter: { code: productCode }, fields: ['code'], appends: ['image'], pageSize: 1 })
+    .then(function (rows) {
+      const p = rows[0];
+      if (!p) return '';
+      const img = p.image;
+      const imgRow = Array.isArray(img) ? img[0] : img;
+      if (!imgRow) return '';
+      return imgRow.url || (imgRow.filename ? '/storage/uploads/' + imgRow.filename : '');
+    }).catch(() => '');
 }
 
+// marker_remarks — NOT `marker` (that column doesn't exist; see FIX note at
+// top of file).
 function fetchDetailMeta(id) {
-  // marker_remarks: free-text notes field on production (what the old
-  // `marker` column became). Distinct from the relational marker system
-  // (production_marker / marker / marker_details) read by fetchMarkers().
-  return runSql('pd_dmeta_' + id, "SELECT remarks, marker_remarks, planning_rol, brand FROM production WHERE id = '" + id + "'").then(r => r[0] || {});
+  return fetchAllPages('production', { filter: { id: id }, fields: ['remarks', 'marker_remarks', 'planning_rol', 'brand'], pageSize: 1 })
+    .then(function (rows) { return rows[0] || {}; });
 }
 
 function fetchMaterial(id) {
   return Promise.all([
-    runSql('pd_dmeta2_' + id, "SELECT planning_rol FROM production WHERE id = '" + id + "'"),
-    runSql('pd_dmat_' + id,
-      "SELECT pm.id AS id, pm.fk_material_details_code AS material_code, " +
-      "  pm.status AS status, pm.shipment_date AS shipment_date, pm.quantity_need AS quantity_need, " +
-      "  raw_material.type AS material_type, raw_material.default_content AS default_content " +
-      "FROM production_material pm " +
-      "JOIN material_details ON pm.fk_material_details_code = material_details.code " +
-      "JOIN raw_material ON material_details.fk_material_code = raw_material.code " +
-      "WHERE pm.fk_production_id = '" + id + "'"),
-    runSql('pd_dsamp_' + id, "SELECT fk_sample_product_code, status, shipment_date, returned_date FROM production_sample WHERE fk_production_id = '" + id + "'"),
-    runSql('pd_ddo_' + id, "SELECT COALESCE(SUM(quantity),0) AS total_do FROM production_quantity_details WHERE fk_production_id = '" + id + "'"),
-  ]).then(function(meta) {
-    const planningRol = num(meta[0] && meta[0][0] && meta[0][0].planning_rol);
-    const materialRows = meta[1] || [];
-    const samples = meta[2] || [];
-    const totalDo = num(meta[3] && meta[3][0] && meta[3][0].total_do);
-    const fabrics = materialRows.filter(m => String(m.material_type || '').toLowerCase() === 'fabric');
-    const accs    = materialRows.filter(m => String(m.material_type || '').toLowerCase() !== 'fabric');
+    fetchAllPages('production', { filter: { id: id }, fields: ['planning_rol'], pageSize: 1 }),
+    fetchAllPages('production_material', {
+      filter: { fk_production_id: id },
+      fields: ['id', 'fk_material_details_code', 'status', 'shipment_date', 'quantity_need'],
+      appends: ['material_details'],
+    }),
+    fetchAllPages('production_sample', { filter: { fk_production_id: id }, fields: ['fk_sample_product_code', 'status', 'shipment_date', 'returned_date'] }),
+    fetchAllPages('production_quantity_details', { filter: { fk_production_id: id }, fields: ['quantity'] }),
+  ]).then(function (r) {
+    const planningRol = num(r[0][0] && r[0][0].planning_rol);
+    const pmRows = r[1] || [];
+    const samples = r[2] || [];
+    const totalDo = (r[3] || []).reduce(function (s, x) { return s + num(x.quantity); }, 0);
 
-    function withDetails(rows) {
-      return Promise.all(rows.map(function(m) {
-        return runSql('pd_dlhdr_' + m.id, "SELECT id FROM material_ledger WHERE fk_production_material_id = '" + m.id + "'").then(function(hdr) {
-          const ids = hdr.map(h => h.id).filter(Boolean);
-          if (!ids.length) return Object.assign({}, m, { details: [] });
-          return runSql('pd_dldet_' + m.id, "SELECT details FROM material_ledger_details WHERE fk_material_ledger_id IN (" + ids.join(',') + ")")
-            .then(det => Object.assign({}, m, { details: det.map(d => d.details) }));
+    const materialCodes = uniqVals(pmRows.map(m => m.fk_material_details_code));
+    return fetchByIn('material_details', 'code', materialCodes, { fields: ['code', 'fk_material_code'] }).then(function (mdRows) {
+      const mdByCode = {}; mdRows.forEach(m => { mdByCode[m.code] = m; });
+      const rawCodes = uniqVals(mdRows.map(m => m.fk_material_code));
+      return fetchByIn('raw_material', 'code', rawCodes, { fields: ['code', 'type', 'default_content'] }).then(function (rmRows) {
+        const rmByCode = {}; rmRows.forEach(rm => { rmByCode[rm.code] = rm; });
+
+        const materialRows = pmRows.map(function (m) {
+          const md = m.material_details || mdByCode[m.fk_material_details_code] || {};
+          const rmResolved = rmByCode[md.fk_material_code] || {};
+          return {
+            id: m.id, material_code: m.fk_material_details_code, status: m.status, shipment_date: m.shipment_date, quantity_need: m.quantity_need,
+            material_type: rmResolved.type, default_content: rmResolved.default_content,
+          };
         });
-      }));
-    }
+        const fabrics = materialRows.filter(m => String(m.material_type || '').toLowerCase() === 'fabric');
+        const accs = materialRows.filter(m => String(m.material_type || '').toLowerCase() !== 'fabric');
 
-    return Promise.all([withDetails(fabrics), withDetails(accs)]).then(function(r) {
-      return { fabrics: r[0], accessories: r[1], samples: samples, totalDo: totalDo, planningRol: planningRol };
+        const allMatIds = materialRows.map(m => m.id);
+        return fetchByIn('material_ledger', 'fk_production_material_id', allMatIds, { fields: ['id', 'fk_production_material_id'] }).then(function (ledgerRows) {
+          const ledgerIdsByMatId = {};
+          ledgerRows.forEach(function (l) {
+            const key = String(l.fk_production_material_id);
+            (ledgerIdsByMatId[key] = ledgerIdsByMatId[key] || []).push(l.id);
+          });
+          const allLedgerIds = ledgerRows.map(l => l.id);
+          return fetchByIn('material_ledger_details', 'fk_material_ledger_id', allLedgerIds, { fields: ['fk_material_ledger_id', 'details'] }).then(function (detailRows) {
+            const detailsByLedgerId = {};
+            detailRows.forEach(function (d) {
+              const key = String(d.fk_material_ledger_id);
+              (detailsByLedgerId[key] = detailsByLedgerId[key] || []).push(d.details);
+            });
+            function withDetails(rows) {
+              return rows.map(function (m) {
+                const ledgerIds = ledgerIdsByMatId[String(m.id)] || [];
+                const details = [];
+                ledgerIds.forEach(function (lid) { (detailsByLedgerId[String(lid)] || []).forEach(function (d) { details.push(d); }); });
+                return Object.assign({}, m, { details: details });
+              });
+            }
+            return { fabrics: withDetails(fabrics), accessories: withDetails(accs), samples: samples, totalDo: totalDo, planningRol: planningRol };
+          });
+        });
+      });
     });
   });
 }
 
 function fetchQuantity(id) {
-  const sqlBase =
-    "SELECT sku_option.id AS sku_id, sku_option.display AS variant, pqd.ratio AS ratio, pqd.quantity AS do_quantity, pqd.cut_quantity AS cut_quantity " +
-    "FROM production_quantity_details AS pqd, sku_option " +
-    "WHERE pqd.fk_production_id = '" + id + "' AND pqd.fk_sku_option_id = sku_option.id ORDER BY sku_option.sort ASC";
-  const sqlSent = "SELECT fk_sku_option_id, COALESCE(SUM(quantity),0) AS sent_qty FROM production_result WHERE fk_production_id = '" + id + "' GROUP BY fk_sku_option_id";
-  const sqlQc   = "SELECT fk_sku_option_id, COALESCE(SUM(quantity),0) AS qc_qty FROM qc_result WHERE fk_production_id = '" + id + "' GROUP BY fk_sku_option_id";
-  const sqlPerm = "SELECT SUM(CASE WHEN quantity<0 THEN quantity*-1 ELSE 0 END) AS sent_permakan, SUM(CASE WHEN quantity>0 THEN quantity ELSE 0 END) AS return_permakan FROM production_result WHERE fk_production_id = '" + id + "' AND is_permakan = TRUE";
-  const sqlHistDel =
-    "SELECT production_result.shipment_date AS event_date, production_result.checking_pic, production_result.quantity, production_result.is_permakan, production_result.remarks, production_result.fk_sku_option_id, sku_option.display AS variant " +
-    "FROM production_result, sku_option WHERE production_result.fk_production_id = '" + id + "' AND production_result.fk_sku_option_id = sku_option.id ORDER BY production_result.shipment_date ASC";
-  const sqlHistQc =
-    "SELECT qc_result.qc_date AS event_date, qc_result.qc_person, qc_result.is_defect, qc_result.quantity, qc_result.fk_sku_option_id, sku_option.display AS variant " +
-    "FROM qc_result, sku_option WHERE qc_result.fk_production_id = '" + id + "' AND qc_result.fk_sku_option_id = sku_option.id ORDER BY qc_result.qc_date ASC";
-
   return Promise.all([
-    runSql('pd_qbase_' + id, sqlBase),
-    runSql('pd_qsent_' + id, sqlSent),
-    runSql('pd_qqc_'   + id, sqlQc),
-    runSql('pd_qperm_' + id, sqlPerm),
-    runSql('pd_qhd_'   + id, sqlHistDel),
-    runSql('pd_qhq_'   + id, sqlHistQc),
-  ]).then(function(r) {
-    const base = r[0], sentR = r[1], qcR = r[2], permR = r[3], histDel = r[4], histQc = r[5];
+    fetchAllPages('production_quantity_details', { filter: { fk_production_id: id }, fields: ['fk_sku_option_id', 'ratio', 'quantity', 'cut_quantity'], appends: ['sku_option'] }),
+    fetchAllPages('production_result', { filter: { fk_production_id: id }, fields: ['fk_sku_option_id', 'quantity'] }),
+    fetchAllPages('qc_result', { filter: { fk_production_id: id }, fields: ['fk_sku_option_id', 'quantity'] }),
+    fetchAllPages('production_result', { filter: { fk_production_id: id, is_permakan: true }, fields: ['quantity'] }),
+    fetchAllPages('production_result', { filter: { fk_production_id: id }, fields: ['shipment_date', 'checking_pic', 'quantity', 'is_permakan', 'remarks', 'fk_sku_option_id'], appends: ['sku_option'] }),
+    fetchAllPages('qc_result', { filter: { fk_production_id: id }, fields: ['qc_date', 'qc_person', 'is_defect', 'quantity', 'fk_sku_option_id'], appends: ['sku_option'] }),
+  ]).then(function (r) {
+    const base = r[0], sentR = r[1], qcR = r[2], permR = r[3], histDelRaw = r[4], histQcRaw = r[5];
     const sentMap = {}, qcMap = {};
-    sentR.forEach(x => { sentMap[String(x.fk_sku_option_id)] = num(x.sent_qty); });
-    qcR.forEach(x => { qcMap[String(x.fk_sku_option_id)] = num(x.qc_qty); });
-    const rows = base.map(function(b) {
-      const sid = String(b.sku_id);
-      return { sku_id: sid, variant: b.variant || '(none)', ratio: num(b.ratio), do: num(b.do_quantity), cut: num(b.cut_quantity), sent: sentMap[sid] || 0, qc: qcMap[sid] || 0 };
+    sentR.forEach(x => { const k = String(x.fk_sku_option_id); sentMap[k] = (sentMap[k] || 0) + num(x.quantity); });
+    qcR.forEach(x => { const k = String(x.fk_sku_option_id); qcMap[k] = (qcMap[k] || 0) + num(x.quantity); });
+    const sortedBase = base.slice().sort(function (a, b) { return ((a.sku_option && a.sku_option.sort) || 0) - ((b.sku_option && b.sku_option.sort) || 0); });
+    const rows = sortedBase.map(function (b) {
+      const sid = String(b.fk_sku_option_id);
+      return { sku_id: sid, variant: (b.sku_option && b.sku_option.display) || '(none)', ratio: num(b.ratio), do: num(b.quantity), cut: num(b.cut_quantity), sent: sentMap[sid] || 0, qc: qcMap[sid] || 0 };
     });
+
+    const sentPermakan = permR.reduce(function (s, x) { const q = num(x.quantity); return s + (q < 0 ? -q : 0); }, 0);
+    const returnPermakan = permR.reduce(function (s, x) { const q = num(x.quantity); return s + (q > 0 ? q : 0); }, 0);
+
+    const histDel = histDelRaw.map(function (x) { return { event_date: x.shipment_date, checking_pic: x.checking_pic, quantity: x.quantity, is_permakan: x.is_permakan, remarks: x.remarks, fk_sku_option_id: x.fk_sku_option_id, variant: (x.sku_option && x.sku_option.display) }; });
+    const histQc = histQcRaw.map(function (x) { return { event_date: x.qc_date, qc_person: x.qc_person, is_defect: x.is_defect, quantity: x.quantity, fk_sku_option_id: x.fk_sku_option_id, variant: (x.sku_option && x.sku_option.display) }; });
     const delMap = {}, qcHistMap = {};
     histDel.forEach(e => { const sid = String(e.fk_sku_option_id); (delMap[sid] = delMap[sid] || []).push(Object.assign({}, e, { _type: 'delivery' })); });
     histQc.forEach(e => { const sid = String(e.fk_sku_option_id); (qcHistMap[sid] = qcHistMap[sid] || []).push(Object.assign({}, e, { _type: 'qc' })); });
+
     return {
-      rows, delMap, qcHistMap, perm: permR[0] || {},
+      rows, delMap, qcHistMap, perm: { sent_permakan: sentPermakan, return_permakan: returnPermakan },
       totDo: rows.reduce((s, x) => s + x.do, 0), totCut: rows.reduce((s, x) => s + x.cut, 0),
       totSent: rows.reduce((s, x) => s + x.sent, 0), totQc: rows.reduce((s, x) => s + x.qc, 0),
     };
   });
 }
 
-function fetchHistory(id) {
-  return runSql('pd_dhist_' + id,
-    "SELECT users.nickname AS name, history.create_date AS history_date, history.status, history.message, history.category, history.table_name AS source " +
-    "FROM history, users WHERE history.fk_user_id = users.id AND ( " +
-    "  (history.table_name='production' AND history.table_id=" + id + ") " +
-    "  OR (history.table_name='production_sample' AND history.table_id IN (SELECT id FROM production_sample WHERE fk_production_id=" + id + ")) " +
-    "  OR (history.table_name='production_material' AND history.table_id IN (SELECT id FROM production_material WHERE fk_production_id=" + id + ")) " +
-    ") ORDER BY history_date DESC LIMIT 30"
-  );
+// enum label resolver (single-select fields: checking_pic, qc_person) — show
+// label, not value. Unrelated to the `fields` meta-collection REST endpoint —
+// this is ctx.dataSourceManager, the documented-safe introspection API
+// (README §4) — left unchanged.
+function pdEnumLabelMap(collectionName, fieldName) {
+  try {
+    const ds = ctx.dataSourceManager.getDataSource('main');
+    const col = ds && ds.getCollection(collectionName);
+    const field = col && col.getField(fieldName);
+    const opts = (field && field.enum) || [];
+    const map = {};
+    opts.forEach(function(o) { if (o && typeof o === 'object' && o.value != null) map[String(o.value)] = (o.label != null ? o.label : o.value); });
+    return map;
+  } catch (e) { return {}; }
+}
+const _pdPicLabels = pdEnumLabelMap('production_result', 'checking_pic');
+const _pdQcLabels = pdEnumLabelMap('qc_result', 'qc_person');
+function pdLabel(map, v) { if (v == null || v === '') return ''; const k = String(v); return map[k] != null ? map[k] : v; }
+
+// result history: production_result (Sent) + qc_result (QC), all variants, date desc.
+function fetchResultHistory(id) {
+  return Promise.all([
+    fetchAllPages('production_result', { filter: { fk_production_id: id }, fields: ['shipment_date', 'quantity', 'checking_pic', 'is_permakan', 'remarks'], appends: ['sku_option'] }),
+    fetchAllPages('qc_result', { filter: { fk_production_id: id }, fields: ['qc_date', 'quantity', 'qc_person', 'is_defect'], appends: ['sku_option'] }),
+  ]).then(function(r) {
+    const sent = (r[0] || []).map(function(x) { return { kind: 'sent', date: x.shipment_date, quantity: num(x.quantity), pic: pdLabel(_pdPicLabels, x.checking_pic), is_permakan: !!x.is_permakan, is_defect: false, variant: x.sku_option && x.sku_option.display, remarks: x.remarks }; });
+    const qc = (r[1] || []).map(function(x) { return { kind: 'qc', date: x.qc_date, quantity: num(x.quantity), pic: pdLabel(_pdQcLabels, x.qc_person), is_permakan: false, is_defect: !!x.is_defect, variant: x.sku_option && x.sku_option.display }; });
+    const all = sent.concat(qc);
+    all.sort(function(a, b) { const av = a.date ? new Date(a.date).getTime() : 0; const bv = b.date ? new Date(b.date).getTime() : 0; return bv - av; });
+    return all;
+  });
 }
 
-// Markers — resource-API reads (non-admin-safe), NOT ctx.sql, per current
-// standard. production_marker (link table) → marker (length) → marker_details
-// (per-size quantity, via sku_option). Returns [{ id, length, sizes: [{display,
-// sort, quantity}] }], sorted by marker id ascending (BigInt-safe — snowflake
-// ids can exceed Number.MAX_SAFE_INTEGER).
-function fetchMarkers(id) {
-  return ctx.api.resource('production_marker').list({
-    filter: { fk_production_id: id },
-    fields: ['fk_marker_id'],
-    pageSize: 100,
-  }).then(function(res) {
-    const links = (res && res.data && res.data.data) || [];
-    const markerIds = links.map(l => l.fk_marker_id).filter(Boolean);
-    if (!markerIds.length) return [];
-    return ctx.api.resource('marker').list({
-      filter: { id: { $in: markerIds } },
-      fields: ['id', 'length'],
-      pageSize: 100,
-    }).then(function(mres) {
-      const markers = (mres && mres.data && mres.data.data) || [];
-      markers.sort(function(a, b) {
-        const ba = BigInt(a.id), bb = BigInt(b.id);
-        return ba < bb ? -1 : ba > bb ? 1 : 0;
-      });
-      return ctx.api.resource('marker_details').list({
-        filter: { fk_marker_id: { $in: markerIds } },
-        fields: ['fk_marker_id', 'quantity'],
-        appends: ['sku_option'],
-        pageSize: 500,
-      }).then(function(dres) {
-        const details = (dres && dres.data && dres.data.data) || [];
-        const byMarker = {};
-        details.forEach(function(d) {
-          const key = String(d.fk_marker_id);
-          const so = d.sku_option || {};
-          (byMarker[key] = byMarker[key] || []).push({ display: so.display || '-', sort: so.sort || 0, quantity: d.quantity });
-        });
-        Object.keys(byMarker).forEach(function(k) {
-          byMarker[k].sort(function(a, b) { return a.sort - b.sort; });
-        });
-        return markers.map(function(mk) {
-          return { id: mk.id, length: mk.length, sizes: byMarker[String(mk.id)] || [] };
-        });
+// history entries can belong to production directly, or to a
+// production_sample / production_material that belongs to this production —
+// three separate queries (can't OR-across-different-field-values in one
+// resource filter), merged + sorted + capped client-side.
+function fetchHistory(id) {
+  return Promise.all([
+    fetchAllPages('production_sample', { filter: { fk_production_id: id }, fields: ['id'] }),
+    fetchAllPages('production_material', { filter: { fk_production_id: id }, fields: ['id'] }),
+  ]).then(function (r) {
+    const sampleIds = r[0].map(x => x.id);
+    const materialIds = r[1].map(x => x.id);
+    const histFields = ['create_date', 'status', 'message', 'category', 'table_name'];
+    const queries = [
+      fetchAllPages('history', { filter: { table_name: 'production', table_id: id }, fields: histFields, appends: ['user'], sort: ['-create_date'] }),
+    ];
+    if (sampleIds.length) queries.push(fetchByIn('history', 'table_id', sampleIds, { filter: { table_name: 'production_sample' }, fields: histFields, appends: ['user'] }));
+    if (materialIds.length) queries.push(fetchByIn('history', 'table_id', materialIds, { filter: { table_name: 'production_material' }, fields: histFields, appends: ['user'] }));
+    return Promise.all(queries).then(function (results) {
+      let all = [];
+      results.forEach(function (rows) { all = all.concat(rows); });
+      all.sort(function (a, b) { return new Date(b.create_date).getTime() - new Date(a.create_date).getTime(); });
+      return all.slice(0, 30).map(function (row) {
+        return { name: row.user && row.user.nickname, history_date: row.create_date, status: row.status, message: row.message, category: row.category, source: row.table_name };
       });
     });
   });
@@ -535,95 +593,55 @@ const Section3Quantity = function(props) {
   );
 };
 
-// SectionMarker — shows TWO things:
-//   1. marker_remarks — free-text notes field on production, specific to markers.
-//   2. the actual relational marker breakdown (production_marker → marker →
-//      marker_details), with an "Add marker" button that lazy-loads
-//      ui_production_addmarker and opens its modal.
-// (production.remarks is NOT repeated here — it already has its own
-// Remarks accordion section; showing it twice was redundant.)
-// On save, re-fetches locally (updates immediately without waiting on a
-// host-level refreshKey bump), and also nudges ctx.resource.refresh() if
-// available so other embedding contexts pick up the change too.
-const SectionMarker = function(props) {
-  const sL = useState(true);  const loading = sL[0];  const setLoading = sL[1];
-  const sM = useState([]);    const markers = sM[0];  const setMarkers = sM[1];
-  const sMR = useState('');   const markerRemarks = sMR[0]; const setMarkerRemarks = sMR[1];
-  const sB = useState(false); const busy = sB[0];     const setBusy = sB[1];
+// =====================================================
+// SectionResultHistory — combined production_result (Sent) + qc_result (QC),
+// all variants merged, chronological DESC. Columns: Date · Sent · QC · Details.
+// =====================================================
+const SectionResultHistory = function(props) {
+  const sL = useState(true); const loading = sL[0]; const setLoading = sL[1];
+  const sD = useState([]);   const rows = sD[0];    const setRows = sD[1];
+  useEffect(function() { setLoading(true); fetchResultHistory(props.id).then(function(d) { setRows(d); setLoading(false); }).catch(function() { setLoading(false); }); }, [props.id, props.refreshKey]);
+  if (loading) return ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…');
+  if (!rows.length) return ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No result history');
 
-  function reload() {
-    setLoading(true);
-    return Promise.all([fetchMarkers(props.id), fetchDetailMeta(props.id)])
-      .then(function(r) {
-        setMarkers(r[0] || []);
-        setMarkerRemarks((r[1] && r[1].marker_remarks) || '');
-        setLoading(false);
-      })
-      .catch(function() { setLoading(false); });
-  }
-  useEffect(function() { reload(); }, [props.id, props.refreshKey]);
+  const rhTh = { padding: '8px 10px', fontSize: 11, fontWeight: 600, color: '#9ca3af', borderBottom: '2px solid #f3f4f6', whiteSpace: 'nowrap' };
+  const rhThR = Object.assign({}, rhTh, { textAlign: 'right' });
+  const rhTd = { padding: '7px 10px', fontSize: 12, borderBottom: '1px solid #f3f4f6', color: '#374151', verticalAlign: 'top' };
+  const rhTdR = Object.assign({}, rhTd, { textAlign: 'right', fontWeight: 700, whiteSpace: 'nowrap' });
+  function tag(text, color) { return ce('span', { style: { background: color + '18', color: color, border: '1px solid ' + color + '40', borderRadius: 10, padding: '0 7px', fontSize: 10, fontWeight: 700, whiteSpace: 'nowrap' } }, text); }
 
-  async function handleAddMarker() {
-    if (busy || props.id == null) return;
-    setBusy(true);
-    const hideLoading = ctx.message.loading('Opening marker…', 0);
-    try {
-      const PM = await loadCode('ui_production_addmarker');
-      if (!PM || !PM.openModal) {
-        ctx.message.error('Marker module loaded but openModal was not found.');
-        return;
-      }
-      await PM.openModal({
-        ctx: ctx,
-        productionId: props.id,
-        onSaved: function() {
-          reload();
-          try { if (ctx.resource && ctx.resource.refresh) ctx.resource.refresh(); } catch (e) {}
-        },
-      });
-    } catch (e) {
-      ctx.message.error('Failed to load marker: ' + ((e && e.message) || e));
-    } finally {
-      hideLoading();
-      setBusy(false);
-    }
-  }
-
-  const addBtn = ce('button', {
-    onClick: handleAddMarker, disabled: busy,
-    style: { fontSize: 11, fontWeight: 600, color: '#4338ca', background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 6, padding: '4px 10px', cursor: busy ? 'default' : 'pointer', marginBottom: 10 },
-  }, busy ? 'Loading…' : '+ Add marker');
-  const subTitle = t => ce('div', { style: { fontSize: 11, fontWeight: 700, color: '#6b7280', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' } }, t);
-
-  if (loading) {
-    return ce('div', null, addBtn, ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…'));
-  }
-
-  const markerNotesBlock = ce('div', { style: { marginBottom: 16 } },
-    subTitle('Marker Notes'),
-    htmlIsEmpty(markerRemarks)
-      ? ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No marker notes')
-      : ce('div', { className: 'pd-remarks', dangerouslySetInnerHTML: { __html: markerRemarks } })
-  );
-
-  const markerListBlock = ce('div', null,
-    subTitle('Markers'),
-    addBtn,
-    !markers.length
-      ? ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No marker')
-      : ce('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-          markers.map(function(mk, i) {
-            const sizesText = mk.sizes.map(function(s) { return s.display + ':' + s.quantity; }).join('  ');
-            return ce('div', { key: mk.id != null ? mk.id : i, style: { display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 12, borderRadius: 6, background: '#fafafa', border: '1px solid #f0f0f0', padding: '6px 10px' } },
-              ce('span', { style: { fontWeight: 700, color: '#374151', whiteSpace: 'nowrap' } }, (mk.length != null ? mk.length : '—') + 'cm'),
-              ce('span', { style: { color: '#8c8c8c' } }, sizesText || '—'));
-          })
-        )
-  );
-
-  return ce('div', null, markerNotesBlock, markerListBlock);
+  return ce('div', { style: { overflowX: 'auto' } },
+    ce('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+      ce('thead', null, ce('tr', null,
+        ce('th', { style: Object.assign({}, rhTh, { textAlign: 'left' }) }, 'Date'),
+        ce('th', { style: rhThR }, 'Sent'),
+        ce('th', { style: rhThR }, 'QC'),
+        ce('th', { style: Object.assign({}, rhTh, { textAlign: 'left' }) }, 'Details'))),
+      ce('tbody', null, rows.map(function(e, i) {
+        const isSent = e.kind === 'sent';
+        const sentColor = e.quantity < 0 ? '#dc2626' : '#0284c7';
+        const qcColor = e.is_defect ? '#dc2626' : '#16a34a';
+        return ce('tr', { key: i, style: { background: i % 2 === 0 ? '#fff' : '#fafafa' } },
+          ce('td', { style: Object.assign({}, rhTd, { fontWeight: 600, color: '#64748b', whiteSpace: 'nowrap' }) }, fmtDateNumeric(e.date) || '—'),
+          ce('td', { style: Object.assign({}, rhTdR, { color: isSent ? sentColor : '#e5e7eb' }) }, isSent ? (e.quantity > 0 ? '+' + e.quantity : String(e.quantity)) : '—'),
+          ce('td', { style: Object.assign({}, rhTdR, { color: !isSent ? qcColor : '#e5e7eb' }) }, !isSent ? String(e.quantity) : '—'),
+          ce('td', { style: Object.assign({}, rhTd, { textAlign: 'left' }) },
+            ce('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+              e.variant ? ce('span', { style: { background: '#eef2ff', color: '#4338ca', borderRadius: 4, padding: '0 7px', fontSize: 10, fontWeight: 600 } }, e.variant) : null,
+              e.pic ? ce('span', { style: { background: '#e0e7ff', color: '#4338ca', borderRadius: 10, padding: '0 7px', fontSize: 10, fontWeight: 600 } }, '👤 ' + e.pic) : null,
+              (isSent && e.is_permakan) ? tag(e.quantity < 0 ? 'PERMAK OUT' : 'PERMAK IN', e.quantity < 0 ? '#dc2626' : '#16a34a') : null,
+              (!isSent && e.is_defect) ? tag('DEFECT', '#dc2626') : null)));
+      }))));
 };
 
+const SectionMarker = function(props) {
+  const sL = useState(true);  const loading = sL[0]; const setLoading = sL[1];
+  const sM = useState('');    const marker = sM[0];  const setMarker = sM[1];
+  useEffect(function() { setLoading(true); fetchDetailMeta(props.id).then(m => { setMarker(m.marker_remarks || ''); setLoading(false); }).catch(() => setLoading(false)); }, [props.id, props.refreshKey]);
+  if (loading) return ce('div', { style: { padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 12 } }, 'Loading…');
+  if (htmlIsEmpty(marker)) return ce('div', { style: { color: '#d1d5db', fontSize: 13, fontStyle: 'italic' } }, 'No marker');
+  return ce('div', { className: 'pd-remarks', dangerouslySetInnerHTML: { __html: marker } });
+};
 const Section4Remarks = function(props) {
   const sL = useState(true); const loading = sL[0]; const setLoading = sL[1];
   const sR = useState('');   const remarks = sR[0]; const setRemarks = sR[1];
@@ -690,6 +708,7 @@ const DetailBody = function(props) {
     { title: 'Summary',  body: ce(Section1Summary, { header: header, image: image }) },
     { title: 'Material', body: ce(Section2Material, { id: id, refreshKey: rk, onOpenMaterial: props.onOpenMaterial }) },
     { title: 'Quantity', body: ce(Section3Quantity, { id: id, refreshKey: rk }) },
+    { title: 'Result history', body: ce(SectionResultHistory, { id: id, refreshKey: rk }) },
     { title: 'Remarks',  body: ce(Section4Remarks,  { id: id, refreshKey: rk }) },
     { title: 'Marker',   body: ce(SectionMarker,    { id: id, refreshKey: rk }) },
     { title: 'History',  body: ce(Section5History,  { id: id, refreshKey: rk }) },
