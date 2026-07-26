@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const ig = require('./lib/instagram');
 const { upsert, upsertMany, upsertManyRelational } = require('./lib/nocobase');
+const { archiveMediaFiles } = require('./lib/media-images');
 const { parseAccounts, filterAccountsFromArgs } = require('./lib/ig-accounts');
 
 // How many recent media items to (re)catalog + snapshot-insight each run.
@@ -116,6 +117,21 @@ async function syncMediaAndComments(account) {
       }
     } catch (e) {
       console.error(`  media ${m.id} comments failed: ${e.message}`);
+    }
+
+    try {
+      // Self-guarding — checks for existing linked files first, so this is
+      // a cheap no-op on every subsequent daily run once a post is archived.
+      const result = await archiveMediaFiles({
+        mediaId: m.id,
+        mediaType: m.media_type,
+        mediaProductType: m.media_product_type,
+        mediaUrl: m.media_url,
+        thumbnailUrl: m.thumbnail_url,
+      });
+      if (result.uploaded > 0) console.log(`    media ${m.id}: archived ${result.uploaded} file(s)`);
+    } catch (e) {
+      console.error(`  media ${m.id} archival failed: ${e.message}`);
     }
   }
 

@@ -183,7 +183,7 @@ async function fetchMediaComments({ mediaId, maxItems = Infinity }) {
 // ---------------------------------------------------------------------
 async function fetchActiveStories({ igUserId }) {
   const data = await get(`${BASE_URL}/${igUserId}/stories`, {
-    fields: 'id,media_type,media_product_type,timestamp,permalink',
+    fields: 'id,media_type,media_product_type,timestamp,permalink,media_url,thumbnail_url',
   });
   return data.data || [];
 }
@@ -235,6 +235,23 @@ async function fetchFollowerDemographics({ igUserId }) {
   return rows;
 }
 
+// ---------------------------------------------------------------------
+// CAROUSEL ALBUM CHILDREN
+//
+// Confirmed via your data: a CAROUSEL_ALBUM's top-level media object never
+// carries media_url — that's why every sampled album row had a blank
+// media_url. The individual slides inside the album DO have media_url —
+// fetch them via the /children edge. Used by lib/media-images.js to
+// archive EVERY slide (not just the first), since each slide is
+// independently deletable content.
+// ---------------------------------------------------------------------
+async function fetchAlbumChildren({ mediaId }) {
+  const data = await get(`${BASE_URL}/${mediaId}/children`, {
+    fields: 'id,media_type,media_url,thumbnail_url',
+  });
+  return data.data || [];
+}
+
 module.exports = {
   fetchAccountInsightsPeriod,
   fetchFollowersCountNow,
@@ -244,4 +261,5 @@ module.exports = {
   fetchActiveStories,
   fetchStoryInsights,
   fetchFollowerDemographics,
+  fetchAlbumChildren,
 };
