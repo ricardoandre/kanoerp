@@ -315,6 +315,66 @@ permissions failure and an empty table look identical through this wrapper, so i
 something using this returns "no data," check the calling role before assuming
 the query is wrong.
 
+#### 4.2.1 The `flowSettingsEnabled` gate is for static uids only — do NOT apply it to dynamic/per-record uids
+
+*(Learned 2026-07, from two separate non-admin-only bugs — `view_sample_dashboard_summary`
+and `ui_sample_details` — both surfacing as a NocoBase-side 500:
+`Cannot read properties of null (reading 'sql')`. Confirmed via a 4-case
+diagnostic jblock — static/dynamic uid × gated/always-save — run as both
+admin and non-admin.)*
+
+§4.2's `if (ctx.flowSettingsEnabled) await ctx.sql.save(...)` gate assumes the uid
+is **static and reusable** — created once (typically by an admin, inside a
+flow-config/edit context) and read by everyone thereafter. That's a fine
+optimization for that case: skip re-saving a schema that's already registered.
+Once a static uid has been saved by anyone, it's registered **globally** (not
+per-role or per-session), so a later non-admin skipping `.save()` on an
+*already-known* uid is harmless — confirmed: a static uid with the gate on
+still resolved fine for a non-admin, purely because an earlier admin run had
+already registered it.
+
+The gate is **wrong** for any uid that's **dynamic / built per record** — e.g.
+`'sdb_detail_' + sampleId`, `'sm_header_' + sampleId`,
+`uid_samples + '_' + selectedCol + '_' + Date.now()`. For these, every
+distinct value is a uid NocoBase has never seen before, with no prior
+registration to fall back on. If `flowSettingsEnabled` is false (the normal
+case for non-admin roles), the gate skips `.save()` entirely — and the
+subsequent `.runById(uid)` then fails with a NocoBase-side 500
+(`Cannot read properties of null (reading 'sql')`), not just a caught JS
+rejection. Our own `.catch()` around `runById` stops this from crashing the
+React tree, but does not stop that backend-side error, which surfaces as
+NocoBase's own error toast — and it happens for **every non-admin, on every
+new record they open**, not just the first time overall.
+
+**Rule:** before adding the `flowSettingsEnabled` gate to a `runSql`/`execSql`
+call site, check whether its uid is static (safe to gate) or built from a
+record id / `Date.now()` / any other per-call value (never gate — always await
+`.save()` unconditionally, keep only the `.catch()` on both `.save()` and
+`.runById()`):
+
+```js
+// Static uid (e.g. a fixed dashboard-level query) — gate is correct:
+async function runSql(uid, sql) {
+  if (ctx.flowSettingsEnabled) {
+    await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  }
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+
+// Dynamic/per-record uid (e.g. 'sdb_detail_' + sampleId) — never gate:
+async function runSql(uid, sql) {
+  await ctx.sql.save({ uid, sql, dataSourceKey: 'main' }).catch(() => {});
+  return ctx.sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' })
+    .then(r => r || []).catch(() => []);
+}
+```
+
+If a single module has both kinds of query (uncommon, but possible), don't
+force one shared `runSql` helper to cover both — a per-call-site decision
+(or a boolean parameter) is clearer than a helper that's silently wrong for
+half its callers.
+
 ### 4.3 `ctx` surface — confirmed members
 
 | Member | Use |
