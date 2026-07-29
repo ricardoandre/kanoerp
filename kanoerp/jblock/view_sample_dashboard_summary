@@ -7,6 +7,22 @@ var createElement = React.createElement;
 var { Select, Drawer } = ctx.antd;
 
 // ─────────────────────────────────────────────────────────────
+// shared code loader (resource-based, non-admin-safe) — this file didn't
+// have one before; added so it can load lib_enum_labels and lib_drawer_shell.
+// ─────────────────────────────────────────────────────────────
+var _codeCache = {};
+function loadCode(name) {
+  if (_codeCache[name]) return Promise.resolve(_codeCache[name]);
+  return ctx.api.resource('source_code').list({ filter: { name: name }, fields: ['code'], pageSize: 1 })
+    .then(function (res) {
+      var rows = (res && res.data && res.data.data) || [];
+      var src = (rows[0] && rows[0].code) || '';
+      _codeCache[name] = new Function('React', 'antd', 'dayjs', 'ctx', src)(ctx.React, ctx.antd, ctx.dayjs || null, ctx);
+      return _codeCache[name];
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
 // SHARED CONFIG / CONSTANTS / HELPERS
 // ─────────────────────────────────────────────────────────────
 var CONFIG = {
@@ -22,16 +38,15 @@ var CONFIG = {
   uid_variants2:      'sample_coll_variants',
   uid_sample_status:  'sample_coll_sstatus',
   uid_variant_status: 'sample_coll_vstatus',
-  uid_designer_opts:  'sample_coll_designer_opts',
 };
 
-var STATUS_ORDER = ['ideas','pola','first_sample','pricing','color','done','cancel'];
+// 'pricing' status removed — no longer used.
+var STATUS_ORDER = ['ideas','pola','first_sample','color','done','cancel'];
 
 var STATUS_META = {
   ideas:        { label: 'Ideas',        color: '#f97316', group: 'inprogress' },
   pola:         { label: 'Pola',         color: '#f97316', group: 'inprogress' },
   first_sample: { label: 'First Sample', color: '#d97706', group: 'inprogress' },
-  pricing:      { label: 'Pricing',      color: '#84cc16', group: 'approved' },
   color:        { label: 'Color Sample', color: '#84cc16', group: 'approved' },
   done:         { label: 'Done',         color: '#22c55e', group: 'approved' },
   cancel:       { label: 'Cancel',       color: '#ef4444', group: 'cancel' },
@@ -45,12 +60,12 @@ var TYPE_LABELS = {
 
 var TYPE_ORDER = ['atasan','tunik','bawahan','dress','set','outerwear','hijab'];
 
-// By-Progress grouping (Collection Preview). Order controls display order.
-var PROGRESS_ORDER = ['ideas','pola','first_sample','revision','qc','approval','approved'];
+var PROGRESS_ORDER = ['ideas','pola','pending','first_sample','revision','qc','approval','approved'];
 
 var PROGRESS_LABELS = {
   ideas:        'Ideas',
   pola:         'Pola',
+  pending:      'Pending',
   first_sample: 'First Sample',
   revision:     'Revision',
   qc:           'QC',
@@ -58,11 +73,15 @@ var PROGRESS_LABELS = {
   approved:     'Approved',
 };
 
+// 'pricing' removed from SAMPLE_APPROVED — status no longer used.
 var SAMPLE_INPROGRESS  = ['ideas','pola','first_sample'];
-var SAMPLE_APPROVED    = ['pricing','color','done'];
+var SAMPLE_APPROVED    = ['color','done'];
 var SAMPLE_CANCEL      = ['cancel'];
 
-var VARIANT_INPROGRESS = ['sewing','qc','approval'];
+// Variant status mapping updated:
+//   pending, sewing, minor_revision, qc, approval -> inprogress
+//   done -> approved
+var VARIANT_INPROGRESS = ['pending','sewing','minor_revision','qc','approval'];
 var VARIANT_APPROVED   = ['done'];
 var VARIANT_CANCEL     = ['cancel'];
 
@@ -86,28 +105,20 @@ function classifyVariant(status) {
   return 'other';
 }
 
-// Determine the "By Progress" bucket for a sample based on its own status
-// and its variants' statuses.
-//   ideas        -> sample.status = ideas
-//   pola         -> sample.status = pola
-//   first_sample -> sample.status = first_sample, no variant in revision/qc/approval
-//   revision     -> sample.status = first_sample, any variant = minor_revision
-//   qc           -> sample.status = first_sample, any variant = qc
-//   approval     -> sample.status = first_sample, any variant = approval (labeled "Need Approval")
-//   approved     -> sample.status = color or done
-// Priority when a sample has variants in more than one of revision/qc/approval:
-// revision > qc > approval (revision surfaces the sample as needing attention
-// first, then qc, then approval). Anything else (pricing, cancel)
-// returns null and is excluded from the By Progress view.
 function classifyProgress(sample, variantStatuses) {
   var status = String((sample && sample.status) || '').toLowerCase();
   if (status === 'ideas') return 'ideas';
   if (status === 'pola') return 'pola';
   if (status === 'first_sample') {
-    var vs = (variantStatuses || []).map(function(s) { return String(s || '').toLowerCase(); });
+  var vs = (variantStatuses || []).map(function(s) { return String(s || '').toLowerCase(); });
     if (vs.indexOf('minor_revision') !== -1) return 'revision';
     if (vs.indexOf('qc') !== -1) return 'qc';
     if (vs.indexOf('approval') !== -1) return 'approval';
+    // sample marked first_sample but sewing hasn't started yet on any
+    // variant (still pending) — bucketed between Pola and First Sample.
+    // Checked last among the first_sample sub-statuses so a variant that's
+    // already progressed past pending (sewing/qc/approval) still wins.
+    if (vs.indexOf('pending') !== -1) return 'pending';
     return 'first_sample';
   }
   if (status === 'color' || status === 'done') return 'approved';
@@ -120,7 +131,8 @@ function runSql(uid, sql) {
   return s.save({ uid: uid, sql: sql, dataSourceKey: 'main' })
     .catch(function(){})
     .then(function() { return s.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
-    .then(function(r) { return r || []; });
+    .then(function(r) { return r || []; })
+    .catch(function() { return []; });
 }
 
 function buildImgUrl(filename, url) {
@@ -129,7 +141,27 @@ function buildImgUrl(filename, url) {
   return '';
 }
 
-// Small opaque price label shown on thumbnails / detail meta rows
+function fetchVariantImages(sampleIds) {
+  if (!sampleIds || !sampleIds.length) return Promise.resolve([]);
+  var CHUNK = 150;
+  var chunks = [];
+  for (var i = 0; i < sampleIds.length; i += CHUNK) chunks.push(sampleIds.slice(i, i + CHUNK));
+
+  return Promise.all(chunks.map(function (ids) {
+    return ctx.api.resource('sample_variant').list({
+      appends: ['image'],
+      filter: { fk_sample_variant_id: { $in: ids }, status: { $ne: 'cancel' } },
+      fields: ['id', 'fk_sample_variant_id', 'status'],
+      sort: ['id'],
+      pageSize: 400,
+    }).then(function (res) {
+      return (res && res.data && res.data.data) || [];
+    });
+  })).then(function (results) {
+    return [].concat.apply([], results);
+  });
+}
+
 function formatPrice(v) {
   var n = Number(v);
   if (!n) return '';
@@ -137,364 +169,204 @@ function formatPrice(v) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// SAMPLE DETAIL MODAL (opened from a thumbnail inside Collection Preview)
+// SAMPLE DETAIL MODAL
+//
+// REFACTORED 2026-07: hosted via lib_drawer_shell's DrawerShell
+// (props.DrawerShell, preloaded once by App and threaded down through
+// CollectionPreviewPage) instead of a hand-built antd Drawer with a manual
+// close button + closable:false. Falls back to the exact original Drawer
+// construction if DrawerShell hasn't loaded yet or fails. Designer/
+// sewing_pic enum lookups now go through lib_enum_labels instead of two
+// separate raw-SQL queries against the `fields` table.
 // ─────────────────────────────────────────────────────────────
 var SampleModal = function(props) {
   var sampleId = props.sampleId;
   var onClose  = props.onClose;
+  var DrawerShellComp = props.DrawerShell;
+  var SampleEditDrawerComp = props.SampleEditDrawerComp;
+  var editCollections = props.editCollections || [];
+  var editTypeOptions = props.editTypeOptions || [];
+  var editStatusOptions = props.editStatusOptions || [];
+  var refreshToken = props.refreshToken;
+  var onSampleSaved = props.onSampleSaved;
 
-  var stateD  = useState(null); var detail       = stateD[0];   var setDetail       = stateD[1];
-  var stateV  = useState([]);   var variants     = stateV[0];   var setVariants     = stateV[1];
-  var stateI  = useState([]);   var images       = stateI[0];   var setImages       = stateI[1];
-  var stateL  = useState(true); var loading      = stateL[0];   var setLoading      = stateL[1];
-  var stateBI = useState(0);    var bigImg       = stateBI[0];  var setBigImg       = stateBI[1];
-  var stateOD = useState({});   var designerMap  = stateOD[0];  var setDesignerMap  = stateOD[1];
-  var stateOS = useState({});   var sewingPicMap = stateOS[0];  var setSwingPicMap  = stateOS[1];
-  var stateCm = useState([]);   var comments     = stateCm[0];  var setComments     = stateCm[1];
-  var stateMt = useState([]);   var materials    = stateMt[0];  var setMaterials    = stateMt[1];
-  var stateNC = useState('');   var newComment   = stateNC[0];  var setNewComment   = stateNC[1];
-  var statePosting = useState(false); var posting = statePosting[0]; var setPosting = statePosting[1];
+  // REFACTORED 2026-07: SampleModal is now a thin chrome wrapper — all the
+  // data-fetching and summary/accordion/comments rendering that used to
+  // live here directly moved to the shared source_code row
+  // ui_sample_details (SampleDetailBody), so act_sample_view (a bare
+  // JSAction, no host Drawer tree) can show the exact same body via
+  // Modal.confirm without duplicating any of that logic. This file only
+  // fetches the light name/status needed for the Drawer's own title bar +
+  // accent color — same "light header here, full body in the shared
+  // module" split ui_production_detail.js already uses between
+  // ProductionDetailDrawer and DetailBody.
+  var stateHeader = useState(null); var header = stateHeader[0]; var setHeader = stateHeader[1];
+  var stateOD = useState({}); var designerMap = stateOD[0]; var setDesignerMap = stateOD[1];
+  var stateEditOpen = useState(false); var editOpen = stateEditOpen[0]; var setEditOpen = stateEditOpen[1];
+  var stateLR = useState(0); var localRefresh = stateLR[0]; var setLocalRefresh = stateLR[1];
+  var stateBodyMod = useState(null); var bodyMod = stateBodyMod[0]; var setBodyMod = stateBodyMod[1];
 
   useEffect(function() {
-    if (!sampleId) return;
-    setLoading(true);
-    setDetail(null); setVariants([]); setImages([]); setBigImg(0);
+    loadCode('ui_sample_details')
+      .then(function(Mod) { setBodyMod(Mod); })
+      .catch(function(e) { console.error('Failed to load ui_sample_details:', e); setBodyMod(false); });
+  }, []);
 
-    var sql = ctx.sql;
-    function q(uid, sqlStr) {
-      return sql.save({ uid: uid, sql: sqlStr, dataSourceKey: 'main' })
-        .catch(function(){})
-        .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
-        .then(function(r) { return r || []; });
-    }
+  useEffect(function() {
+  if (!sampleId) return;
+  setHeader(null);
+  var sql = ctx.sql;
+  var uid = 'sm_header_' + sampleId;
+  sql.save({ uid: uid, sql: "SELECT name, status FROM sample WHERE id = " + sampleId, dataSourceKey: 'main' })
+    .catch(function(){})
+    .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+    .then(function(rows) { setHeader((rows && rows[0]) || null); })
+    .catch(function() { setHeader(null); });
 
-    function parseOptionsMap(optionsJson) {
-      var map = {};
-      try {
-        var parsed = typeof optionsJson === 'string' ? JSON.parse(optionsJson) : optionsJson;
-        var enumArr = (parsed && parsed.uiSchema && parsed.uiSchema.enum) ? parsed.uiSchema.enum : [];
-        enumArr.forEach(function(o) { if (o.value && o.label) map[o.value] = o.label; });
-      } catch(e) {}
-      return map;
-    }
+    // designerMap is caller-supplied to SampleEditDrawerComp (it doesn't
+    // self-fetch it, per ui_sample_edit's own contract) — kept here, small.
+    loadCode('lib_enum_labels').then(function (Lib) {
+      setDesignerMap(Lib.enumLabelMap('sample', 'designer'));
+    }).catch(function () {});
+  }, [sampleId, refreshToken]);
 
-    function loadComments() {
-      return q('photo_dash_comments_' + sampleId,
-        "SELECT sample_comment.id AS id, users.nickname AS name, " +
-        "sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
-        "FROM sample_comment, users " +
-        "WHERE sample_comment.fk_sample_id = " + sampleId + " " +
-        "AND sample_comment.created_by_id = users.id " +
-        "ORDER BY sample_comment.created_at DESC"
-      ).then(function(rows) { setComments(rows); });
-    }
-
-    function loadMaterials() {
-      return q('photo_dash_materials_' + sampleId,
-        "SELECT fk_raw_material_code AS material_code " +
-        "FROM sample_material WHERE fk_sample_id = " + sampleId + " ORDER BY id ASC"
-      ).then(function(rows) { setMaterials(rows); });
-    }
-
-    q(CONFIG.uid_detail + '_' + sampleId,
-      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
-      "sample.type AS type, sample.designer AS designer, sample.target_price AS target_price, " +
-      "sample.description AS sample_description, " +
-      "sample.remarks AS sample_remarks, " +
-      "collection.name AS collection_name " +
-      "FROM sample, collection " +
-      "WHERE sample.id = " + sampleId + " AND sample.fk_collection_id = collection.id"
-    ).then(function(rows) {
-      if (rows.length) setDetail(rows[0]);
-      return q('photo_dash_fld_designer',
-        "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'"
-      );
-    }).then(function(frows) {
-      if (frows.length && frows[0].options) setDesignerMap(parseOptionsMap(frows[0].options));
-      return q('photo_dash_fld_sewingpic',
-        "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample_variant' AND name = 'sewing_pic'"
-      );
-    }).then(function(frows) {
-      if (frows.length && frows[0].options) setSwingPicMap(parseOptionsMap(frows[0].options));
-      return q(CONFIG.uid_variants + '_' + sampleId,
-        "SELECT sample_variant.id AS id, sample_variant.status AS status, " +
-        "sample_variant.sewing_pic AS sewing_pic, sample_variant.fk_fabric_code AS fabric_code " +
-        "FROM sample_variant WHERE sample_variant.fk_sample_variant_id = " + sampleId
-      );
-    }).then(function(vrows) {
-      setVariants(vrows);
-      return q(CONFIG.uid_images + '_' + sampleId,
-        "SELECT attachments.url AS img_url, attachments.filename AS img_filename " +
-        "FROM t_wda3bnmr9c9, attachments " +
-        "WHERE t_wda3bnmr9c9.f_57nmxuosclw = " + sampleId + " " +
-        "AND attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd ORDER BY attachments.id ASC"
-      );
-    }).then(function(irows) {
-      var origin = window.location.origin;
-      setImages(irows.map(function(r) {
-        return r.img_url || (r.img_filename ? origin + '/storage/uploads/' + r.img_filename : null);
-      }).filter(Boolean));
-      setLoading(false);
-      loadComments();
-      loadMaterials();
-    }).catch(function(e) { console.error('modal load error', e); setLoading(false); });
-  }, [sampleId]);
-
-  function addComment() {
-    var text = newComment.trim();
-    if (!text || !sampleId) return;
-    setPosting(true);
-
-    var apiCall;
-    if (ctx.api && typeof ctx.api.resource === 'function') {
-      apiCall = ctx.api.resource('sample_comment').create({
-        values: { fk_sample_id: sampleId, comment: text }
-      });
-    } else if (ctx.api && typeof ctx.api.request === 'function') {
-      apiCall = ctx.api.request({
-        url: 'sample_comment:create',
-        method: 'post',
-        data: { fk_sample_id: sampleId, comment: text }
-      });
-    } else {
-      console.error('No ctx.api available', ctx.api);
-      setPosting(false);
-      return;
-    }
-
-    apiCall.then(function() {
-      setNewComment('');
-      setPosting(false);
-      var sql = ctx.sql;
-      var uid = 'photo_dash_comments_reload_' + Date.now();
-      return sql.save({
-        uid: uid,
-        sql: "SELECT sample_comment.id AS id, users.nickname AS name, " +
-          "sample_comment.created_at AS comment_date, sample_comment.comment AS comment " +
-          "FROM sample_comment, users " +
-          "WHERE sample_comment.fk_sample_id = " + sampleId + " " +
-          "AND sample_comment.created_by_id = users.id " +
-          "ORDER BY sample_comment.created_at DESC",
-        dataSourceKey: 'main'
-      }).catch(function(){})
-      .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
-      .then(function(rows) { setComments(rows || []); });
-    }).catch(function(e) {
-      console.error('post comment error', e);
-      setPosting(false);
-    });
-  }
-
-  var st = detail ? getStatus(detail.status) : { label: '—', color: '#9ca3af' };
-
-  function metaRow(label, value) {
-    if (!value) return null;
-    return createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 6 } },
-      createElement('div', { style: { fontSize: 11, color: '#9ca3af', minWidth: 80, paddingTop: 1 } }, label),
-      createElement('div', { style: { fontSize: 12, color: '#1e293b', fontWeight: 500 } }, value)
-    );
-  }
-
-  function htmlBlock(label, html) {
-    if (!html) return null;
-    return createElement('div', { style: { marginBottom: 16 } },
-      createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 6 } }, label),
-      createElement('div', { style: { fontSize: 12, color: '#374151', lineHeight: 1.7 }, dangerouslySetInnerHTML: { __html: html } })
-    );
-  }
+  var st = header ? getStatus(header.status) : { label: '—', color: '#9ca3af' };
 
   function openEditDrawer() {
-    try {
-      var popupUid = ctx.model.uid + '-1';
-      ctx.openView(popupUid, {
-        navigation: false,
-        mode: 'drawer',
-        size: 'large',
-        title: 'Edit Sample',
-        dataSourceKey: 'main',
-        collectionName: 'sample',
-        filterByTk: detail.id,
-      });
-    } catch (e) { console.error('open edit drawer', e); }
+    setEditOpen(true);
   }
 
-  return createElement(Drawer, {
-    open: true,
-    onClose: onClose,
-    placement: 'right',
-    closable: false,
-    maskClosable: true,
-    width: 480,
-    rootClassName: 'sample-modal-drawer',
-    bodyStyle: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' },
-    title: createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 } },
-      createElement('button', { onClick: onClose, style: { border: 'none', background: '#f1f5f9', borderRadius: 6, width: 28, height: 28, flexShrink: 0, cursor: 'pointer', fontSize: 14, color: '#64748b', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '✕'),
-      createElement('div', { style: { fontSize: 15, fontWeight: 700, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, detail ? detail.name : '…')
-    ),
-    extra: detail ? createElement('button', {
-      onClick: openEditDrawer,
-      style: { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 6, padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#475569', fontWeight: 500 }
-    }, '✏️ Edit') : null,
-  },
-    createElement('style', null, `
-      @media (min-width: 701px) {
-        .sample-modal-drawer .ant-drawer-content-wrapper { width: min(980px, 92vw) !important; }
-        .cp-modal-summary { flex-direction: row !important; align-items: flex-start !important; }
-        .cp-modal-images { width: 280px !important; flex-shrink: 0 !important; }
-        .cp-modal-fields { flex: 1 1 auto !important; }
-        .cp-modal-lower { flex-direction: row !important; align-items: flex-start !important; }
-        .cp-modal-detail { flex: 1 1 auto !important; min-width: 0 !important; }
-        .cp-modal-comments { width: 320px !important; flex-shrink: 0 !important; border-left: 1px solid #f1f5f9 !important; border-top: none !important; }
-      }
-      @media (max-width: 700px) {
-        .sample-modal-drawer .ant-drawer-content-wrapper { width: 100% !important; }
-      }
-    `),
-    createElement('div', { style: { height: 3, width: '100%', flexShrink: 0, background: st.color } }),
-    loading
-      ? createElement('div', { style: { padding: 60, textAlign: 'center', color: '#94a3b8' } }, 'Loading…')
-      : createElement('div', { className: 'cp-modal-body', style: { display: 'flex', flexDirection: 'column', flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', minHeight: 0 } },
-            createElement('div', { className: 'cp-modal-summary', style: { display: 'flex', flexDirection: 'column', flexShrink: 0, gap: 16, padding: '16px 20px', borderBottom: '1px solid #f1f5f9' } },
-              createElement('div', { className: 'cp-modal-images', style: { width: '100%', flexShrink: 0, background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
-                images.length > 0
-                  ? createElement('img', { src: images[bigImg] || images[0], style: { width: '100%', display: 'block', objectFit: 'contain', maxHeight: 260, background: '#f8fafc' } })
-                  : createElement('div', { style: { height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#cbd5e1', fontSize: 13 } }, 'No images'),
-                images.length > 1
-                  ? createElement('div', { style: { display: 'flex', gap: 4, padding: 8, overflowX: 'auto', background: '#f1f5f9', borderTop: '1px solid #e5e7eb' } },
-                      images.map(function(url, ii) {
-                        return createElement('img', { key: ii, src: url, onClick: function() { setBigImg(ii); }, style: { width: 52, height: 52, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', flexShrink: 0, border: bigImg === ii ? '2px solid #6366f1' : '2px solid #e2e8f0', opacity: bigImg === ii ? 1 : 0.7 } });
-                      })
-                    )
-                  : null
-              ),
-              createElement('div', { className: 'cp-modal-fields', style: { minWidth: 0 } },
-                detail ? createElement('div', { style: { marginBottom: 14 } },
-                  createElement('span', { style: { background: st.color + '20', color: st.color, border: '1px solid ' + st.color + '44', borderRadius: 99, padding: '3px 12px', fontSize: 11, fontWeight: 700 } }, st.label)
-                ) : null,
-                detail ? createElement('div', null,
-                  metaRow('Collection', detail.collection_name),
-                  metaRow('Type', TYPE_LABELS[detail.type] || detail.type),
-                  metaRow('Designer', designerMap[detail.designer] || detail.designer),
-                  metaRow('Target Price', detail.target_price ? formatPrice(detail.target_price) : null),
-                ) : null
-              )
-            ),
-            createElement('div', { className: 'cp-modal-lower', style: { display: 'flex', flexDirection: 'column' } },
-            createElement('div', { className: 'cp-modal-detail', style: { padding: '16px 20px', flexShrink: 0, minWidth: 0, overflow: 'hidden' } },
-              variants.length > 0
-                ? createElement('div', { style: { marginBottom: 16 } },
-                    createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 8 } }, 'Variants (' + variants.length + ')'),
-                    variants.map(function(v, vi) {
-                      var vs = getStatus(v.status);
-                      return createElement('div', { key: vi, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderRadius: 6, background: '#f8fafc', marginBottom: 4, fontSize: 12, minWidth: 0, overflow: 'hidden' } },
-                        createElement('div', { style: { width: 7, height: 7, borderRadius: '50%', background: vs.color, flexShrink: 0 } }),
-                        createElement('span', { style: { color: '#374151', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, v.fabric_code || '—'),
-                        createElement('span', { style: { fontSize: 10, color: '#64748b', flexShrink: 0, whiteSpace: 'nowrap' } }, sewingPicMap[v.sewing_pic] || v.sewing_pic || ''),
-                        createElement('span', { style: { fontSize: 10, fontWeight: 600, color: vs.color, background: vs.color + '15', borderRadius: 4, padding: '1px 6px', flexShrink: 0, whiteSpace: 'nowrap' } }, vs.label)
-                      );
-                    })
-                  )
-                : null,
-              materials.length > 0
-                ? createElement('div', { style: { marginBottom: 16 } },
-                    createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 8 } }, 'Materials'),
-                    createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-                      materials.map(function(m, mi) {
-                        return createElement('div', { key: mi, style: { padding: '5px 8px', borderRadius: 6, background: '#f8fafc', fontSize: 12, fontWeight: 600, color: '#1e293b' } }, m.material_code);
-                      })
-                    )
-                  )
-                : null,
-              detail && detail.sample_description ? htmlBlock('Description', detail.sample_description) : null,
-              detail && detail.sample_remarks ? htmlBlock('Remarks', detail.sample_remarks) : null
-            ),
+  var editBtn = header ? createElement('button', {
+    onClick: openEditDrawer,
+    style: { border: '1px solid #e2e8f0', background: '#fff', borderRadius: 6, padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#475569', fontWeight: 500 }
+  }, '✏️ Edit') : null;
 
-            createElement('div', { className: 'cp-modal-comments', style: { width: '100%', flexShrink: 0, borderLeft: 'none', borderTop: '1px solid #f1f5f9', padding: '16px 20px', display: 'flex', flexDirection: 'column' } },
-              createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#9ca3af', marginBottom: 10 } }, 'Comments'),
-              createElement('div', { className: 'cp-modal-comments-list', style: { maxHeight: 240, overflowY: 'auto', marginBottom: 10 } },
-                comments.length === 0
-                  ? createElement('div', { style: { color: '#d1d5db', fontSize: 12, fontStyle: 'italic' } }, 'No comments yet')
-                  : comments.map(function(c, ci) {
-                      return createElement('div', { key: ci, style: { borderLeft: '2px solid #e2e8f0', paddingLeft: 10, marginBottom: 10 } },
-                        createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 } },
-                          createElement('span', { style: { fontWeight: 700, fontSize: 11, color: '#1e293b' } }, c.name || '—'),
-                          createElement('span', { style: { fontSize: 9, color: '#94a3b8' } }, String(c.comment_date || '').substring(0, 16).replace('T', ' '))
-                        ),
-                        createElement('div', { style: { fontSize: 11, color: '#374151', lineHeight: 1.5 }, dangerouslySetInnerHTML: { __html: c.comment || '' } })
-                      );
-                    })
-              ),
-              createElement('div', { style: { borderTop: '1px solid #f1f5f9', paddingTop: 10 } },
-                createElement('textarea', {
-                  value: newComment,
-                  onChange: function(e) { setNewComment(e.target.value); },
-                  placeholder: 'Add a comment…',
-                  rows: 3,
-                  style: { width: '100%', fontSize: 12, padding: 8, borderRadius: 6, border: '1px solid #e2e8f0', resize: 'vertical', fontFamily: 'inherit', marginBottom: 6, boxSizing: 'border-box' }
-                }),
-                createElement('button', {
-                  onClick: addComment,
-                  disabled: posting || !newComment.trim(),
-                  style: {
-                    width: '100%', padding: '6px 0', fontSize: 12, fontWeight: 600,
-                    border: 'none', borderRadius: 6, cursor: (posting || !newComment.trim()) ? 'not-allowed' : 'pointer',
-                    background: (posting || !newComment.trim()) ? '#e2e8f0' : '#6366f1',
-                    color: (posting || !newComment.trim()) ? '#94a3b8' : '#fff',
-                  }
-                }, posting ? 'Posting…' : 'Post Comment'),
-                createElement('button', {
-                  onClick: onClose,
-                  style: {
-                    width: '100%', padding: '6px 0', fontSize: 12, fontWeight: 600, marginTop: 6,
-                    border: '1px solid #e2e8f0', borderRadius: 6, cursor: 'pointer',
-                    background: '#fff', color: '#64748b',
-                  }
-                }, 'Close'),
-                createElement('div', { className: 'cp-modal-spacer', style: { width: '100%', height: 100 } })
-              )
-            )
-            )
-          )
+  // For this photo dashboard, only Details + Remarks/Comments are editable —
+  // Variants and Materials are shown read-only here; they belong to a
+  // different, not-yet-built page (sewing/QC workflow).
+  var editDrawer = SampleEditDrawerComp ? createElement(SampleEditDrawerComp, {
+    open: editOpen,
+    sampleId: sampleId,
+    onClose: function() { setEditOpen(false); },
+    onSaved: function() {
+      setEditOpen(false);
+      setLocalRefresh(function(k) { return k + 1; });
+      if (onSampleSaved) onSampleSaved();
+    },
+    collections: editCollections,
+    designerMap: designerMap,
+    typeOptions: editTypeOptions,
+    statusOptions: editStatusOptions,
+    editableSections: ['details', 'remarks'],
+    DrawerShell: DrawerShellComp,
+  }) : null;
+
+  // Pure Drawer chrome (width breakpoints) only — the summary's own
+  // image-left/details-right responsive layout used to be duplicated here,
+  // but now lives in ui_sample_details' own BodyStyles so it applies
+  // identically whether SampleDetailBody is hosted in this Drawer or in the
+  // JSAction's Modal.confirm (see act_sample_view/act_sample_edit).
+  var styleTag = createElement('style', null, `
+    @media (min-width: 701px) {
+      .sample-modal-drawer .ant-drawer-content-wrapper { width: min(980px, 92vw) !important; }
+    }
+    @media (max-width: 700px) {
+      .sample-modal-drawer .ant-drawer-content-wrapper { width: 100% !important; }
+    }
+  `);
+
+  var bodyContent = (bodyMod && bodyMod.SampleDetailBody)
+    ? createElement('div', { className: 'cp-modal-body', style: { display: 'flex', flexDirection: 'column', flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', minHeight: 0 } },
+        createElement(bodyMod.SampleDetailBody, { sampleId: sampleId, refreshKey: (refreshToken || 0) + localRefresh })
+      )
+    : createElement('div', { style: { padding: 60, textAlign: 'center', color: '#94a3b8' } }, 'Loading…');
+
+  if (DrawerShellComp) {
+    return React.createElement(React.Fragment, null,
+      createElement(DrawerShellComp, {
+        open: true, onClose: onClose, title: header ? header.name : '\u2026',
+        extra: editBtn, accentColor: st.color,
+        width: 480, placement: 'right', rootClassName: 'sample-modal-drawer',
+      }, styleTag, bodyContent),
+      editDrawer
+    );
+  }
+
+  return React.createElement(React.Fragment, null,
+    createElement(Drawer, {
+      open: true,
+      onClose: onClose,
+      placement: 'right',
+      closable: false,
+      maskClosable: true,
+      width: 480,
+      rootClassName: 'sample-modal-drawer',
+      bodyStyle: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' },
+      title: createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 } },
+        createElement('button', { onClick: onClose, style: { border: 'none', background: '#f1f5f9', borderRadius: 6, width: 28, height: 28, flexShrink: 0, cursor: 'pointer', fontSize: 14, color: '#64748b', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '\u2715'),
+        createElement('div', { style: { fontSize: 15, fontWeight: 700, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, header ? header.name : '\u2026')
+      ),
+      extra: editBtn,
+    },
+      styleTag,
+      createElement('div', { style: { height: 3, width: '100%', flexShrink: 0, background: st.color } }),
+      bodyContent
+    ),
+    editDrawer
   );
 };
 
 // ─────────────────────────────────────────────────────────────
-// MOODBOARD TILE (with target_price overlay, top-left, small & opaque)
+// MOODBOARD TILE — thumbnail strip enlarged 22px -> 40px so users can
+// actually make out the other variant colors at a glance, not just tell
+// something extra exists.
 // ─────────────────────────────────────────────────────────────
 var SampleTile = function(props) {
   var s = props.sample;
   var onOpen = props.onOpen;
   var st = getStatus(s.status);
   var firstImg = s.img_url || '';
+  var thumbs = (s.thumb_images || []).slice(0, 6);
   var priceLabel = formatPrice(s.target_price);
 
   return createElement('div', {
     style: { position: 'relative', overflow: 'hidden', borderRadius: 6, cursor: 'pointer', background: '#e5e7eb', breakInside: 'avoid', marginBottom: 8 },
     onClick: function() { onOpen(s.id); },
   },
-    firstImg
-      ? createElement('img', { src: firstImg, style: { width: '100%', display: 'block', borderRadius: 6 }, onerror: function(e) { e.target.parentElement.style.display = 'none'; } })
-      : createElement('div', { style: { height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 18 } }, '📷'),
-    priceLabel
-      ? createElement('div', {
-          style: {
-            position: 'absolute', top: 5, left: 5,
-            background: 'rgba(15,23,42,0.55)', color: '#fff',
-            fontSize: 9, fontWeight: 700, borderRadius: 4,
-            padding: '1px 5px', lineHeight: 1.5, letterSpacing: '0.01em',
-          }
-        }, priceLabel)
-      : null,
-    createElement('div', {
-      style: { position: 'absolute', bottom: 6, right: 6, width: 8, height: 8, borderRadius: '50%', background: st.group === 'approved' ? '#22c55e' : st.group === 'cancel' ? '#ef4444' : '#f97316', opacity: 0.75, boxShadow: '0 0 0 2px rgba(255,255,255,0.65)' }
-    })
+    createElement('div', { style: { position: 'relative' } },
+      firstImg
+        ? createElement('img', { src: firstImg, style: { width: '100%', display: 'block', borderRadius: thumbs.length ? '6px 6px 0 0' : 6 }, onerror: function(e) { e.target.parentElement.style.display = 'none'; } })
+        : createElement('div', { style: { height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 18, borderRadius: thumbs.length ? '6px 6px 0 0' : 6 } }, '📷'),
+      priceLabel
+        ? createElement('div', {
+            style: {
+              position: 'absolute', top: 5, left: 5,
+              background: 'rgba(15,23,42,0.55)', color: '#fff',
+              fontSize: 9, fontWeight: 700, borderRadius: 4,
+              padding: '1px 5px', lineHeight: 1.5, letterSpacing: '0.01em',
+            }
+          }, priceLabel)
+        : null,
+      createElement('div', {
+        style: { position: 'absolute', bottom: 6, right: 6, width: 8, height: 8, borderRadius: '50%', background: st.group === 'approved' ? '#22c55e' : st.group === 'cancel' ? '#ef4444' : '#f97316', opacity: 0.75, boxShadow: '0 0 0 2px rgba(255,255,255,0.65)' }
+      })
+    ),
+    thumbs.length > 0
+      ? createElement('div', { style: { display: 'flex', gap: 6, padding: 6, background: '#fff', flexWrap: 'wrap' } },
+          thumbs.map(function(t, i) {
+            return createElement('img', {
+              key: i, src: t,
+              style: { width: 80, height: 120, objectFit: 'cover', borderRadius: 4, border: '1px solid #e5e7eb' },
+              onerror: function(e) { e.target.style.display = 'none'; }
+            });
+          })
+        )
+      : null
   );
 };
 
 // ─────────────────────────────────────────────────────────────
-// GROUP CARD (Pinterest style, used inside Collection Preview for both
-// "By Type" and "By Progress" grouped views). `label` overrides the
-// TYPE_LABELS lookup so it can be reused for progress-bucket labels too.
+// GROUP CARD
 // ─────────────────────────────────────────────────────────────
 var TypeCard = function(props) {
   var typeKey  = props.typeKey;
@@ -546,7 +418,8 @@ var MasonryGrid = function(props) {
   var onOpen   = props.onOpen;
   var maxCols  = props.maxCols || 4;
 
-  var STATUS_SORT = ['done','color','pricing','first_sample','pola','ideas'];
+  // 'pricing' removed — no longer used.
+  var STATUS_SORT = ['done','color','first_sample','pola','ideas'];
   var sorted = samples.slice().sort(function(a, b) {
     var ai = STATUS_SORT.indexOf(String(a.status || '').toLowerCase());
     var bi = STATUS_SORT.indexOf(String(b.status || '').toLowerCase());
@@ -572,8 +445,7 @@ var MasonryGrid = function(props) {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GROUP DETAIL VIEW (back from category/progress grid within Collection
-// Preview). `label` overrides the TYPE_LABELS lookup, same as TypeCard.
+// GROUP DETAIL VIEW
 // ─────────────────────────────────────────────────────────────
 var TypeDetailView = function(props) {
   var typeKey    = props.typeKey;
@@ -597,10 +469,12 @@ var TypeDetailView = function(props) {
     createElement(MasonryGrid, { samples: nonCancel, onOpen: onOpen, maxCols: colCount })
   );
 };
-
 // ─────────────────────────────────────────────────────────────
-// COLLECTION PREVIEW PAGE (full page, replaces the old standalone jblock)
-// props: initialCollectionId, initialType, initialViewMode, onBack
+// COLLECTION PREVIEW PAGE
+//
+// REFACTORED 2026-07: designer enum map now via lib_enum_labels instead of
+// a raw-SQL query against `fields`. Threads props.DrawerShell down to
+// SampleModal (preloaded once by App, see below).
 // ─────────────────────────────────────────────────────────────
 var CollectionPreviewPage = function(props) {
   var stateC   = useState([]);      var collections   = stateC[0];   var setCollections   = stateC[1];
@@ -613,12 +487,11 @@ var CollectionPreviewPage = function(props) {
   var stateDM  = useState({});      var designerMap   = stateDM[0];  var setDesignerMap   = stateDM[1];
   var stateVw  = useState(props.initialViewMode || 'all'); var viewMode = stateVw[0]; var setViewMode = stateVw[1];
   var stateST  = useState(props.initialType || null); var selectedType = stateST[0]; var setSelectedType = stateST[1];
+  var stateAdd = useState(false);   var showAddDrawer = stateAdd[0]; var setShowAddDrawer = stateAdd[1];
+  var stateRK  = useState(0);       var refreshKey    = stateRK[0];  var setRefreshKey    = stateRK[1];
 
   var firstRunRef = useRef(true);
 
-  // Switch view mode (all / category / progress) and clear any drill-down
-  // selection, since selectedType keys differ between "By Type" and
-  // "By Progress" and a stale value would look up an empty group.
   function switchViewMode(mode) {
     setSelectedType(null);
     setViewMode(mode);
@@ -637,21 +510,10 @@ var CollectionPreviewPage = function(props) {
       }
     });
 
-    var s = ctx.sql;
-    if (!s) return;
-    var designerOptUid = 'photo_dash_designer_' + Date.now();
-    s.save({ uid: designerOptUid, sql: "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'", dataSourceKey: 'main' })
-      .catch(function(){})
-      .then(function() { return s.runById(designerOptUid, { type: 'selectRows', dataSourceKey: 'main' }); })
-      .then(function(frows) {
-        var map = {};
-        try {
-          var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
-          var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
-          arr.forEach(function(o) { if (o.value) map[o.value] = o.label || o.value; });
-        } catch(e) {}
-        setDesignerMap(map);
-      });
+    // designer enum map via lib_enum_labels — was a raw-SQL `fields` query.
+    loadCode('lib_enum_labels').then(function (Lib) {
+      setDesignerMap(Lib.enumLabelMap('sample', 'designer'));
+    }).catch(function () {});
   }, []);
 
   useEffect(function() {
@@ -659,7 +521,6 @@ var CollectionPreviewPage = function(props) {
     setLoadingSamp(true);
     setSamples([]);
     if (firstRunRef.current) {
-      // Preserve any initial selectedType/viewMode passed in via props on first load
       firstRunRef.current = false;
     } else {
       setSelectedType(null);
@@ -676,49 +537,78 @@ var CollectionPreviewPage = function(props) {
       "WHERE sample.fk_collection_id = " + selectedCol + " " +
       "ORDER BY sample.name ASC"
     ).then(function(sampleRows) {
-      return runSql(imgUid,
-        "SELECT t_wda3bnmr9c9.f_57nmxuosclw AS sample_id, " +
-        "attachments.url AS img_url, attachments.filename AS img_filename " +
-        "FROM t_wda3bnmr9c9, attachments " +
-        "WHERE attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
-        "ORDER BY attachments.id ASC"
-      ).then(function(imgRows) {
+      var sampleIds = sampleRows.map(function(r) { return r.id; });
+
+      return Promise.all([
+        runSql(imgUid,
+          "SELECT t_wda3bnmr9c9.f_57nmxuosclw AS sample_id, " +
+          "attachments.url AS img_url, attachments.filename AS img_filename " +
+          "FROM t_wda3bnmr9c9, attachments " +
+          "WHERE attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+          "ORDER BY attachments.id ASC"
+        ),
+        runSql(varUid,
+          "SELECT sample_variant.fk_sample_variant_id AS sample_id, sample_variant.status AS status " +
+          "FROM sample_variant, sample " +
+          "WHERE sample_variant.fk_sample_variant_id = sample.id " +
+          "AND sample.fk_collection_id = " + selectedCol
+        ),
+        fetchVariantImages(sampleIds),
+      ]).then(function(results) {
+        var imgRows = results[0];
+        var varRows = results[1];
+        var variantImgRows = results[2];
+
+        // sample-level image fallback map
         var imgMap = {};
         imgRows.forEach(function(r) {
           var sid = String(r.sample_id);
           if (!imgMap[sid]) imgMap[sid] = buildImgUrl(r.img_filename, r.img_url);
         });
 
-        return runSql(varUid,
-          "SELECT sample_variant.fk_sample_variant_id AS sample_id, sample_variant.status AS status " +
-          "FROM sample_variant, sample " +
-          "WHERE sample_variant.fk_sample_variant_id = sample.id " +
-          "AND sample.fk_collection_id = " + selectedCol
-        ).then(function(varRows) {
-          var variantMap = {};
-          varRows.forEach(function(r) {
-            var sid = String(r.sample_id);
-            if (!variantMap[sid]) variantMap[sid] = [];
-            variantMap[sid].push(r.status);
-          });
-
-          var grouped = sampleRows.map(function(r) {
-            var isOld = String(r.is_new) === 'false' || r.is_new === 0 || r.is_new === false;
-            return {
-              id: r.id, name: r.name, status: r.status, type: r.type, designer: r.designer,
-              target_price: r.target_price,
-              is_old: isOld,
-              img_url: imgMap[String(r.id)] || '',
-              progress: classifyProgress(r, variantMap[String(r.id)]),
-            };
-          });
-
-          setSamples(grouped);
-          setLoadingSamp(false);
+        // variant statuses, for progress classification (unrelated to images)
+        var variantMap = {};
+        varRows.forEach(function(r) {
+          var sid = String(r.sample_id);
+          if (!variantMap[sid]) variantMap[sid] = [];
+          variantMap[sid].push(r.status);
         });
+
+        // variant-level images, in ascending (variant id, then attachment id) order per sample.
+        // sample_variant.image is belongsToMany, so row.image is an array of attachments.
+        var variantImgMap = {};
+        variantImgRows.forEach(function(row) {
+          var sid = String(row.fk_sample_variant_id);
+          var imgs = Array.isArray(row.image) ? row.image.slice() : [];
+          if (!imgs.length) return;
+          imgs.sort(function(a, b) { return (a.id || 0) - (b.id || 0); });
+          if (!variantImgMap[sid]) variantImgMap[sid] = [];
+          imgs.forEach(function(img) {
+            var url = buildImgUrl(img.filename, img.url);
+            if (url) variantImgMap[sid].push(url);
+          });
+        });
+
+        var grouped = sampleRows.map(function(r) {
+          var isOld = String(r.is_new) === 'false' || r.is_new === 0 || r.is_new === false;
+          var vImgs = variantImgMap[String(r.id)] || [];
+          var mainImg = vImgs.length > 0 ? vImgs[0] : (imgMap[String(r.id)] || '');
+          var thumbImgs = vImgs.length > 1 ? vImgs.slice(1) : [];
+          return {
+            id: r.id, name: r.name, status: r.status, type: r.type, designer: r.designer,
+            target_price: r.target_price,
+            is_old: isOld,
+            img_url: mainImg,
+            thumb_images: thumbImgs,
+            progress: classifyProgress(r, variantMap[String(r.id)]),
+          };
+        });
+
+        setSamples(grouped);
+        setLoadingSamp(false);
       });
     });
-  }, [selectedCol]);
+  }, [selectedCol, refreshKey]);
 
   var selectedColData = collections.find(function(c) { return String(c.id) === selectedCol; });
 
@@ -733,7 +623,8 @@ var CollectionPreviewPage = function(props) {
   });
   var designerEntries = Object.keys(designerCounts).sort(function(a, b) { return designerCounts[b] - designerCounts[a]; });
 
-  var STATUS_SORT = ['done','color','pricing','first_sample','pola','ideas'];
+  // 'pricing' removed — no longer used.
+  var STATUS_SORT = ['done','color','first_sample','pola','ideas'];
   var sortedSamples = samples.filter(function(s) {
     return String(s.status || '') !== 'cancel' && !s.is_old;
   }).slice().sort(function(a, b) {
@@ -755,7 +646,6 @@ var CollectionPreviewPage = function(props) {
   var unknownTypes = Object.keys(typeGroups).filter(function(t) { return TYPE_ORDER.indexOf(t) === -1; });
   typeKeys = typeKeys.concat(unknownTypes);
 
-  // Progress groups (Ideas / Pola / First Sample / Revision / QC / Approval)
   var progressGroups = {};
   samples.forEach(function(s) {
     if (s.is_old) return;
@@ -784,10 +674,35 @@ var CollectionPreviewPage = function(props) {
     `),
 
     modalSampleId
-      ? createElement(SampleModal, { sampleId: modalSampleId, onClose: function() { setModalSampleId(null); } })
+      ? createElement(SampleModal, {
+          sampleId: modalSampleId,
+          onClose: function() { setModalSampleId(null); },
+          DrawerShell: props.DrawerShell,
+          SampleEditDrawerComp: props.SampleEditDrawerComp,
+          editCollections: collections,
+          editTypeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
+          editStatusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
+          refreshToken: refreshKey,
+          onSampleSaved: function() { setRefreshKey(function(k) { return k + 1; }); },
+        })
       : null,
 
-    // Header
+    props.SampleCreateDrawerComp ? createElement(props.SampleCreateDrawerComp, {
+      open: showAddDrawer,
+      onClose: function() { setShowAddDrawer(false); },
+      collections: collections,
+      defaultCollectionId: selectedCol,
+      designerMap: designerMap,
+      typeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
+      statusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
+      defaultStatus: 'ideas',
+      DrawerShell: props.DrawerShell,
+      onCreated: function() {
+        setShowAddDrawer(false);
+        setRefreshKey(function(k) { return k + 1; });
+      },
+    }) : null,
+
     createElement('div', { className: 'cp-header', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', marginBottom: 14, gap: 12 } },
       createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
         props.onBack ? createElement('button', {
@@ -806,11 +721,17 @@ var CollectionPreviewPage = function(props) {
             var date = c.target_photoshoot ? ' · ' + String(c.target_photoshoot).substring(0, 10) : '';
             return { value: String(c.id), label: c.name + date };
           }),
-        })
+        }),
+        createElement('button', {
+          onClick: function() { setShowAddDrawer(true); },
+          style: {
+            padding: '5px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+            border: 'none', borderRadius: 6, background: '#6366f1', color: '#fff',
+          }
+        }, '+ Add Sample')
       )
     ),
 
-    // Meta bar
     selectedColData
       ? createElement('div', {
           className: 'cp-meta-bar',
@@ -861,7 +782,6 @@ var CollectionPreviewPage = function(props) {
         )
       : null,
 
-    // Content
     loadingSamp
       ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#94a3b8' } }, 'Loading…')
       : samples.length === 0
@@ -923,25 +843,55 @@ var CollectionPreviewPage = function(props) {
 };
 
 // ─────────────────────────────────────────────────────────────
-// SUMMARY REPORT PAGE (default view). Clicking a card, or a type
-// row inside it, navigates to the Collection Preview page (full
-// page change with a Back button) instead of opening a popup.
-// props: onOpenCollection(collectionId, { type, viewMode })
+// SUMMARY REPORT PAGE
+//
+// REFACTORED 2026-07: designer enum map now via lib_enum_labels — the
+// designer-options SQL step + its `frows` parsing block are removed
+// entirely, replaced with one loadCode() call kicked off in parallel with
+// the rest of this effect's query chain.
+//
+// UPDATED: 'pricing' sample status removed (no longer used). Sample Status
+// query filtered to is_new = TRUE so its total matches the "X samples"
+// breakdown chip. Variant status mapping updated: pending / sewing /
+// minor_revision / qc / approval -> inprogress, done -> approved.
 // ─────────────────────────────────────────────────────────────
 var SummaryReportPage = function (props) {
   var _d = useState(null), data = _d[0], setData = _d[1];
   var _l = useState(true), loading = _l[0], setLoading = _l[1];
+  var _a = useState(false), showAddDrawer = _a[0], setShowAddDrawer = _a[1];
+  var _rk = useState(0), refreshKey = _rk[0], setRefreshKey = _rk[1];
+  var _ac = useState([]), allCollections = _ac[0], setAllCollections = _ac[1];
+
+  // Full collection list for the Add Sample drawer — the summary's own
+  // `collections` (below, derived from data.collMap) only includes
+  // collections that already have qualifying sample rows, which would
+  // exclude a brand-new empty collection.
+  useEffect(function () {
+    runSql(CONFIG.uid_collections,
+      "SELECT collection.id AS id, collection.name AS name, collection.target_photoshoot AS target_photoshoot " +
+      "FROM collection " +
+      "WHERE (collection.photoshoot IS NULL OR collection.photoshoot = 0 OR collection.photoshoot = FALSE) " +
+      "ORDER BY collection.target_photoshoot ASC, collection.name ASC"
+    ).then(function(rows) { setAllCollections(rows); });
+  }, []);
 
   useEffect(function () {
     setLoading(true);
     var sql = ctx.sql;
 
-    function q(uid, sqlStr) {
-      return sql.save({ uid: uid, sql: sqlStr, dataSourceKey: 'main' })
-        .catch(function(){})
-        .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
-        .then(function(r) { return r || []; });
-    }
+
+function q(uid, sqlStr) {
+  var savePromise = ctx.flowSettingsEnabled
+    ? sql.save({ uid: uid, sql: sqlStr, dataSourceKey: 'main' }).catch(function(){})
+    : Promise.resolve();
+  return savePromise
+    .then(function() { return sql.runById(uid, { type: 'selectRows', dataSourceKey: 'main' }); })
+    .then(function(r) { return r || []; })
+    .catch(function() { return []; });
+}
+    var designerLabelMapPromise = loadCode('lib_enum_labels')
+      .then(function (Lib) { return Lib.enumLabelMap('sample', 'designer'); })
+      .catch(function () { return {}; });
 
     q(CONFIG.uid_summary,
       "SELECT collection.name AS collection_name, collection.id AS collection_id, " +
@@ -978,7 +928,9 @@ var SummaryReportPage = function (props) {
 
         return q(CONFIG.uid_sample_status,
           "SELECT fk_collection_id AS collection_id, status, COUNT(*) AS cnt " +
-          "FROM sample GROUP BY fk_collection_id, status"
+          "FROM sample " +
+          "WHERE is_new = TRUE " +
+          "GROUP BY fk_collection_id, status"
         ).then(function(sStatusRows) {
 
           return q(CONFIG.uid_variant_status,
@@ -987,10 +939,6 @@ var SummaryReportPage = function (props) {
             "WHERE sample_variant.fk_sample_variant_id = sample.id " +
             "GROUP BY sample.fk_collection_id, sample_variant.status"
           ).then(function(vStatusRows) {
-
-          return q(CONFIG.uid_designer_opts,
-            "SELECT CAST(options AS CHAR) AS options FROM fields WHERE collection_name = 'sample' AND name = 'designer'"
-          ).then(function(frows) {
 
             return q('sample_coll_checkpoints',
               "SELECT fk_collection_id AS collection_id, checkpoint_date, approved_sample " +
@@ -1005,17 +953,12 @@ var SummaryReportPage = function (props) {
               ")"
             ).then(function(targetRows) {
 
+            return designerLabelMapPromise.then(function (designerLabelMap) {
+
             var targetMap = {};
             targetRows.forEach(function(r) {
               targetMap[String(r.collection_id)] = Number(r.total_sample) || 0;
             });
-
-              var designerLabelMap = {};
-              try {
-                var parsed = JSON.parse((frows && frows[0] && frows[0].options) || '{}');
-                var arr = parsed.uiSchema && parsed.uiSchema.enum ? parsed.uiSchema.enum : [];
-                arr.forEach(function(o) { if (o.value) designerLabelMap[o.value] = o.label || o.value; });
-              } catch(e) {}
 
               var sampleVariantMap = {};
               varRows.forEach(function(v) {
@@ -1164,7 +1107,7 @@ var SummaryReportPage = function (props) {
         });
       });
     }).catch(function() { setLoading(false); });
-  }, []);
+  }, [refreshKey]);
 
   var S = {
     wrap:      { padding: 16, background: '#fff', borderRadius: 8, fontFamily: 'system-ui,sans-serif', boxSizing: 'border-box' },
@@ -1210,6 +1153,34 @@ var SummaryReportPage = function (props) {
     );
   }
 
+  function addSampleDrawer(collList, designerLabelMap) {
+    return props.SampleCreateDrawerComp ? React.createElement(props.SampleCreateDrawerComp, {
+      open: showAddDrawer,
+      onClose: function() { setShowAddDrawer(false); },
+      collections: collList,
+      defaultCollectionId: null,
+      designerMap: designerLabelMap || {},
+      typeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
+      statusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
+      defaultStatus: 'ideas',
+      DrawerShell: props.DrawerShell,
+      onCreated: function() {
+        setShowAddDrawer(false);
+        setRefreshKey(function(k) { return k + 1; });
+      },
+    }) : null;
+  }
+
+  function addSampleButton() {
+    return React.createElement('button', {
+      onClick: function() { setShowAddDrawer(true); },
+      style: {
+        padding: '5px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+        border: 'none', borderRadius: 6, background: '#6366f1', color: '#fff',
+      }
+    }, '+ Add Sample');
+  }
+
   if (loading) {
     return React.createElement('div', { style: S.wrap },
       React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…')
@@ -1217,7 +1188,11 @@ var SummaryReportPage = function (props) {
   }
   if (!data || !data.collOrder || !data.collOrder.length) {
     return React.createElement('div', { style: S.wrap },
-      React.createElement('div', { style: S.title }, 'Sample Summary Report'),
+      addSampleDrawer(allCollections, {}),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+        React.createElement('div', { style: S.title }, 'Sample Summary Report'),
+        addSampleButton()
+      ),
       React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#d1d5db', fontStyle: 'italic' } }, 'No data found')
     );
   }
@@ -1232,7 +1207,11 @@ var SummaryReportPage = function (props) {
         .ssr-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
       }
     `),
-    React.createElement('div', { style: S.title }, 'Sample Summary Report'),
+    addSampleDrawer(allCollections, designerLabelMap),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 } },
+      React.createElement('div', { style: Object.assign({}, S.title, { marginBottom: 0 }) }, 'Sample Summary Report'),
+      addSampleButton()
+    ),
     React.createElement('div', { className: 'ssr-grid', style: S.grid },
       collections.map(function(coll, ci) {
         var collId = data.collOrder[ci];
@@ -1347,10 +1326,30 @@ var SummaryReportPage = function (props) {
 
 // ─────────────────────────────────────────────────────────────
 // APP — page switcher: 'summary' (default) <-> 'preview'
+//
+// REFACTORED 2026-07: preloads lib_drawer_shell once here, threads it down
+// to CollectionPreviewPage -> SampleModal. If it fails to load for any
+// reason, DrawerShellComp stays null and SampleModal falls back to its
+// original hand-built Drawer, unchanged.
 // ─────────────────────────────────────────────────────────────
 var App = function() {
   var stateStage = useState('summary'); var page = stateStage[0]; var setPage = stateStage[1];
   var statePreview = useState(null); var previewParams = statePreview[0]; var setPreviewParams = statePreview[1];
+  var stateShell = useState(null); var DrawerShellComp = stateShell[0]; var setDrawerShellComp = stateShell[1];
+  var stateAdd = useState(null); var SampleCreateDrawerComp = stateAdd[0]; var setSampleCreateDrawerComp = stateAdd[1];
+  var stateEdit = useState(null); var SampleEditDrawerComp = stateEdit[0]; var setSampleEditDrawerComp = stateEdit[1];
+
+  useEffect(function() {
+    loadCode('lib_drawer_shell')
+      .then(function(Mod) { setDrawerShellComp(function() { return Mod.DrawerShell; }); })
+      .catch(function() { setDrawerShellComp(function() { return null; }); });
+    loadCode('ui_sample_add')
+      .then(function(Mod) { setSampleCreateDrawerComp(function() { return Mod.SampleCreateDrawer; }); })
+      .catch(function(e) { console.error('Failed to load ui_sample_add:', e); setSampleCreateDrawerComp(function() { return null; }); });
+    loadCode('ui_sample_edit')
+      .then(function(Mod) { setSampleEditDrawerComp(function() { return Mod.SampleEditDrawer; }); })
+      .catch(function(e) { console.error('Failed to load ui_sample_edit:', e); setSampleEditDrawerComp(function() { return null; }); });
+  }, []);
 
   function openCollection(collectionId, opts) {
     setPreviewParams({
@@ -1372,9 +1371,16 @@ var App = function() {
       initialType: previewParams.initialType,
       initialViewMode: previewParams.initialViewMode,
       onBack: backToSummary,
+      DrawerShell: DrawerShellComp,
+      SampleCreateDrawerComp: SampleCreateDrawerComp,
+      SampleEditDrawerComp: SampleEditDrawerComp,
     });
   }
-  return createElement(SummaryReportPage, { onOpenCollection: openCollection });
+  return createElement(SummaryReportPage, {
+    onOpenCollection: openCollection,
+    DrawerShell: DrawerShellComp,
+    SampleCreateDrawerComp: SampleCreateDrawerComp,
+  });
 };
 
 ctx.render(createElement(App));
