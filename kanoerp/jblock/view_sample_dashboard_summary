@@ -4,7 +4,7 @@ var useEffect = React.useEffect;
 var useRef = React.useRef;
 var createElement = React.createElement;
 
-var { Select, Drawer } = ctx.antd;
+var { Select, Drawer, Input } = ctx.antd;
 
 // ─────────────────────────────────────────────────────────────
 // shared code loader (resource-based, non-admin-safe) — this file didn't
@@ -168,6 +168,98 @@ function formatPrice(v) {
   return 'Rp' + n.toLocaleString('id-ID');
 }
 
+// escape a search term for embedding inside a single-quoted SQL literal,
+// then wrap it in a case-insensitive LIKE clause against `col`.
+function likeClause(col, term) {
+  var esc = String(term).replace(/'/g, "''");
+  return "LOWER(" + col + ") LIKE LOWER('%" + esc + "%')";
+}
+
+// ─────────────────────────────────────────────────────────────
+// GLOBAL SEARCH HELPERS (used by the top-level, always-visible search bar)
+//
+// sample_variant.fabric / fabric2 are `belongsTo` relations to
+// material_details — not plain text columns — so raw SQL must reference the
+// underlying foreign-key columns fk_fabric_code / fk_fabric_code2 instead.
+// Searches across every (non-photoshoot) collection, not just the one
+// currently open in the preview page.
+// ─────────────────────────────────────────────────────────────
+function searchSampleIds(query) {
+  return runSql('global_search_ids_' + Date.now(),
+    "SELECT DISTINCT sample.id AS id FROM sample, collection " +
+    "WHERE sample.fk_collection_id = collection.id " +
+    "AND (collection.photoshoot IS NULL OR collection.photoshoot = 0 OR collection.photoshoot = FALSE) " +
+    "AND (" + likeClause('sample.name', query) + " OR " + likeClause('sample.description', query) + " " +
+    "OR sample.id IN (" +
+      "SELECT sample_variant.fk_sample_variant_id FROM sample_variant " +
+      "WHERE (" + likeClause('sample_variant.fk_fabric_code', query) + " OR " + likeClause('sample_variant.fk_fabric_code2', query) + ")" +
+    "))"
+  );
+}
+
+function fetchSampleCards(sampleIds) {
+  if (!sampleIds || !sampleIds.length) return Promise.resolve([]);
+  var idList = sampleIds.join(',');
+  var baseUid = 'global_search_base_' + Date.now();
+  var imgUid  = 'global_search_img_' + Date.now();
+
+  return Promise.all([
+    runSql(baseUid,
+      "SELECT sample.id AS id, sample.name AS name, sample.status AS status, " +
+      "sample.type AS type, sample.designer AS designer, sample.is_new AS is_new, " +
+      "sample.target_price AS target_price, collection.name AS collection_name, " +
+      "sample.fk_collection_id AS collection_id " +
+      "FROM sample, collection " +
+      "WHERE sample.fk_collection_id = collection.id " +
+      "AND sample.id IN (" + idList + ")"
+    ),
+    runSql(imgUid,
+      "SELECT t_wda3bnmr9c9.f_57nmxuosclw AS sample_id, " +
+      "attachments.url AS img_url, attachments.filename AS img_filename " +
+      "FROM t_wda3bnmr9c9, attachments " +
+      "WHERE attachments.id = t_wda3bnmr9c9.f_3icqdx05qdd " +
+      "AND t_wda3bnmr9c9.f_57nmxuosclw IN (" + idList + ") " +
+      "ORDER BY attachments.id ASC"
+    ),
+    fetchVariantImages(sampleIds),
+  ]).then(function(results) {
+    var sampleRows = results[0];
+    var imgRows = results[1];
+    var variantImgRows = results[2];
+
+    var imgMap = {};
+    imgRows.forEach(function(r) {
+      var sid = String(r.sample_id);
+      if (!imgMap[sid]) imgMap[sid] = buildImgUrl(r.img_filename, r.img_url);
+    });
+
+    var variantImgMap = {};
+    variantImgRows.forEach(function(row) {
+      var sid = String(row.fk_sample_variant_id);
+      var imgs = Array.isArray(row.image) ? row.image.slice() : [];
+      if (!imgs.length) return;
+      imgs.sort(function(a, b) { return (a.id || 0) - (b.id || 0); });
+      if (!variantImgMap[sid]) variantImgMap[sid] = [];
+      imgs.forEach(function(img) {
+        var url = buildImgUrl(img.filename, img.url);
+        if (url) variantImgMap[sid].push(url);
+      });
+    });
+
+    return sampleRows.map(function(r) {
+      var vImgs = variantImgMap[String(r.id)] || [];
+      var mainImg = vImgs.length > 0 ? vImgs[0] : (imgMap[String(r.id)] || '');
+      var thumbImgs = vImgs.length > 1 ? vImgs.slice(1) : [];
+      return {
+        id: r.id, name: r.name, status: r.status, type: r.type, designer: r.designer,
+        target_price: r.target_price,
+        collection_name: r.collection_name, collection_id: r.collection_id,
+        img_url: mainImg, thumb_images: thumbImgs,
+      };
+    });
+  });
+}
+
 // ─────────────────────────────────────────────────────────────
 // SAMPLE DETAIL MODAL
 //
@@ -320,10 +412,15 @@ var SampleModal = function(props) {
 // MOODBOARD TILE — thumbnail strip enlarged 22px -> 40px so users can
 // actually make out the other variant colors at a glance, not just tell
 // something extra exists.
+//
+// UPDATED: optional `showName` prop renders a name caption strip under the
+// image/thumbs (used by search results, where the match may be on
+// description/fabric rather than something visible in the photo).
 // ─────────────────────────────────────────────────────────────
 var SampleTile = function(props) {
   var s = props.sample;
   var onOpen = props.onOpen;
+  var showName = props.showName;
   var st = getStatus(s.status);
   var firstImg = s.img_url || '';
   var thumbs = (s.thumb_images || []).slice(0, 6);
@@ -335,8 +432,8 @@ var SampleTile = function(props) {
   },
     createElement('div', { style: { position: 'relative' } },
       firstImg
-        ? createElement('img', { src: firstImg, style: { width: '100%', display: 'block', borderRadius: thumbs.length ? '6px 6px 0 0' : 6 }, onerror: function(e) { e.target.parentElement.style.display = 'none'; } })
-        : createElement('div', { style: { height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 18, borderRadius: thumbs.length ? '6px 6px 0 0' : 6 } }, '📷'),
+        ? createElement('img', { src: firstImg, style: { width: '100%', display: 'block', borderRadius: thumbs.length ? '6px 6px 0 0' : (showName ? '6px 6px 0 0' : 6) }, onerror: function(e) { e.target.parentElement.style.display = 'none'; } })
+        : createElement('div', { style: { height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d1d5db', fontSize: 18, borderRadius: thumbs.length ? '6px 6px 0 0' : (showName ? '6px 6px 0 0' : 6) } }, '📷'),
       priceLabel
         ? createElement('div', {
             style: {
@@ -360,6 +457,20 @@ var SampleTile = function(props) {
               onerror: function(e) { e.target.style.display = 'none'; }
             });
           })
+        )
+      : null,
+    showName
+      ? createElement('div', {
+          style: { padding: '6px 8px', background: '#fff', borderTop: '1px solid #f1f5f9' }
+        },
+          createElement('div', {
+            style: { fontSize: 11, fontWeight: 600, color: '#334155', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
+          }, s.name),
+          s.collection_name
+            ? createElement('div', {
+                style: { fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 1 }
+              }, s.collection_name)
+            : null
         )
       : null
   );
@@ -412,6 +523,8 @@ var TypeCard = function(props) {
 
 // ─────────────────────────────────────────────────────────────
 // MASONRY GRID
+//
+// UPDATED: threads an optional `showNames` prop down to each SampleTile.
 // ─────────────────────────────────────────────────────────────
 var MasonryGrid = function(props) {
   var samples  = props.samples;
@@ -437,7 +550,7 @@ var MasonryGrid = function(props) {
     columns.map(function(colSamples, colIdx) {
       return createElement('div', { key: colIdx, style: { flex: 1, display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 } },
         colSamples.map(function(s) {
-          return createElement(SampleTile, { key: s.id, sample: s, onOpen: onOpen });
+          return createElement(SampleTile, { key: s.id, sample: s, onOpen: onOpen, showName: props.showNames });
         })
       );
     })
@@ -446,6 +559,10 @@ var MasonryGrid = function(props) {
 
 // ─────────────────────────────────────────────────────────────
 // GROUP DETAIL VIEW
+//
+// UPDATED: threads an optional `showNames` prop down to MasonryGrid, so the
+// same "← Back / masonry grid" layout can be reused for search results with
+// a name caption on each tile.
 // ─────────────────────────────────────────────────────────────
 var TypeDetailView = function(props) {
   var typeKey    = props.typeKey;
@@ -464,9 +581,11 @@ var TypeDetailView = function(props) {
         style: { border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#64748b' }
       }, '← Back'),
       createElement('span', { style: { fontSize: 15, fontWeight: 700, color: '#1e293b' } }, label),
-      createElement('span', { style: { fontSize: 12, color: '#94a3b8' } }, samples.length + ' samples')
+      props.hideCount ? null : createElement('span', { style: { fontSize: 12, color: '#94a3b8' } }, samples.length + ' samples')
     ),
-    createElement(MasonryGrid, { samples: nonCancel, onOpen: onOpen, maxCols: colCount })
+    nonCancel.length === 0
+      ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No matches')
+      : createElement(MasonryGrid, { samples: nonCancel, onOpen: onOpen, maxCols: colCount, showNames: props.showNames })
   );
 };
 // ─────────────────────────────────────────────────────────────
@@ -475,6 +594,13 @@ var TypeDetailView = function(props) {
 // REFACTORED 2026-07: designer enum map now via lib_enum_labels instead of
 // a raw-SQL query against `fields`. Threads props.DrawerShell down to
 // SampleModal (preloaded once by App, see below).
+//
+// UPDATED: added a search bar (top, above the collection meta bar) that
+// searches sample.name, sample.description, and sample_variant.fabric /
+// fabric2 within the currently selected collection. Results are shown
+// using the same TypeDetailView layout as the "by type" drill-down, with
+// name captions on each tile (via showNames) since matches may come from
+// fields not visible in the photo itself.
 // ─────────────────────────────────────────────────────────────
 var CollectionPreviewPage = function(props) {
   var stateC   = useState([]);      var collections   = stateC[0];   var setCollections   = stateC[1];
@@ -487,7 +613,6 @@ var CollectionPreviewPage = function(props) {
   var stateDM  = useState({});      var designerMap   = stateDM[0];  var setDesignerMap   = stateDM[1];
   var stateVw  = useState(props.initialViewMode || 'all'); var viewMode = stateVw[0]; var setViewMode = stateVw[1];
   var stateST  = useState(props.initialType || null); var selectedType = stateST[0]; var setSelectedType = stateST[1];
-  var stateAdd = useState(false);   var showAddDrawer = stateAdd[0]; var setShowAddDrawer = stateAdd[1];
   var stateRK  = useState(0);       var refreshKey    = stateRK[0];  var setRefreshKey    = stateRK[1];
 
   var firstRunRef = useRef(true);
@@ -608,7 +733,7 @@ var CollectionPreviewPage = function(props) {
         setLoadingSamp(false);
       });
     });
-  }, [selectedCol, refreshKey]);
+  }, [selectedCol, refreshKey, props.refreshToken]);
 
   var selectedColData = collections.find(function(c) { return String(c.id) === selectedCol; });
 
@@ -658,18 +783,74 @@ var CollectionPreviewPage = function(props) {
   var colCount = { sm: 6, md: 4, lg: 3 }[thumbSize] || 4;
   var SIZES = [{ key: 'sm', icon: '⣿' }, { key: 'md', icon: '▦' }, { key: 'lg', icon: '□' }];
 
-  return createElement('div', { style: { padding: 16, fontFamily: 'system-ui,sans-serif', background: '#f8fafc', minHeight: '100%' } },
+  var pageContent = samples.length === 0
+    ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in this collection')
+    : viewMode === 'all'
+      ? createElement(MasonryGrid, { samples: sortedSamples, onOpen: function(id) { setModalSampleId(id); }, maxCols: colCount })
+      : viewMode === 'progress'
+        ? (
+            selectedType
+              ? createElement(TypeDetailView, {
+                  typeKey:  selectedType,
+                  label:    PROGRESS_LABELS[selectedType] || selectedType,
+                  samples:  progressGroups[selectedType] || [],
+                  onBack:   function() { setSelectedType(null); },
+                  onOpen:   function(id) { setModalSampleId(id); },
+                  colCount: colCount,
+                })
+              : progressKeys.length === 0
+                ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in ideas/pola/first sample stages')
+                : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
+                    progressKeys.map(function(pKey) {
+                      return createElement(TypeCard, {
+                        key:      pKey,
+                        typeKey:  pKey,
+                        label:    PROGRESS_LABELS[pKey],
+                        samples:  progressGroups[pKey] || [],
+                        onSelect: function(t) { setSelectedType(t); },
+                      });
+                    })
+                  )
+          )
+        : selectedType
+          ? createElement(TypeDetailView, {
+              typeKey:  selectedType,
+              samples:  selectedType === '__warna_lama__' ? oldSamples : (typeGroups[selectedType] || []),
+              onBack:   function() { setSelectedType(null); },
+              onOpen:   function(id) { setModalSampleId(id); },
+              colCount: colCount,
+            })
+          : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
+              typeKeys.map(function(typeKey) {
+                return createElement(TypeCard, {
+                  key:      typeKey,
+                  typeKey:  typeKey,
+                  samples:  typeGroups[typeKey] || [],
+                  onSelect: function(t) { setSelectedType(t); },
+                });
+              }),
+              oldSamples.length > 0
+                ? createElement(TypeCard, {
+                    key:      '__warna_lama__',
+                    typeKey:  '__warna_lama__',
+                    samples:  oldSamples,
+                    onSelect: function(t) { setSelectedType(t); },
+                  })
+                : null
+            );
+
+  return createElement('div', { style: { padding: 16, fontFamily: 'system-ui,sans-serif', minHeight: '100%' } },
 
     createElement('style', null, `
-      @media (max-width: 1024px) {
-        .cp-toggle-group { margin-left: 0 !important; }
-      }
+      .cp-toolbar-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+      .cp-toolbar-select { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+      .cp-toolbar-select .ant-select { min-width: 260px; }
+      .cp-stats-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+      .cp-toggle-group { display: flex; gap: 8px; align-items: center; margin-left: auto; }
       @media (max-width: 640px) {
-        .cp-header { flex-direction: column !important; align-items: flex-start !important; }
-        .cp-header-select-row { width: 100% !important; }
-        .cp-header-select-row .ant-select { min-width: 0 !important; width: 100% !important; }
-        .cp-meta-bar { justify-content: flex-start !important; }
-        .cp-toggle-group { flex-basis: 100% !important; justify-content: flex-start !important; }
+        .cp-toolbar-select { width: 100%; }
+        .cp-toolbar-select .ant-select { min-width: 0 !important; width: 100%; }
+        .cp-toggle-group { margin-left: 0; flex-basis: 100%; justify-content: flex-start; }
       }
     `),
 
@@ -687,158 +868,71 @@ var CollectionPreviewPage = function(props) {
         })
       : null,
 
-    props.SampleCreateDrawerComp ? createElement(props.SampleCreateDrawerComp, {
-      open: showAddDrawer,
-      onClose: function() { setShowAddDrawer(false); },
-      collections: collections,
-      defaultCollectionId: selectedCol,
-      designerMap: designerMap,
-      typeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
-      statusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
-      defaultStatus: 'ideas',
-      DrawerShell: props.DrawerShell,
-      onCreated: function() {
-        setShowAddDrawer(false);
-        setRefreshKey(function(k) { return k + 1; });
-      },
-    }) : null,
+    // ── Consolidated toolbar: back button + collection name on top,
+    // stats + designer chips + view controls below — all inside one card
+    // instead of two separate header/meta-bar strips. Collection switching
+    // now happens via Back → pick another collection card, so no dropdown here.
+    createElement('div', { style: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', padding: '14px 16px', marginBottom: 16 } },
 
-    createElement('div', { className: 'cp-header', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', marginBottom: 14, gap: 12 } },
-      createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-        props.onBack ? createElement('button', {
-          onClick: props.onBack,
-          style: { border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', padding: '4px 12px', fontSize: 12, cursor: 'pointer', color: '#64748b' }
-        }, '← Back') : null,
-        createElement('div', { style: { fontSize: 16, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.01em' } }, 'Collection Preview')
+      createElement('div', { className: 'cp-toolbar-top', style: { marginBottom: selectedColData ? 12 : 0 } },
+        createElement('div', { className: 'cp-toolbar-select' },
+          props.onBack ? createElement('button', {
+            onClick: props.onBack,
+            style: { border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', padding: '6px 12px', fontSize: 12, cursor: 'pointer', color: '#64748b', flexShrink: 0 }
+          }, '← Back') : null,
+          selectedColData
+            ? createElement('span', { style: { fontSize: 15, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.01em' } }, selectedColData.name)
+            : null
+        )
       ),
-      createElement('div', { className: 'cp-header-select-row', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-        createElement('span', { style: { fontSize: 12, fontWeight: 600, color: '#475569' } }, 'Collection:'),
-        createElement(Select, {
-          value: selectedCol,
-          onChange: function(v) { setSelectedCol(v); },
-          style: { minWidth: 220 },
-          options: collections.map(function(c) {
-            var date = c.target_photoshoot ? ' · ' + String(c.target_photoshoot).substring(0, 10) : '';
-            return { value: String(c.id), label: c.name + date };
-          }),
-        }),
-        createElement('button', {
-          onClick: function() { setShowAddDrawer(true); },
-          style: {
-            padding: '5px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-            border: 'none', borderRadius: 6, background: '#6366f1', color: '#fff',
-          }
-        }, '+ Add Sample')
-      )
-    ),
 
-    selectedColData
-      ? createElement('div', {
-          className: 'cp-meta-bar',
-          style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14, padding: '8px 12px', background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', fontSize: 11 }
-        },
-          createElement('span', { style: { fontWeight: 700, color: '#0f172a', fontSize: 13 } }, selectedColData.name),
-          createElement('span', { style: { color: '#e2e8f0' } }, '·'),
-          createElement('span', { style: { color: '#64748b' } }, nonCancelSamples.length + ' samples'),
-          createElement('span', { style: { color: '#e2e8f0' } }, '·'),
-          createElement('span', { style: { color: '#f97316', fontWeight: 600 } }, '● ' + inProgressCount + ' in progress'),
-          createElement('span', { style: { color: '#22c55e', fontWeight: 600 } }, '● ' + approvedCount + ' approved'),
-          selectedColData.target_photoshoot
-            ? createElement('span', { style: { color: '#64748b' } }, '📅 ' + String(selectedColData.target_photoshoot).substring(0, 10))
-            : null,
-          designerEntries.length > 0 ? createElement('span', { style: { color: '#e2e8f0' } }, '·') : null,
-          designerEntries.map(function(d) {
-            return createElement('span', { key: d, style: { background: '#f0f4ff', color: '#4338ca', border: '1px solid #c7d2fe', borderRadius: 99, padding: '1px 8px', fontWeight: 600, fontSize: 10 } },
-              (designerMap[d] || d) + ' ' + designerCounts[d]
-            );
-          }),
+      selectedColData
+        ? createElement('div', { className: 'cp-stats-row' },
+            createElement('span', { style: { background: '#eff6ff', color: '#3b82f6', borderRadius: 6, padding: '3px 9px', fontSize: 11, fontWeight: 700 } }, nonCancelSamples.length + ' samples'),
+            createElement('span', { style: { background: '#fff7ed', color: '#f97316', borderRadius: 6, padding: '3px 9px', fontSize: 11, fontWeight: 700 } }, '● ' + inProgressCount + ' in progress'),
+            createElement('span', { style: { background: '#f0fdf4', color: '#22c55e', borderRadius: 6, padding: '3px 9px', fontSize: 11, fontWeight: 700 } }, '● ' + approvedCount + ' approved'),
+            selectedColData.target_photoshoot
+              ? createElement('span', { style: { color: '#64748b', fontSize: 11 } }, '📅 ' + String(selectedColData.target_photoshoot).substring(0, 10))
+              : null,
+            designerEntries.map(function(d) {
+              return createElement('span', { key: d, style: { background: '#f0f4ff', color: '#4338ca', border: '1px solid #c7d2fe', borderRadius: 99, padding: '2px 9px', fontWeight: 600, fontSize: 10 } },
+                (designerMap[d] || d) + ' ' + designerCounts[d]
+              );
+            }),
 
-          createElement('div', { className: 'cp-toggle-group', style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' } },
-            createElement('div', { style: { display: 'flex', gap: 2, border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
-              createElement('button', {
-                onClick: function() { switchViewMode('all'); },
-                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', background: viewMode === 'all' ? '#eef2ff' : '#fff', color: viewMode === 'all' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'all' ? 700 : 400 }
-              }, 'All'),
-              createElement('button', {
-                onClick: function() { switchViewMode('category'); },
-                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'category' ? '#eef2ff' : '#fff', color: viewMode === 'category' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'category' ? 700 : 400 }
-              }, 'By Type'),
-              createElement('button', {
-                onClick: function() { switchViewMode('progress'); },
-                style: { padding: '2px 10px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'progress' ? '#eef2ff' : '#fff', color: viewMode === 'progress' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'progress' ? 700 : 400 }
-              }, 'By Progress')
-            ),
-            createElement('div', { style: { display: 'flex', gap: 3 } },
-              SIZES.map(function(sz) {
-                var active = thumbSize === sz.key;
-                return createElement('button', {
-                  key: sz.key,
-                  onClick: function() { setThumbSize(sz.key); },
-                  style: { padding: '2px 8px', fontSize: 11, cursor: 'pointer', border: '1px solid ' + (active ? '#6366f1' : '#e2e8f0'), borderRadius: 4, background: active ? '#eef2ff' : '#fff', color: active ? '#4338ca' : '#94a3b8', fontWeight: active ? 700 : 400 }
-                }, sz.icon);
-              })
+            createElement('div', { className: 'cp-toggle-group' },
+              createElement('div', { style: { display: 'flex', gap: 2, border: '1px solid #e2e8f0', borderRadius: 6, overflow: 'hidden' } },
+                createElement('button', {
+                  onClick: function() { switchViewMode('all'); },
+                  style: { padding: '3px 11px', fontSize: 11, cursor: 'pointer', border: 'none', background: viewMode === 'all' ? '#eef2ff' : '#fff', color: viewMode === 'all' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'all' ? 700 : 400 }
+                }, 'All'),
+                createElement('button', {
+                  onClick: function() { switchViewMode('category'); },
+                  style: { padding: '3px 11px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'category' ? '#eef2ff' : '#fff', color: viewMode === 'category' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'category' ? 700 : 400 }
+                }, 'By Type'),
+                createElement('button', {
+                  onClick: function() { switchViewMode('progress'); },
+                  style: { padding: '3px 11px', fontSize: 11, cursor: 'pointer', border: 'none', borderLeft: '1px solid #e2e8f0', background: viewMode === 'progress' ? '#eef2ff' : '#fff', color: viewMode === 'progress' ? '#4338ca' : '#94a3b8', fontWeight: viewMode === 'progress' ? 700 : 400 }
+                }, 'By Progress')
+              ),
+              createElement('div', { style: { display: 'flex', gap: 3 } },
+                SIZES.map(function(sz) {
+                  var active = thumbSize === sz.key;
+                  return createElement('button', {
+                    key: sz.key,
+                    onClick: function() { setThumbSize(sz.key); },
+                    style: { padding: '3px 9px', fontSize: 11, cursor: 'pointer', border: '1px solid ' + (active ? '#6366f1' : '#e2e8f0'), borderRadius: 4, background: active ? '#eef2ff' : '#fff', color: active ? '#4338ca' : '#94a3b8', fontWeight: active ? 700 : 400 }
+                  }, sz.icon);
+                })
+              )
             )
           )
-        )
-      : null,
+        : null
+    ),
 
     loadingSamp
       ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#94a3b8' } }, 'Loading…')
-      : samples.length === 0
-        ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in this collection')
-        : viewMode === 'all'
-          ? createElement(MasonryGrid, { samples: sortedSamples, onOpen: function(id) { setModalSampleId(id); }, maxCols: colCount })
-          : viewMode === 'progress'
-            ? (
-                selectedType
-                  ? createElement(TypeDetailView, {
-                      typeKey:  selectedType,
-                      label:    PROGRESS_LABELS[selectedType] || selectedType,
-                      samples:  progressGroups[selectedType] || [],
-                      onBack:   function() { setSelectedType(null); },
-                      onOpen:   function(id) { setModalSampleId(id); },
-                      colCount: colCount,
-                    })
-                  : progressKeys.length === 0
-                    ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#cbd5e1', fontStyle: 'italic' } }, 'No samples in ideas/pola/first sample stages')
-                    : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
-                        progressKeys.map(function(pKey) {
-                          return createElement(TypeCard, {
-                            key:      pKey,
-                            typeKey:  pKey,
-                            label:    PROGRESS_LABELS[pKey],
-                            samples:  progressGroups[pKey] || [],
-                            onSelect: function(t) { setSelectedType(t); },
-                          });
-                        })
-                      )
-              )
-            : selectedType
-              ? createElement(TypeDetailView, {
-                  typeKey:  selectedType,
-                  samples:  selectedType === '__warna_lama__' ? oldSamples : (typeGroups[selectedType] || []),
-                  onBack:   function() { setSelectedType(null); },
-                  onOpen:   function(id) { setModalSampleId(id); },
-                  colCount: colCount,
-                })
-              : createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 } },
-                  typeKeys.map(function(typeKey) {
-                    return createElement(TypeCard, {
-                      key:      typeKey,
-                      typeKey:  typeKey,
-                      samples:  typeGroups[typeKey] || [],
-                      onSelect: function(t) { setSelectedType(t); },
-                    });
-                  }),
-                  oldSamples.length > 0
-                    ? createElement(TypeCard, {
-                        key:      '__warna_lama__',
-                        typeKey:  '__warna_lama__',
-                        samples:  oldSamples,
-                        onSelect: function(t) { setSelectedType(t); },
-                      })
-                    : null
-                )
+      : pageContent
   );
 };
 
@@ -858,22 +952,7 @@ var CollectionPreviewPage = function(props) {
 var SummaryReportPage = function (props) {
   var _d = useState(null), data = _d[0], setData = _d[1];
   var _l = useState(true), loading = _l[0], setLoading = _l[1];
-  var _a = useState(false), showAddDrawer = _a[0], setShowAddDrawer = _a[1];
   var _rk = useState(0), refreshKey = _rk[0], setRefreshKey = _rk[1];
-  var _ac = useState([]), allCollections = _ac[0], setAllCollections = _ac[1];
-
-  // Full collection list for the Add Sample drawer — the summary's own
-  // `collections` (below, derived from data.collMap) only includes
-  // collections that already have qualifying sample rows, which would
-  // exclude a brand-new empty collection.
-  useEffect(function () {
-    runSql(CONFIG.uid_collections,
-      "SELECT collection.id AS id, collection.name AS name, collection.target_photoshoot AS target_photoshoot " +
-      "FROM collection " +
-      "WHERE (collection.photoshoot IS NULL OR collection.photoshoot = 0 OR collection.photoshoot = FALSE) " +
-      "ORDER BY collection.target_photoshoot ASC, collection.name ASC"
-    ).then(function(rows) { setAllCollections(rows); });
-  }, []);
 
   useEffect(function () {
     setLoading(true);
@@ -1107,7 +1186,7 @@ function q(uid, sqlStr) {
         });
       });
     }).catch(function() { setLoading(false); });
-  }, [refreshKey]);
+  }, [refreshKey, props.refreshToken]);
 
   var S = {
     wrap:      { padding: 16, background: '#fff', borderRadius: 8, fontFamily: 'system-ui,sans-serif', boxSizing: 'border-box' },
@@ -1153,34 +1232,6 @@ function q(uid, sqlStr) {
     );
   }
 
-  function addSampleDrawer(collList, designerLabelMap) {
-    return props.SampleCreateDrawerComp ? React.createElement(props.SampleCreateDrawerComp, {
-      open: showAddDrawer,
-      onClose: function() { setShowAddDrawer(false); },
-      collections: collList,
-      defaultCollectionId: null,
-      designerMap: designerLabelMap || {},
-      typeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
-      statusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
-      defaultStatus: 'ideas',
-      DrawerShell: props.DrawerShell,
-      onCreated: function() {
-        setShowAddDrawer(false);
-        setRefreshKey(function(k) { return k + 1; });
-      },
-    }) : null;
-  }
-
-  function addSampleButton() {
-    return React.createElement('button', {
-      onClick: function() { setShowAddDrawer(true); },
-      style: {
-        padding: '5px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-        border: 'none', borderRadius: 6, background: '#6366f1', color: '#fff',
-      }
-    }, '+ Add Sample');
-  }
-
   if (loading) {
     return React.createElement('div', { style: S.wrap },
       React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#9ca3af' } }, 'Loading…')
@@ -1188,11 +1239,6 @@ function q(uid, sqlStr) {
   }
   if (!data || !data.collOrder || !data.collOrder.length) {
     return React.createElement('div', { style: S.wrap },
-      addSampleDrawer(allCollections, {}),
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-        React.createElement('div', { style: S.title }, 'Sample Summary Report'),
-        addSampleButton()
-      ),
       React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#d1d5db', fontStyle: 'italic' } }, 'No data found')
     );
   }
@@ -1207,11 +1253,6 @@ function q(uid, sqlStr) {
         .ssr-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
       }
     `),
-    addSampleDrawer(allCollections, designerLabelMap),
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 } },
-      React.createElement('div', { style: Object.assign({}, S.title, { marginBottom: 0 }) }, 'Sample Summary Report'),
-      addSampleButton()
-    ),
     React.createElement('div', { className: 'ssr-grid', style: S.grid },
       collections.map(function(coll, ci) {
         var collId = data.collOrder[ci];
@@ -1339,6 +1380,20 @@ var App = function() {
   var stateAdd = useState(null); var SampleCreateDrawerComp = stateAdd[0]; var setSampleCreateDrawerComp = stateAdd[1];
   var stateEdit = useState(null); var SampleEditDrawerComp = stateEdit[0]; var setSampleEditDrawerComp = stateEdit[1];
 
+  // ── global collections list (used by the search-result sample modal's
+  // edit drawer, since that modal can be opened outside CollectionPreviewPage) ──
+  var stateColl = useState([]); var collections = stateColl[0]; var setCollections = stateColl[1];
+
+  // ── always-visible global search (name / description / fabric / fabric2,
+  // across every collection) ──
+  var stateQ  = useState('');    var searchQuery  = stateQ[0];  var setSearchQuery  = stateQ[1];
+  var stateR  = useState([]);    var searchResults = stateR[0]; var setSearchResults = stateR[1];
+  var stateSg = useState(false); var searching     = stateSg[0]; var setSearching     = stateSg[1];
+  var stateMd = useState(null);  var modalSampleId = stateMd[0]; var setModalSampleId = stateMd[1];
+  var stateRf = useState(0);     var globalRefresh = stateRf[0]; var setGlobalRefresh = stateRf[1];
+  var stateAddOpen = useState(false); var showAddDrawer = stateAddOpen[0]; var setShowAddDrawer = stateAddOpen[1];
+  var searchDebounceRef = useRef(null);
+
   useEffect(function() {
     loadCode('lib_drawer_shell')
       .then(function(Mod) { setDrawerShellComp(function() { return Mod.DrawerShell; }); })
@@ -1349,7 +1404,33 @@ var App = function() {
     loadCode('ui_sample_edit')
       .then(function(Mod) { setSampleEditDrawerComp(function() { return Mod.SampleEditDrawer; }); })
       .catch(function(e) { console.error('Failed to load ui_sample_edit:', e); setSampleEditDrawerComp(function() { return null; }); });
+    runSql(CONFIG.uid_collections,
+      "SELECT collection.id AS id, collection.name AS name, collection.target_photoshoot AS target_photoshoot " +
+      "FROM collection " +
+      "WHERE (collection.photoshoot IS NULL OR collection.photoshoot = 0 OR collection.photoshoot = FALSE) " +
+      "ORDER BY collection.target_photoshoot ASC, collection.name ASC"
+    ).then(function(rows) { setCollections(rows); });
   }, []);
+
+  function performSearch(q) {
+    setSearching(true);
+    searchSampleIds(q).then(function(rows) {
+      var ids = rows.map(function(r) { return r.id; });
+      if (!ids.length) { setSearchResults([]); setSearching(false); return; }
+      fetchSampleCards(ids).then(function(cards) {
+        setSearchResults(cards);
+        setSearching(false);
+      });
+    });
+  }
+
+  useEffect(function() {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    var q = searchQuery.trim();
+    if (!q) { setSearchResults([]); setSearching(false); return; }
+    searchDebounceRef.current = setTimeout(function() { performSearch(q); }, 300);
+    return function() { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
+  }, [searchQuery]);
 
   function openCollection(collectionId, opts) {
     setPreviewParams({
@@ -1365,22 +1446,116 @@ var App = function() {
     setPreviewParams(null);
   }
 
-  if (page === 'preview' && previewParams) {
-    return createElement(CollectionPreviewPage, {
-      initialCollectionId: previewParams.collectionId,
-      initialType: previewParams.initialType,
-      initialViewMode: previewParams.initialViewMode,
-      onBack: backToSummary,
+  var isSearching = !!searchQuery.trim();
+
+  var addDefaultCollectionId = (page === 'preview' && previewParams) ? previewParams.collectionId : null;
+
+  var pageEl = (page === 'preview' && previewParams)
+    ? createElement(CollectionPreviewPage, {
+        key: 'preview-' + previewParams.collectionId,
+        initialCollectionId: previewParams.collectionId,
+        initialType: previewParams.initialType,
+        initialViewMode: previewParams.initialViewMode,
+        onBack: backToSummary,
+        DrawerShell: DrawerShellComp,
+        SampleEditDrawerComp: SampleEditDrawerComp,
+        refreshToken: globalRefresh,
+      })
+    : createElement(SummaryReportPage, {
+        onOpenCollection: openCollection,
+        DrawerShell: DrawerShellComp,
+        refreshToken: globalRefresh,
+      });
+
+  var searchResultsEl = createElement('div', { style: { padding: 16, fontFamily: 'system-ui,sans-serif' } },
+    searching
+      ? createElement('div', { style: { textAlign: 'center', padding: 60, color: '#94a3b8' } }, 'Searching…')
+      : createElement(TypeDetailView, {
+          typeKey:   '__global_search__',
+          label:     'Search results for "' + searchQuery.trim() + '"',
+          samples:   searchResults,
+          onBack:    function() { setSearchQuery(''); },
+          onOpen:    function(id) { setModalSampleId(id); },
+          colCount:  4,
+          showNames: true,
+        })
+  );
+
+  return createElement('div', { style: { minHeight: '100%' } },
+
+    modalSampleId
+      ? createElement(SampleModal, {
+          sampleId: modalSampleId,
+          onClose: function() { setModalSampleId(null); },
+          DrawerShell: DrawerShellComp,
+          SampleEditDrawerComp: SampleEditDrawerComp,
+          editCollections: collections,
+          editTypeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
+          editStatusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
+          refreshToken: globalRefresh,
+          onSampleSaved: function() {
+            setGlobalRefresh(function(k) { return k + 1; });
+            if (isSearching) performSearch(searchQuery.trim());
+          },
+        })
+      : null,
+
+    SampleCreateDrawerComp ? createElement(SampleCreateDrawerComp, {
+      open: showAddDrawer,
+      onClose: function() { setShowAddDrawer(false); },
+      collections: collections,
+      defaultCollectionId: addDefaultCollectionId,
+      designerMap: {},
+      typeOptions: TYPE_ORDER.map(function(t) { return { value: t, label: TYPE_LABELS[t] || t }; }),
+      statusOptions: STATUS_ORDER.map(function(s) { return { value: s, label: (STATUS_META[s] && STATUS_META[s].label) || s }; }),
+      defaultStatus: 'ideas',
       DrawerShell: DrawerShellComp,
-      SampleCreateDrawerComp: SampleCreateDrawerComp,
-      SampleEditDrawerComp: SampleEditDrawerComp,
-    });
-  }
-  return createElement(SummaryReportPage, {
-    onOpenCollection: openCollection,
-    DrawerShell: DrawerShellComp,
-    SampleCreateDrawerComp: SampleCreateDrawerComp,
-  });
+      onCreated: function() {
+        setShowAddDrawer(false);
+        setGlobalRefresh(function(k) { return k + 1; });
+      },
+    }) : null,
+
+    // ── persistent title + Add Sample bar — unchanged, stays on top ──
+    createElement('div', {
+      style: {
+        position: 'sticky', top: 0, zIndex: 30, padding: '12px 16px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+      }
+    },
+      createElement('div', { style: { fontSize: 16, fontWeight: 700, color: '#111827' } }, 'Sample Summary Report'),
+      createElement('button', {
+        onClick: function() { setShowAddDrawer(true); },
+        style: {
+          padding: '6px 16px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+          border: 'none', borderRadius: 6, background: '#6366f1', color: '#fff',
+        }
+      }, '+ Add Sample')
+    ),
+
+    // ── search bar — same CSS as ui_list_engine's SearchBar (native input,
+    // 1px #e5e7eb border, 10px radius, 13px font, round "×" clear button),
+    // just taller. Wrapper no longer has a bottom line or background fill.
+    createElement('div', {
+      style: { position: 'sticky', top: 52, zIndex: 29, padding: '12px 16px' }
+    },
+      createElement('div', { style: { position: 'relative', display: 'flex', alignItems: 'center' } },
+        createElement('input', {
+          value: searchQuery,
+          onChange: function(e) { setSearchQuery(e.target.value); },
+          placeholder: 'Search name, description, fabric…',
+          style: { width: '100%', padding: '13px 32px 13px 14px', borderRadius: 10, border: '1px solid #e5e7eb', fontSize: 13, outline: 'none' },
+        }),
+        searchQuery ? createElement('button', {
+          onClick: function() { setSearchQuery(''); },
+          title: 'Clear',
+          style: { position: 'absolute', right: 8, border: 'none', background: '#f1f5f9', color: '#64748b', borderRadius: 999, width: 20, height: 20, cursor: 'pointer', fontSize: 13, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }
+        }, '×') : null
+      )
+    ),
+
+    isSearching ? searchResultsEl : pageEl
+  );
 };
 
 ctx.render(createElement(App));
