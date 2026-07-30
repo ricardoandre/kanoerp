@@ -27,6 +27,16 @@ async function downloadAndUpload({ url, filenameBase, attachmentField, fallbackE
     responseType: 'arraybuffer',
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
+    // Meta's CDN (video links especially) commonly 403s a bare HTTP
+    // client as anti-hotlinking protection, even when the URL itself is
+    // valid and unexpired — mimicking a real browser request usually
+    // clears it. If a 403 still happens after this, the URL itself has
+    // likely genuinely expired (Instagram's signed media URLs are
+    // time-limited) rather than being a client-identification issue.
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      Referer: 'https://www.instagram.com/',
+    },
   });
   const buffer = Buffer.from(resp.data);
   const contentType = resp.headers['content-type'] || (fallbackExt === 'mp4' ? 'video/mp4' : 'image/jpeg');
@@ -68,6 +78,20 @@ async function archiveMediaFiles({ mediaId, mediaType, mediaProductType, mediaUr
   const existing = await getOne('ig_media', { media_id: mediaId }, ['media_images']);
   if (existing && Array.isArray(existing.media_images) && existing.media_images.length > 0) {
     return { uploaded: 0, skipped: true };
+  }
+
+  // VIDEO with no thumbnailUrl passed in means the caller doesn't have it
+  // (e.g. backfill-media-images.js reading from the DB, which never
+  // persisted thumbnail_url) — look it up live rather than silently
+  // skipping the thumbnail for an otherwise fully-archived video.
+  if (mediaType === 'VIDEO' && !thumbnailUrl) {
+    try {
+      const details = await ig.fetchMediaDetails({ mediaId });
+      thumbnailUrl = details.thumbnail_url || null;
+      if (!mediaUrl) mediaUrl = details.media_url || null;
+    } catch (e) {
+      console.warn(`    media ${mediaId}: could not refresh thumbnail_url (${e.message}) — archiving video without it`);
+    }
   }
 
   let targets = [];

@@ -1,4 +1,5 @@
 const axios = require('axios');
+const FormData = require('form-data');
 
 const BASE = (process.env.NOCOBASE_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.NOCOBASE_API_KEY;
@@ -7,6 +8,22 @@ const client = axios.create({
   baseURL: `${BASE}/api`,
   headers: { Authorization: `Bearer ${TOKEN}` },
 });
+
+// Without this, every failure just says "Request failed with status code
+// 400" — useless for debugging which field/param NocoBase actually
+// rejected. This rewrites err.message to include NocoBase's real error
+// body (it typically returns { errors: [{ message: "..." }] }) so every
+// function below (listAll, getOne, upsert, etc.) surfaces the real cause
+// automatically, without each call site needing its own try/catch parsing.
+client.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    const detail = err.response?.data?.errors?.map((e) => e.message).join('; ')
+      || (err.response?.data ? JSON.stringify(err.response.data) : null);
+    if (detail) err.message = `${err.message} — ${detail}`;
+    return Promise.reject(err);
+  }
+);
 
 // Upsert one record: matches on filterKeys, so a re-run updates the same
 // row instead of inserting a duplicate. Identical to fb-ads-sync's version
@@ -83,4 +100,36 @@ async function getOne(collection, filter, appends = []) {
   return resp.data?.data?.[0] || null;
 }
 
-module.exports = { upsert, upsertMany, upsertRelational, upsertManyRelational, getOne };
+// Loops .list() by page until a page returns fewer rows than pageSize —
+// same safety pattern as the fetchAllPages helper used elsewhere in this
+// project, avoids silent truncation past ~2000 rows on large collections
+// (ig_media will grow well past that).
+async function listAll(collection, params = {}, pageSize = 200) {
+  const rows = [];
+  let page = 1;
+  for (;;) {
+    const resp = await client.get(`/${collection}:list`, { params: { ...params, pageSize, page } });
+    const data = resp.data?.data || [];
+    rows.push(...data);
+    if (data.length < pageSize) break;
+    page++;
+  }
+  return rows;
+}
+
+// Upload raw image bytes into a collection's attachment field's storage.
+// Returns the created attachment object (use its .id to link to a row).
+// Identical to fb-ads-sync's version.
+async function uploadAttachment(buffer, filename, mimetype, attachmentField) {
+  const form = new FormData();
+  form.append('file', buffer, { filename, contentType: mimetype });
+  const url = `${BASE}/api/attachments:create?attachmentField=${encodeURIComponent(attachmentField)}`;
+  const resp = await axios.post(url, form, {
+    headers: { ...form.getHeaders(), Authorization: `Bearer ${TOKEN}` },
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+  });
+  return resp.data?.data;
+}
+
+module.exports = { upsert, upsertMany, upsertRelational, upsertManyRelational, getOne, listAll, uploadAttachment };

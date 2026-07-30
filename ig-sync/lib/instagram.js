@@ -252,6 +252,21 @@ async function fetchAlbumChildren({ mediaId }) {
   return data.data || [];
 }
 
+// ---------------------------------------------------------------------
+// SINGLE MEDIA DETAILS (on-demand refresh)
+//
+// Used by lib/media-images.js's catch-up path: ig_media only ever
+// persisted media_url, never thumbnail_url, so a video post being
+// archived via backfill-media-images.js (reading from the DB, not fresh
+// off a live listing) has no thumbnail to work with unless we look it up
+// again here.
+// ---------------------------------------------------------------------
+async function fetchMediaDetails({ mediaId }) {
+  return get(`${BASE_URL}/${mediaId}`, {
+    fields: 'media_type,media_product_type,media_url,thumbnail_url',
+  });
+}
+
 module.exports = {
   fetchAccountInsightsPeriod,
   fetchFollowersCountNow,
@@ -262,4 +277,5 @@ module.exports = {
   fetchStoryInsights,
   fetchFollowerDemographics,
   fetchAlbumChildren,
+  fetchMediaDetails,
 };
