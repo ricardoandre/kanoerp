@@ -7,9 +7,24 @@ Create the Shopee ads collections in NocoBase and upsert parsed rows.
 
     python3 nocobase_import.py --schema                       # create collections
     python3 nocobase_import.py --data shopee_ads_normalized.csv
-    python3 nocobase_import.py --map  shopee_product_map_seed.csv
+    python3 nocobase_import.py --map  shopee_ads_normalized_map_seed.csv
 
-Re-running --data is safe: rows upsert on dedup_key.
+Re-running --data is safe: for each (brand, granularity, period_start) in
+the file, existing rows for that group are deleted and replaced.
+
+Re-running --map is safe: it only INSERTS product_codes that are not
+already present in shopee_product_map. It never updates or overwrites an
+existing row, so curated fields (tier, colorway, notes, target_roas,
+margin, ...) on your existing 633 product_map rows are never touched.
+
+2026-07 schema update:
+  - `family` removed from shopee_ads_performance (it now lives only on
+    shopee_product_map, joined via product_code).
+  - `target_roas` / `margin` added to shopee_product_map.
+  - new `shopee_ads_action_log` collection (decision log). This script can
+    create the collection (--schema), but does not sync data into it -
+    that table is populated by users/other tooling, not from weekly
+    Excel exports.
 """
 import os, sys, csv, json, time, re, argparse
 import urllib.request, urllib.error
@@ -50,6 +65,7 @@ NB_ROLE = _env("NOCOBASE_ROLE")
 
 PERF = "shopee_ads_performance"
 MAP = "shopee_product_map"
+ACTION = "shopee_ads_action_log"
 
 
 def F(name, type_, ui="input", **kw):
@@ -58,6 +74,7 @@ def F(name, type_, ui="input", **kw):
     return d
 
 
+# NOTE: no "family" field here anymore - it moved to shopee_product_map.
 PERF_FIELDS = [
     F("brand", "string"),
     F("granularity", "string"),
@@ -66,7 +83,6 @@ PERF_FIELDS = [
     F("days_in_period", "integer", "integer"),
     F("product_code", "string"),
     F("ad_name", "text", "textarea"),
-    F("family", "string"),
     F("status", "string"),
     F("ad_type", "string"),
     F("bidding_mode", "string"),
@@ -108,13 +124,38 @@ MAP_FIELDS = [
     F("is_primary_listing", "boolean", "checkbox"),
     F("restockable", "boolean", "checkbox"),
     F("notes", "text", "textarea"),
+    F("target_roas", "double", "number"),
+    F("margin", "double", "number"),
+]
+
+# Decision log. `decided_by` is a belongsTo relation to users
+# (fk_decided_by_id) - created here but not populated by this script.
+ACTION_FIELDS = [
+    F("id", "snowflakeId", "snowflakeId", primaryKey=True),
+    F("fk_decided_by_id", "bigInt", "integer"),
+    F("brand", "string"),
+    F("scope", "string"),
+    F("family", "string"),
+    F("product_code", "string"),
+    F("label", "string"),
+    F("action_type", "string"),
+    F("from_value", "string"),
+    F("to_value", "string"),
+    F("note", "text", "textarea"),
+    F("expected_outcome", "text", "textarea"),
+    F("review_by", "dateOnly", "date"),
+    F("decided_on", "dateOnly", "date"),
+    F("period_ref", "string"),
+    F("snapshot", "text", "textarea"),
+    F("decided_by", "belongsTo", "obo", target="users",
+      foreignKey="fk_decided_by_id"),
 ]
 
 NUM = {"impressions", "clicks", "conversions", "direct_conversions",
        "units_sold", "direct_units_sold", "gmv", "direct_gmv", "spend",
        "roas", "direct_roas", "cpc", "aov", "cost_per_conversion",
        "spend_per_day", "units_per_day", "ctr", "cvr", "direct_cvr",
-       "days_in_period"}
+       "days_in_period", "target_roas", "margin", "fk_decided_by_id"}
 BOOL = {"is_shop_level", "is_primary_listing", "restockable"}
 
 
@@ -171,7 +212,7 @@ def list_fields(name):
 
 
 def inspect():
-    for coll, spec in ((PERF, PERF_FIELDS), (MAP, MAP_FIELDS)):
+    for coll, spec in ((PERF, PERF_FIELDS), (MAP, MAP_FIELDS), (ACTION, ACTION_FIELDS)):
         have = set(list_fields(coll))
         want = {f["name"] for f in spec}
         print(f"\n{coll}")
@@ -225,6 +266,8 @@ def purge(collection, yes=False):
 
 
 OBSOLETE = ["dedup_key", "shop_name", "shop_id", "source_file"]
+# family used to live on PERF; drop it there if an older run created it.
+PERF_OBSOLETE = OBSOLETE + ["family"]
 
 
 def drop_fields(collection, names, yes=False):
@@ -313,14 +356,26 @@ def probe(collection, key, sample):
     print("  -> if 'create' and 'filtered list' pass, use --mode safe")
 
 
-def upsert(collection, path, key, batch=200, mode="safe"):
+def upsert(collection, path, key, batch=200, mode="safe", insert_only=False):
+    """insert_only=True: never update an existing row, only create rows
+    for keys not already present. Used for shopee_product_map so curated
+    fields (tier, notes, target_roas, margin, ...) are never clobbered by
+    an auto-generated seed file that only knows product_code/brand/
+    ad_name/family."""
     with open(path, encoding="utf-8-sig", newline="") as fh:
         rows = [coerce(r) for r in csv.DictReader(fh)]
     allowed = {f["name"] for f in (PERF_FIELDS if collection == PERF else MAP_FIELDS)}
     rows = [{k: v for k, v in r.items() if k in allowed} for r in rows]
-    n, made, upd, t0 = 0, 0, 0, time.time()
+    n, made, upd, skipped, t0 = 0, 0, 0, 0, time.time()
     for r in rows:
-        if mode == "fast":
+        if insert_only:
+            ex = find_one(collection, key, r[key])
+            if ex:
+                skipped += 1
+            else:
+                call(f"{collection}:create", r)
+                made += 1
+        elif mode == "fast":
             call(f"{collection}:updateOrCreate?filterKeys={key}", r)
         else:
             ex = find_one(collection, key, r[key])
@@ -332,8 +387,9 @@ def upsert(collection, path, key, batch=200, mode="safe"):
                 made += 1
         n += 1
         if n % batch == 0 or n == len(rows):
-            print(f"  {n}/{len(rows)}  created={made} updated={upd}  "
-                  f"({time.time()-t0:.0f}s)", flush=True)
+            msg = f"  {n}/{len(rows)}  created={made}"
+            msg += f" skipped(existing)={skipped}" if insert_only else f" updated={upd}"
+            print(f"{msg}  ({time.time()-t0:.0f}s)", flush=True)
     print(f"  done: {n} rows")
 
 
@@ -342,12 +398,14 @@ if __name__ == "__main__":
     ap.add_argument("--test", action="store_true", help="verify URL + token only")
     ap.add_argument("--inspect", action="store_true", help="list fields actually present")
     ap.add_argument("--probe", action="store_true", help="test each CRUD op separately")
-    ap.add_argument("--purge", choices=["perf", "map", "all"], help="DELETE all rows")
+    ap.add_argument("--purge", choices=["perf", "map", "action", "all"], help="DELETE all rows")
     ap.add_argument("--drop-obsolete", action="store_true",
-                    help="remove dedup_key / shop_name / shop_id / source_file fields")
+                    help="remove dedup_key / shop_name / shop_id / source_file "
+                         "(+ legacy 'family' on performance) fields")
     ap.add_argument("--yes", action="store_true", help="confirm destructive action")
     ap.add_argument("--mode", default="safe", choices=["safe", "fast"],
-                    help="safe = filter+create/update (works everywhere); fast = updateOrCreate")
+                    help="safe = filter+create/update (works everywhere); fast = updateOrCreate "
+                         "(ignored for --map, which is always insert-only)")
     ap.add_argument("--schema", action="store_true")
     ap.add_argument("--data")
     ap.add_argument("--map")
@@ -359,7 +417,7 @@ if __name__ == "__main__":
         r = call("collections:list?pageSize=200")
         names = sorted(c["name"] for c in r.get("data", []))
         print(f"  auth OK - {len(names)} collections visible")
-        for n in (PERF, MAP):
+        for n in (PERF, MAP, ACTION):
             print(f"  {n}: {'EXISTS' if n in names else 'not created yet'}")
         sys.exit(0)
     if a.inspect:
@@ -371,7 +429,7 @@ if __name__ == "__main__":
             "family": "probe"})
         sys.exit(0)
     if a.drop_obsolete:
-        drop_fields(PERF, OBSOLETE, a.yes)
+        drop_fields(PERF, PERF_OBSOLETE, a.yes)
         drop_fields(MAP, ["dedup_key"], a.yes)
         sys.exit(0)
     if a.purge:
@@ -379,11 +437,15 @@ if __name__ == "__main__":
             purge(MAP, a.yes)
         if a.purge in ("perf", "all"):
             purge(PERF, a.yes)
+        if a.purge in ("action", "all"):
+            purge(ACTION, a.yes)
         sys.exit(0)
     if a.schema:
         create_collection(PERF, "Shopee Ads Performance", PERF_FIELDS)
         create_collection(MAP, "Shopee Product Map", MAP_FIELDS)
+        create_collection(ACTION, "Shopee Ads Action Log", ACTION_FIELDS)
     if a.data:
         load_periods(a.data)
     if a.map:
-        upsert(MAP, a.map, "product_code", mode=a.mode)
+        # always insert-only: never overwrite curated product_map rows
+        upsert(MAP, a.map, "product_code", mode=a.mode, insert_only=True)
