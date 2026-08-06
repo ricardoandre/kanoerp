@@ -1,0 +1,23 @@
+{
+  "name": "tiktok-nocodb-sync",
+  "version": "1.0.0",
+  "description": "Fetch TikTok ads, organic content, and affiliate data across multiple client accounts and sync into NocoDB",
+  "type": "module",
+  "main": "src/sync.js",
+  "scripts": {
+    "auth-server": "node src/auth-server.js",
+    "test-access": "node src/test-access.js",
+    "sync": "node src/sync.js",
+    "sync:ads": "node src/sync.js --only=ads",
+    "sync:creatives": "node src/sync.js --only=creatives",
+    "sync:gmvmax": "node src/sync.js --only=gmvmax",
+    "backfill:gmvmax": "node src/backfill-gmvmax.js",
+    "sync:content": "node src/sync.js --only=content",
+    "sync:affiliate": "node src/sync.js --only=affiliate"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}

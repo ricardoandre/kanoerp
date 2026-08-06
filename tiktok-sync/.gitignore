@@ -1,0 +1,6 @@
+.env
+node_modules/
+public/thumbnails/
+backfill-checkpoint.json
+*.log
+.DS_Store
